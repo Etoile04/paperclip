@@ -524,6 +524,9 @@ export async function startServer(): Promise<StartedServer> {
   let resolveSession:
     | ((req: ExpressRequest) => Promise<BetterAuthSessionResult | null>)
     | undefined;
+  let refreshSession:
+    | ((req: ExpressRequest) => Promise<BetterAuthSessionResult | null>)
+    | undefined;
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
@@ -539,6 +542,7 @@ export async function startServer(): Promise<StartedServer> {
       createBetterAuthHandler,
       createBetterAuthInstance,
       deriveAuthTrustedOrigins,
+      refreshBetterAuthSession,
       resolveBetterAuthSession,
       resolveBetterAuthSessionFromHeaders,
     } = await import("./auth/better-auth.js");
@@ -563,6 +567,7 @@ export async function startServer(): Promise<StartedServer> {
     const auth = createBetterAuthInstance(db as any, config, effectiveTrustedOrigins);
     betterAuthHandler = createBetterAuthHandler(auth);
     resolveSession = (req) => resolveBetterAuthSession(auth, req);
+    refreshSession = (req) => refreshBetterAuthSession(auth, req);
     resolveSessionFromHeaders = (headers) => resolveBetterAuthSessionFromHeaders(auth, headers);
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
@@ -664,6 +669,7 @@ export async function startServer(): Promise<StartedServer> {
     pluginMigrationDb: pluginMigrationDb as any,
     betterAuthHandler,
     resolveSession,
+    refreshSession,
     pluginWorkerManager,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);

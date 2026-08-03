@@ -20,12 +20,13 @@ export type BetterAuthSessionUser = {
 };
 
 export type BetterAuthSessionResult = {
-  session: { id: string; userId: string } | null;
+  session: { id: string; userId: string; expiresAt?: Date } | null;
   user: BetterAuthSessionUser | null;
 };
 
 type BetterAuthGetSessionApi = {
   getSession?: (input: { headers: Headers }) => Promise<unknown>;
+  updateSession?: (input: { headers: Headers; body?: Record<string, unknown> }) => Promise<unknown>;
 };
 
 type BetterAuthHandlerTarget = Extract<Parameters<typeof toNodeHandler>[0], { handler: Auth["handler"] }>;
@@ -188,11 +189,15 @@ export async function resolveBetterAuthSessionFromHeaders(
   if (!sessionValue || typeof sessionValue !== "object") return null;
 
   const value = sessionValue as {
-    session?: { id?: string; userId?: string } | null;
+    session?: { id?: string; userId?: string; expiresAt?: Date | string | null } | null;
     user?: { id?: string; email?: string | null; name?: string | null } | null;
   };
   const session = value.session?.id && value.session.userId
-    ? { id: value.session.id, userId: value.session.userId }
+    ? {
+        id: value.session.id,
+        userId: value.session.userId,
+        ...(value.session.expiresAt ? { expiresAt: new Date(value.session.expiresAt) } : {}),
+      }
     : null;
   const user = value.user?.id
     ? {
@@ -211,4 +216,20 @@ export async function resolveBetterAuthSession(
   req: Request,
 ): Promise<BetterAuthSessionResult | null> {
   return resolveBetterAuthSessionFromHeaders(auth, headersFromExpressRequest(req));
+}
+
+export async function refreshBetterAuthSession(
+  auth: BetterAuthSessionResolver,
+  req: Request,
+): Promise<BetterAuthSessionResult | null> {
+  const api = auth.api;
+  if (!api?.updateSession || !api?.getSession) return null;
+
+  const nodeHeaders = headersFromExpressRequest(req);
+
+  const updateResult = await api.updateSession({ headers: nodeHeaders });
+  if (!updateResult || typeof updateResult !== "object") return null;
+
+  // Re-fetch the session to get the updated expiresAt
+  return resolveBetterAuthSessionFromHeaders(auth, nodeHeaders);
 }

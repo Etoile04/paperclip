@@ -190,6 +190,8 @@ export const authSessionSchema = z.object({
   session: z.object({
     id: z.string().min(1),
     userId: z.string().min(1),
+    expiresAt: z.string().datetime({ offset: true }).optional(),
+    ttlSeconds: z.number().int().nonnegative().optional(),
   }),
   user: currentUserProfileSchema,
 });

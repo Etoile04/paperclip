@@ -42,7 +42,7 @@ import {
   type InstanceDatabaseBackupService,
 } from "./routes/instance-database-backups.js";
 import { llmRoutes } from "./routes/llms.js";
-import { authRoutes } from "./routes/auth.js";
+import { authRoutes, type SessionRefreshFn } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
@@ -155,6 +155,7 @@ export async function createApp(
     pluginWorkerManager?: PluginWorkerManager;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
+    refreshSession?: SessionRefreshFn;
   },
 ) {
   const app = express();
@@ -197,7 +198,7 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
-  app.use("/api/auth", authRoutes(db));
+  app.use("/api/auth", authRoutes(db, { refreshSession: opts.refreshSession }));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
