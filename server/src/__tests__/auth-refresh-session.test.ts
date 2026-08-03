@@ -48,6 +48,7 @@ describe.sequential("POST /api/auth/refresh-session", () => {
   const boardActor = {
     type: "board",
     userId: "user-1",
+    sessionId: "session-1",
     source: "session",
   };
 
@@ -68,6 +69,30 @@ describe.sequential("POST /api/auth/refresh-session", () => {
     expect(res.body.session.expiresAt).toBe(futureExpiry.toISOString());
     expect(res.body.session.ttlSeconds).toBeGreaterThan(0);
     expect(res.body.user.id).toBe("user-1");
+    expect(res.body.user.email).toBe("jane@example.com");
+    expect(res.body.user.name).toBe("Jane Example");
+    // Regression guard: `/refresh-session` previously hard-coded `image: null`,
+    // wiping the user's profile picture on every refresh. The response must
+    // mirror `GET /get-session` and hydrate `image` from the DB row.
+    expect(res.body.user.image).toBe("https://example.com/jane.png");
+  });
+
+  it("hydrates missing user fields from the DB row even when Better Auth only returns id", async () => {
+    const futureExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const refreshFn: SessionRefreshFn = vi.fn().mockResolvedValue({
+      session: { id: "session-1", userId: "user-1", expiresAt: futureExpiry },
+      user: { id: "user-1" },
+    });
+
+    const app = await createApp(boardActor, baseUser, refreshFn);
+    const res = await request(app).post("/api/auth/refresh-session");
+
+    expect(res.status).toBe(200);
+    // Empty Better Auth user → all profile fields filled from DB row.
+    expect(res.body.user.id).toBe("user-1");
+    expect(res.body.user.email).toBe("jane@example.com");
+    expect(res.body.user.name).toBe("Jane Example");
+    expect(res.body.user.image).toBe("https://example.com/jane.png");
   });
 
   it("returns 401 when the session cannot be refreshed", async () => {
@@ -187,7 +212,11 @@ describe.sequential("POST /api/auth/refresh-session", () => {
     expect(res.body.session.ttlSeconds).toBeUndefined();
   });
 
-  it("rate-limits per session, not globally", async () => {
+  it("rate-limits per session id, not per user id", async () => {
+    // AC-5 requires the limit to be applied "per session". A user with two
+    // concurrent sessions (desktop + mobile) must be able to refresh each
+    // independently within the 60s window. The prior implementation keyed on
+    // userId, blocking the second session until the window elapsed.
     const futureExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
     let callCount = 0;
@@ -199,21 +228,24 @@ describe.sequential("POST /api/auth/refresh-session", () => {
       };
     });
 
-    const app1 = await createApp(
-      { type: "board", userId: "user-a", source: "session" },
+    // Same userId across both apps; only the sessionId differs.
+    const desktopApp = await createApp(
+      { type: "board", userId: "user-1", sessionId: "session-desktop", source: "session" },
       baseUser,
       refreshFn,
     );
-    const app2 = await createApp(
-      { type: "board", userId: "user-b", source: "session" },
+    const mobileApp = await createApp(
+      { type: "board", userId: "user-1", sessionId: "session-mobile", source: "session" },
       baseUser,
       refreshFn,
     );
 
-    const res1 = await request(app1).post("/api/auth/refresh-session");
-    expect(res1.status).toBe(200);
+    const desktopRes = await request(desktopApp).post("/api/auth/refresh-session");
+    expect(desktopRes.status).toBe(200);
 
-    const res2 = await request(app2).post("/api/auth/refresh-session");
-    expect(res2.status).toBe(200);
+    const mobileRes = await request(mobileApp).post("/api/auth/refresh-session");
+    // Independent sessionId, so the desktop refresh must not block the
+    // mobile one — that is the whole point of AC-5.
+    expect(mobileRes.status).toBe(200);
   });
 });

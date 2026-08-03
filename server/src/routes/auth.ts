@@ -82,8 +82,10 @@ export function authRoutes(db: Db, opts?: { refreshSession?: SessionRefreshFn })
       return;
     }
 
-    // Rate limit: max 1 refresh per 60 seconds per session
-    const rateLimitKey = req.actor.userId;
+    // Rate limit: max 1 refresh per 60 seconds per session.
+    // AC-5 keys the limit on the *session*, not the user, so a user with two
+    // active sessions (desktop + mobile) can refresh each independently.
+    const rateLimitKey = req.actor.sessionId;
     const now = Date.now();
     const cutoff = now - SESSION_REFRESH_WINDOW_MS;
     const recentHits = (refreshHitsByKey.get(rateLimitKey) ?? []).filter((hit) => hit > cutoff);
@@ -98,6 +100,13 @@ export function authRoutes(db: Db, opts?: { refreshSession?: SessionRefreshFn })
       throw unauthorized("Session refresh failed");
     }
 
+    // Re-read the user profile from the DB so the refresh response carries
+    // the same hydrated fields as `GET /get-session` — most importantly
+    // `image`, which the previous implementation hard-coded to `null`.
+    // Without this, the frontend's `authSession.user.image` was wiped on
+    // every refresh (NFM-2411 / CR finding).
+    const user = await loadCurrentUserProfile(db, result.session.userId);
+
     const ttl = buildSessionTtl(result.session.expiresAt);
     res.json(authSessionSchema.parse({
       session: {
@@ -105,12 +114,7 @@ export function authRoutes(db: Db, opts?: { refreshSession?: SessionRefreshFn })
         userId: result.session.userId,
         ...ttl,
       },
-      user: {
-        id: result.user.id,
-        email: result.user.email ?? null,
-        name: result.user.name ?? null,
-        image: null,
-      },
+      user,
     }));
   });
 
