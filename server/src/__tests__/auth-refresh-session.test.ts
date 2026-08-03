@@ -162,6 +162,31 @@ describe.sequential("POST /api/auth/refresh-session", () => {
     expect(res.body.session.ttlSeconds).toBeUndefined();
   });
 
+  it("exposes expiresAt and ttlSeconds on GET /get-session", async () => {
+    const futureExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const app = await createApp(
+      { ...boardActor, sessionExpiresAt: futureExpiry },
+      baseUser,
+    );
+
+    const res = await request(app).get("/api/auth/get-session");
+
+    expect(res.status).toBe(200);
+    expect(res.body.session.expiresAt).toBe(futureExpiry.toISOString());
+    expect(res.body.session.ttlSeconds).toBeGreaterThan(0);
+    expect(res.body.session.ttlSeconds).toBeLessThanOrEqual(7 * 24 * 60 * 60);
+  });
+
+  it("omits TTL fields on GET /get-session when the session has no expiry", async () => {
+    const app = await createApp(boardActor, baseUser);
+
+    const res = await request(app).get("/api/auth/get-session");
+
+    expect(res.status).toBe(200);
+    expect(res.body.session.expiresAt).toBeUndefined();
+    expect(res.body.session.ttlSeconds).toBeUndefined();
+  });
+
   it("rate-limits per session, not globally", async () => {
     const futureExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 

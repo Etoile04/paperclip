@@ -26,7 +26,10 @@ export type BetterAuthSessionResult = {
 
 type BetterAuthGetSessionApi = {
   getSession?: (input: { headers: Headers }) => Promise<unknown>;
-  updateSession?: (input: { headers: Headers; body?: Record<string, unknown> }) => Promise<unknown>;
+  // Better Auth types `updateSession` as a StrictEndpoint whose exact generic
+  // signature depends on the configured session fields, so keep this loose
+  // enough that the concrete `Auth` instance stays assignable.
+  updateSession?: (...args: never[]) => Promise<unknown>;
 };
 
 type BetterAuthHandlerTarget = Extract<Parameters<typeof toNodeHandler>[0], { handler: Auth["handler"] }>;
@@ -227,7 +230,12 @@ export async function refreshBetterAuthSession(
 
   const nodeHeaders = headersFromExpressRequest(req);
 
-  const updateResult = await api.updateSession({ headers: nodeHeaders });
+  // `/update-session` is a POST endpoint with a required (record) body; an empty
+  // body leaves the session fields untouched and just extends the expiry.
+  const updateSession = api.updateSession as (
+    input: { headers: Headers; body: Record<string, unknown> },
+  ) => Promise<unknown>;
+  const updateResult = await updateSession({ headers: nodeHeaders, body: {} });
   if (!updateResult || typeof updateResult !== "object") return null;
 
   // Re-fetch the session to get the updated expiresAt

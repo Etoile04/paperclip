@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request as ExpressRequest } from "express";
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { authUsers } from "@paperclipai/db";
@@ -14,7 +14,7 @@ import { validate } from "../middleware/validate.js";
 const SESSION_REFRESH_WINDOW_MS = 60_000;
 const SESSION_REFRESH_MAX_REQUESTS = 1;
 
-export type SessionRefreshFn = (req: express.Request) => Promise<BetterAuthSessionResult | null>;
+export type SessionRefreshFn = (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
 
 async function loadCurrentUserProfile(db: Db, userId: string) {
   const user = await db
@@ -66,6 +66,7 @@ export function authRoutes(db: Db, opts?: { refreshSession?: SessionRefreshFn })
       session: {
         id: `paperclip:${req.actor.source ?? "none"}:${req.actor.userId}`,
         userId: req.actor.userId,
+        ...buildSessionTtl(req.actor.sessionExpiresAt),
       },
       user,
     }));

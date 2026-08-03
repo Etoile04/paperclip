@@ -19,6 +19,7 @@ declare global {
           status?: string;
         }>;
         isInstanceAdmin?: boolean;
+        sessionExpiresAt?: Date;
         keyId?: string;
         keyScope?: AgentApiKeyScope;
         runId?: string;
