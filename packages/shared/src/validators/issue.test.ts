@@ -611,6 +611,22 @@ describe("issue validators", () => {
     expect(parsed.success).toBe(false);
   });
 
+  it("preserves livenessFanoutOptOut through the PATCH whitelist", () => {
+    const parsed = updateIssueSchema.parse({
+      livenessFanoutOptOut: true,
+    });
+
+    expect(parsed.livenessFanoutOptOut).toBe(true);
+  });
+
+  it("preserves livenessFanoutOptOut=false through the PATCH whitelist", () => {
+    const parsed = updateIssueSchema.parse({
+      livenessFanoutOptOut: false,
+    });
+
+    expect(parsed.livenessFanoutOptOut).toBe(false);
+  });
+
   it("rejects retired model profiles in agent runtime config", () => {
     const parsed = createAgentSchema.safeParse({
       name: "Coder",
