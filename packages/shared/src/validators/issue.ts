@@ -728,6 +728,7 @@ const createIssueBaseSchema = z.object({
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema
     .optional()
     .nullable(),
+  livenessFanoutOptOut: z.boolean().optional(),
   labelIds: z.array(z.string().guid()).optional(),
   watchdogDiscovery: z
     .object({
