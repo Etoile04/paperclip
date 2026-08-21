@@ -28,6 +28,12 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  /**
+   * When true, this issue is excluded from harness liveness fanout: a peer touching one of
+   * its blockers will not produce a finding, so its assignee is not woken. Comment- and
+   * cron-driven wakes run through separate code paths and are unaffected.
+   */
+  livenessFanoutOptOut?: boolean | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -590,6 +596,10 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   }
 
   for (const issue of input.issues) {
+    // Opted-out issues never fan out to their assignee. This is the harness liveness path
+    // only; comment- and cron-driven wakes do not go through this classifier.
+    if (issue.livenessFanoutOptOut) continue;
+
     if (issue.status === "blocked") {
       if (unresolvedBlockers.has(issue.id)) continue;
       const chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
