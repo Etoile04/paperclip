@@ -519,3 +519,79 @@ describe("issue graph liveness classifier", () => {
     });
   });
 });
+
+describe("livenessFanoutOptOut", () => {
+  const blockedByUnassignedBlocker = (overrides: Record<string, unknown> = {}) => ({
+    issues: [
+      issue(overrides),
+      issue({
+        id: blockerId,
+        identifier: "PAP-1704",
+        title: "Missing unblock work",
+        status: "todo",
+        assigneeAgentId: null,
+      }),
+    ],
+    relations: blocks,
+    agents: [agent(), manager],
+  });
+
+  it("does not wake the assignee when the issue opts out of liveness fanout", () => {
+    const findings = classifyIssueGraphLiveness(
+      blockedByUnassignedBlocker({ livenessFanoutOptOut: true }),
+    );
+
+    expect(findings).toEqual([]);
+  });
+
+  it("wakes the assignee when the issue explicitly does not opt out", () => {
+    const findings = classifyIssueGraphLiveness(
+      blockedByUnassignedBlocker({ livenessFanoutOptOut: false }),
+    );
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: blockedId,
+      state: "blocked_by_unassigned_issue",
+      recommendedOwnerAgentId: managerId,
+    });
+  });
+
+  it("wakes the assignee when the flag is absent, matching the column default of false", () => {
+    const findings = classifyIssueGraphLiveness(blockedByUnassignedBlocker());
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: blockedId,
+      state: "blocked_by_unassigned_issue",
+    });
+  });
+
+  it("suppresses only the opt-out issue's own finding, not findings for its peers", () => {
+    // The opt-out issue stays a first-class node in the graph: a peer blocked by the same
+    // unassigned blocker must still produce a finding. Opting out mutes this issue's own
+    // fanout, it does not remove it from the dependency graph.
+    const peerId = "blocked-2";
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({ livenessFanoutOptOut: true }),
+        issue({ id: peerId, identifier: "PAP-1705", title: "Peer work" }),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Missing unblock work",
+          status: "todo",
+          assigneeAgentId: null,
+        }),
+      ],
+      relations: [
+        ...blocks,
+        { companyId, blockerIssueId: blockerId, blockedIssueId: peerId },
+      ],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ issueId: peerId });
+  });
+});
