@@ -394,6 +394,7 @@ const createIssueBaseSchema = z.object({
   executionWorkspaceId: z.string().uuid().optional().nullable(),
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
+  livenessFanoutOptOut: z.boolean().optional(),
   labelIds: z.array(z.string().uuid()).optional(),
   watchdogDiscovery: z.object({
     kind: z.enum(ISSUE_WATCHDOG_DISCOVERY_KINDS),

@@ -306,6 +306,22 @@ describe("issue validators", () => {
     expect(parsed.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
 
+  it("preserves livenessFanoutOptOut through the PATCH whitelist", () => {
+    const parsed = updateIssueSchema.parse({
+      livenessFanoutOptOut: true,
+    });
+
+    expect(parsed.livenessFanoutOptOut).toBe(true);
+  });
+
+  it("preserves livenessFanoutOptOut=false through the PATCH whitelist", () => {
+    const parsed = updateIssueSchema.parse({
+      livenessFanoutOptOut: false,
+    });
+
+    expect(parsed.livenessFanoutOptOut).toBe(false);
+  });
+
   it("accepts the cheap model profile in issue assignee adapter overrides", () => {
     const parsed = createIssueSchema.parse({
       title: "Run a cheap heartbeat",

@@ -1141,6 +1141,39 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   it("returns null instead of throwing for malformed non-uuid issue refs", async () => {
     await expect(svc.getById("not-a-uuid")).resolves.toBeNull();
   });
+
+  it("returns livenessFanoutOptOut from getById", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `LF${issueId.slice(0, 4).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      issueNumber: 1,
+      identifier: `LF${issueId.slice(0, 4).toUpperCase()}-1`,
+      title: "Opted out of liveness fanout",
+      status: "todo",
+      priority: "medium",
+      createdByUserId: "user-1",
+      livenessFanoutOptOut: true,
+    });
+
+    const issue = await svc.getById(issueId);
+
+    expect(issue).toEqual(
+      expect.objectContaining({
+        id: issueId,
+        livenessFanoutOptOut: true,
+      }),
+    );
+  });
   it("filters issues by execution workspace id", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
