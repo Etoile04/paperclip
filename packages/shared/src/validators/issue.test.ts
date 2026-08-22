@@ -389,3 +389,11 @@ describe("issue validators", () => {
     expect(parsed.success).toBe(false);
   });
 });
+
+  it("accepts livenessFanoutOptOut in PATCH (updateIssueSchema)", () => {
+    const parsed = updateIssueSchema.parse({ livenessFanoutOptOut: true });
+    expect(parsed.livenessFanoutOptOut).toBe(true);
+
+    const parsedFalse = updateIssueSchema.parse({ livenessFanoutOptOut: false });
+    expect(parsedFalse.livenessFanoutOptOut).toBe(false);
+  });
