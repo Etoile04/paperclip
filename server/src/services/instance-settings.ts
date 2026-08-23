@@ -60,6 +60,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       issueGraphLivenessAutoRecoveryLookbackHours:
         parsed.data.issueGraphLivenessAutoRecoveryLookbackHours ??
         DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+      // ADR-009 §4.3 (NFM-3584) — daily reconciliation hook flag.
+      adr009ReconciliationHookEnabled: parsed.data.adr009ReconciliationHookEnabled ?? false,
     };
   }
   return {
@@ -78,6 +80,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableIssueGraphLivenessAutoRecovery: false,
     issueGraphLivenessAutoRecoveryLookbackHours:
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+    adr009ReconciliationHookEnabled: false,
   };
 }
 

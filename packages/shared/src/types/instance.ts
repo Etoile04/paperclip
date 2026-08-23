@@ -59,6 +59,12 @@ export interface InstanceExperimentalSettings {
   autoRestartDevServerWhenIdle: boolean;
   enableIssueGraphLivenessAutoRecovery: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
+  /**
+   * ADR-009 §4.3 (NFM-3584): toggles the daily 06:00 UTC reconciliation
+   * routine that prunes done/cancelled blockers from every dependent's
+   * `blockedByIssueIds`. See NFM-3554 / NFM-3571.
+   */
+  adr009ReconciliationHookEnabled: boolean;
 }
 
 export interface InstanceSettings {

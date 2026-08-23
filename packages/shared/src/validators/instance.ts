@@ -58,6 +58,15 @@ export const instanceExperimentalSettingsSchema = z.object({
     .min(MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .max(MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .default(DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS),
+  /**
+   * ADR-009 §4.3 (NFM-3584): enables the daily 06:00 UTC reconciliation
+   * routine that walks every issue's `blockedByIssueIds` and removes any
+   * UUID whose referenced issue is `done` or `cancelled`. This is the
+   * periodic backstop for §4.1's close-transition hook (NFM-3571). Off by
+   * default — operators enable it explicitly after §4.1 is stable on the
+   * canary tier.
+   */
+  adr009ReconciliationHookEnabled: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();
