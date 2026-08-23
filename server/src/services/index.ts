@@ -27,6 +27,13 @@ export { issueTreeControlService } from "./issue-tree-control.js";
 export { issueApprovalService } from "./issue-approvals.js";
 export { issueReferenceService } from "./issue-references.js";
 export { issueRecoveryActionService } from "./issue-recovery-actions.js";
+export {
+  issueReconciliationService,
+  ADR_009_RECONCILE_ROUTINE_FEATURE_FLAG,
+  type IssueReconciliationService,
+  type ReconcileIssueBlockersDailyOptions,
+  type ReconcileIssueBlockersDailyResult,
+} from "./issue-reconciliation.js";
 export { taskWatchdogService } from "./task-watchdogs.js";
 export {
   issueIsInTaskWatchdogSubtree,

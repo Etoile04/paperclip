@@ -40,6 +40,7 @@ import {
   bootstrapExecutionPolicyFromEnv,
   heartbeatService,
   instanceSettingsService,
+  issueReconciliationService,
   reconcileCloudUpstreamRunsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -777,6 +778,22 @@ export async function startServer(): Promise<StartedServer> {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
 
+    // ADR-009 §4.3-a: cron helpers for the daily 06:00 UTC reconcile routine.
+    // We deliberately re-fire on a single tick each day (not per-tick) so a
+    // slow reconcile run does not double-trigger within the same minute.
+    let lastAdr009ReconcileFireAt: string | null = null;
+    function nowUtcMinuteKey(date: Date): string {
+      // `YYYY-MM-DDTHH:MM` in UTC. Two cron fires never share this key
+      // because we only re-fire when the key differs from `lastFireAt`.
+      return date.toISOString().slice(0, 16);
+    }
+    function isAdr009ReconcileFireTime(date: Date, lastKey: string | null): boolean {
+      // Cron `0 6 * * *` → fire when the minute key is `…T06:00` (UTC) and we
+      // have not already fired at that minute key.
+      const key = nowUtcMinuteKey(date);
+      return key.endsWith("T06:00") && key !== lastKey;
+    }
+
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
     // into a dead "running" row during startup recovery.
     await (async () => {
@@ -932,6 +949,25 @@ export async function startServer(): Promise<StartedServer> {
           const reviewed = await heartbeat.reconcileProductivityReviews();
           if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
             logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+          }
+        })
+        .then(async () => {
+          // ADR-009 §4.3-a: fire the daily 06:00 UTC reconcile routine. We use
+          // an in-process cron check (parsed once per heartbeat tick) rather
+          // than a dedicated timer so the routine observes the same lifecycle
+          // as the rest of the heartbeat-recovery chain.
+          if (isAdr009ReconcileFireTime(new Date(), lastAdr009ReconcileFireAt)) {
+            lastAdr009ReconcileFireAt = nowUtcMinuteKey(new Date());
+            const reconciliation = issueReconciliationService(db as any);
+            const reconciled = await reconciliation.reconcileIssueBlockersDaily({
+              enqueueWakeup: heartbeat.wakeup,
+            });
+            if (reconciled.dependentsTouched > 0) {
+              logger.info(
+                { ...reconciled },
+                "ADR-009 §4.3-a daily reconcile tick completed",
+              );
+            }
           }
         })
         .catch((err) => {

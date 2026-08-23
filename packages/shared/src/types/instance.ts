@@ -59,6 +59,17 @@ export interface InstanceExperimentalSettings {
   autoRestartDevServerWhenIdle: boolean;
   enableIssueGraphLivenessAutoRecovery: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
+  /**
+   * ADR-009 §4.3-a: enable the daily 06:00 UTC reconciliation routine that
+   * scans every issue's `blockedByIssueIds`, removes UUIDs referencing
+   * terminal-status (done|cancelled) blockers, writes a §4.1-shaped audit log
+   * entry per dependent touched, and auto-transitions eligible dependents
+   * (`blocked` → `todo` or `in_progress`) plus fires an assignee wake.
+   *
+   * Sibling 2 (NFM-XXXX-b) wires the dry-run/test fixture; the integration
+   * task (NFM-3554-i) merges the inline helper with the §4.1-b/c copies.
+   */
+  enableAdr009ReconcileRoutine: boolean;
 }
 
 export interface InstanceSettings {
