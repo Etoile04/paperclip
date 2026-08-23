@@ -102,6 +102,10 @@ import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.
 import { localAiLoginService } from "./services/local-ai-login.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
+  ADR009_DAILY_RECONCILE_CRON,
+  shouldFireAdr009DailyReconcile,
+} from "./services/adr009-daily-schedule.js";
+import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
@@ -1701,6 +1705,42 @@ async function startServerWithDatabaseTeardown(
             logger.error({ err }, "routine scheduler tick failed");
           }));
 
+        // ADR-009 §4.3 (NFM-3584): daily 06:00 UTC reconciliation tick.
+        // The schedule lives in code (see `adr009-daily-schedule.ts`). The
+        // routine itself is feature-flag-gated and idempotent, so duplicate
+        // fires within the same window are safe no-ops.
+        if (heartbeatSchedulerStopped) return;
+        if (shouldFireAdr009DailyReconcile(new Date())) {
+          logger.info(
+            { cron: ADR009_DAILY_RECONCILE_CRON, tz: "UTC" },
+            "adr009 §4.3 daily reconciliation tick firing",
+          );
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileBlockedByIssueIds()
+            .then((result) => {
+              if (
+                result.dependentsUpdated > 0 ||
+                result.blockerRelationsRemoved > 0
+              ) {
+                logger.warn(
+                  { ...result },
+                  "adr009 §4.3 daily reconciliation pruned terminal blockers",
+                );
+              } else if (!result.skippedFlagOff) {
+                logger.info(
+                  { ...result },
+                  "adr009 §4.3 daily reconciliation completed (no-op)",
+                );
+              }
+            })
+            .catch((err) => {
+              logger.error(
+                { err },
+                "adr009 §4.3 daily reconciliation tick failed",
+              );
+            }));
+        }
+
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork((async () => {
           const experimental = await instanceSettingsService(db).getExperimental();
@@ -1845,8 +1885,7 @@ async function startServerWithDatabaseTeardown(
       scheduleEnvironmentLeaseCleanupSweep();
       scheduleGitHubConnectionEventPoll();
       scheduleGitHubConnectionContinuitySweep();
-    });
-  }
+    });  }
   
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;

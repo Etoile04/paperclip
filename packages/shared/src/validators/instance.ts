@@ -76,8 +76,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   enablePaperclipDeveloperMode: z.boolean().default(false),
   enableSimplifiedEnglishInteractions: z.boolean().default(false),
   enableFirstTaskPlanProposal: z.boolean().default(false),
-  autoRestartDevServerWhenIdle: z.boolean().default(false),
-  enableWorkspaceBranchReconcileForward: z.boolean().default(true),
+  autoRestartDevServerWhenIdle: z.boolean().default(false),  enableWorkspaceBranchReconcileForward: z.boolean().default(true),
   enableWorkspaceDirtyQuarantineRepair: z.boolean().default(true),
   enableOwnerInstanceAdmin: z.boolean().default(false),
   // Kill switch for the sandbox duplex command-stream bridge. Default off. When
@@ -90,7 +89,22 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableWorktreeRunExecution: z.boolean().default(false),
   worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
   worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),
-}).strict();
+  enableIssueGraphLivenessAutoRecovery: z.boolean().default(false),
+  issueGraphLivenessAutoRecoveryLookbackHours: z
+    .number()
+    .int()
+    .min(MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
+    .max(MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
+    .default(DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS),
+  /**
+   * ADR-009 §4.3 (NFM-3584): enables the daily 06:00 UTC reconciliation
+   * routine that walks every issue's `blockedByIssueIds` and removes any
+   * UUID whose referenced issue is `done` or `cancelled`. This is the
+   * periodic backstop for §4.1's close-transition hook (NFM-3571). Off by
+   * default — operators enable it explicitly after §4.1 is stable on the
+   * canary tier.
+   */
+  adr009ReconciliationHookEnabled: z.boolean().default(false),}).strict();
 
 export const patchInstanceExperimentalSettingsSchema = z
   .object(

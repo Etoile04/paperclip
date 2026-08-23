@@ -111,8 +111,7 @@ export interface InstanceExperimentalSettings {
    * flipping it later does not change an existing first task.
    */
   enableFirstTaskPlanProposal: boolean;
-  autoRestartDevServerWhenIdle: boolean;
-  enableWorkspaceBranchReconcileForward: boolean;
+  autoRestartDevServerWhenIdle: boolean;  enableWorkspaceBranchReconcileForward: boolean;
   enableWorkspaceDirtyQuarantineRepair: boolean;
   /**
    * On cloud-managed instances, grant the stack owner instance-admin access
@@ -151,6 +150,14 @@ export interface InstanceExperimentalSettings {
    * from another instance fail closed.
    */
   worktreeRunExecutionActivationInstanceId: string | null;
+  enableIssueGraphLivenessAutoRecovery: boolean;
+  issueGraphLivenessAutoRecoveryLookbackHours: number;
+  /**
+   * ADR-009 §4.3 (NFM-3584): toggles the daily 06:00 UTC reconciliation
+   * routine that prunes done/cancelled blockers from every dependent's
+   * `blockedByIssueIds`. See NFM-3554 / NFM-3571.
+   */
+  adr009ReconciliationHookEnabled: boolean;
 }
 
 /**
@@ -178,8 +185,7 @@ export interface ManagedSettingMetadata {
  * whose value is overlaid by the harness; self-hosted responses omit it.
  */
 export interface InstanceExperimentalSettingsWithManaged extends InstanceExperimentalSettings {
-  managedKeys?: Partial<Record<ManagedExperimentalFeatureKey, ManagedSettingMetadata>>;
-}
+  managedKeys?: Partial<Record<ManagedExperimentalFeatureKey, ManagedSettingMetadata>>;}
 
 export interface InstanceSettings {
   id: string;
