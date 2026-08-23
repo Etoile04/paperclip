@@ -67,6 +67,14 @@ export const instanceExperimentalSettingsSchema = z.object({
    * canary tier.
    */
   adr009ReconciliationHookEnabled: z.boolean().default(false),
+  /**
+   * ADR-009 §4.1-a: when an issue transitions to a terminal state (done|cancelled),
+   * sweep every dependent in `issue.blocks` and clear this issue's UUID from each
+   * dependent's `blockedByIssueIds` so they can transition out of `blocked`.
+   * Distinct from `adr009ReconciliationHookEnabled` (§4.3's daily 06:00 UTC backstop).
+   * The §4.1 hook reads this flag and short-circuits when disabled.
+   */
+  enableAdr009ReconciliationHook: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();

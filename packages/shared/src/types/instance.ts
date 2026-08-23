@@ -65,6 +65,13 @@ export interface InstanceExperimentalSettings {
    * `blockedByIssueIds`. See NFM-3554 / NFM-3571.
    */
   adr009ReconciliationHookEnabled: boolean;
+  /**
+   * ADR-009 §4.1-a: terminal-transition reverse-dependency reconciliation hook.
+   * When true, transitioning an issue to `done`/`cancelled` sweeps `issue.blocks`
+   * and clears this issue's UUID from each dependent's `blockedByIssueIds`.
+   * Distinct from `adr009ReconciliationHookEnabled` (§4.3's daily 06:00 UTC backstop).
+   */
+  enableAdr009ReconciliationHook: boolean;
 }
 
 export interface InstanceSettings {
