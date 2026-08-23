@@ -72,6 +72,13 @@ export interface InstanceExperimentalSettings {
    * Distinct from `adr009ReconciliationHookEnabled` (§4.3's daily 06:00 UTC backstop).
    */
   enableAdr009ReconciliationHook: boolean;
+  /**
+   * ADR-009 §4.1-c (NFM-3571): toggles the close-transition reconciliation
+   * hook (audit log + transactional wrap of the §4.1-a sweep). Off by default;
+   * the canary tier opts in after §4.3 has stabilized. Independent from
+   * `adr009ReconciliationHookEnabled` so the two rollouts can be sequenced.
+   */
+  adr009CloseTransitionReconciliationHookEnabled: boolean;
 }
 
 export interface InstanceSettings {

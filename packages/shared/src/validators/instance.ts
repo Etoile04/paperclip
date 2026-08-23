@@ -75,6 +75,14 @@ export const instanceExperimentalSettingsSchema = z.object({
    * The §4.1 hook reads this flag and short-circuits when disabled.
    */
   enableAdr009ReconciliationHook: z.boolean().default(false),
+  /**
+   * ADR-009 §4.1-c (NFM-3571): enables the close-transition reconciliation
+   * hook (audit log + transactional wrap of the §4.1-a sweep). Defaults OFF
+   * in production; canary tier opts in explicitly after §4.3 has stabilized.
+   * Independent from `adr009ReconciliationHookEnabled` so the two rollouts
+   * can be sequenced.
+   */
+  adr009CloseTransitionReconciliationHookEnabled: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();

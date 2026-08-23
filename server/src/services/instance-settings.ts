@@ -64,6 +64,10 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       adr009ReconciliationHookEnabled: parsed.data.adr009ReconciliationHookEnabled ?? false,
       // ADR-009 §4.1-a — terminal-transition reconciliation hook flag.
       enableAdr009ReconciliationHook: parsed.data.enableAdr009ReconciliationHook ?? false,
+      // ADR-009 §4.1-c (NFM-3571) — close-transition reconciliation hook flag.
+      // Independent from §4.3's daily-cron flag (`adr009ReconciliationHookEnabled`).
+      adr009CloseTransitionReconciliationHookEnabled:
+        parsed.data.adr009CloseTransitionReconciliationHookEnabled ?? false,
     };
   }
   return {
@@ -86,6 +90,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     adr009ReconciliationHookEnabled: false,
     // ADR-009 §4.1-a — terminal-transition reconciliation hook flag (default off).
     enableAdr009ReconciliationHook: false,
+    // ADR-009 §4.1-c (NFM-3571) — close-transition reconciliation hook flag (default off).
+    adr009CloseTransitionReconciliationHookEnabled: false,
   };
 }
 
