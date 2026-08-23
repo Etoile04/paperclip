@@ -59,6 +59,12 @@ export interface InstanceExperimentalSettings {
   autoRestartDevServerWhenIdle: boolean;
   enableIssueGraphLivenessAutoRecovery: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
+  /**
+   * ADR-009 §4.1-a: terminal-transition reverse-dependency reconciliation hook.
+   * When true, transitioning an issue to `done`/`cancelled` sweeps `issue.blocks`
+   * and clears this issue's UUID from each dependent's `blockedByIssueIds`.
+   */
+  enableAdr009ReconciliationHook: boolean;
 }
 
 export interface InstanceSettings {
