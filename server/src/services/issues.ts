@@ -144,19 +144,34 @@ function applyStatusSideEffects(
  * the dependent has already been reconciled and we skip the delete (no DB
  * write). If it IS present, we delete that single `issueRelations` row.
  *
- * Scope notes (per sibling 1's AC):
- * - This function does NOT auto-transition dependents out of `blocked` — that
- *   is sibling 2's responsibility.
- * - This function does NOT emit wakes or audit log entries — those are
- *   sibling 2 (wake) and sibling 3 (audit + flag wiring) respectively.
- * - The caller is responsible for the feature-flag short-circuit (see
- *   `sweepReverseDependentsOnTerminalCloseIfEnabled`).
+ * Sibling 2 extension (§4.1-b): for every dependent that we just unblocked (i.e.
+ * the closing-issue relation row existed and was deleted by this call AND the
+ * dependent has zero remaining blockers), we additionally:
+ *   - auto-transition the dependent out of `blocked` (→ `in_progress` if it has
+ *     an active `checkoutRunId`, otherwise → `todo`); and
+ *   - collect a "pending wake" entry describing the transition so the caller
+ *     can enqueue a Paperclip heartbeat wake to the assignee post-commit.
+ *
+ * The wake itself is intentionally NOT fired inside the transaction: the wake
+ * primitive (`enqueueWakeup`) writes to multiple tables and reads agent /
+ * budget state, so we defer emission to after the transaction commits. See
+ * `runUpdate` in the issue `update()` method for the post-commit wake loop.
  */
+type Adr009WakeIntent = {
+  dependentId: string;
+  closingIssueId: string;
+  fromStatus: "blocked";
+  toStatus: "todo" | "in_progress";
+  assigneeAgentId: string | null;
+  idempotencyKey: string;
+  payload: Record<string, unknown>;
+};
+
 async function sweepReverseDependentsOnTerminalClose(
   closingIssueId: string,
   companyId: string,
   dbOrTx: any,
-): Promise<{ removed: number; skipped: number }> {
+): Promise<{ removed: number; skipped: number; transitions: Adr009WakeIntent[] }> {
   const dependentRows: Array<{ relatedIssueId: string }> = await dbOrTx
     .select({ relatedIssueId: issueRelations.relatedIssueId })
     .from(issueRelations)
@@ -169,7 +184,7 @@ async function sweepReverseDependentsOnTerminalClose(
     );
 
   if (dependentRows.length === 0) {
-    return { removed: 0, skipped: 0 };
+    return { removed: 0, skipped: 0, transitions: [] };
   }
 
   const dependentIds: string[] = [
@@ -194,7 +209,7 @@ async function sweepReverseDependentsOnTerminalClose(
 
   const toReconcile: string[] = dependentIds.filter((id) => stillPresent.has(id));
   if (toReconcile.length === 0) {
-    return { removed: 0, skipped: dependentIds.length };
+    return { removed: 0, skipped: dependentIds.length, transitions: [] };
   }
 
   const result: Array<{ relatedIssueId: string }> = await dbOrTx
@@ -209,9 +224,107 @@ async function sweepReverseDependentsOnTerminalClose(
     )
     .returning({ relatedIssueId: issueRelations.relatedIssueId });
 
+  // Sibling 2 (§4.1-b): for each dependent we just unblocked, decide whether
+  // to auto-transition out of `blocked`. The conditional is:
+  //   - status MUST be `blocked` (other statuses are no-ops);
+  //   - remaining blockers MUST be empty (`after == []`);
+  //   - if both hold, transition to `in_progress` when the dependent already
+  //     has an active `checkoutRunId`, otherwise to `todo`.
+  // We also collect the wake intent here; the caller is responsible for
+  // emitting the wake post-commit.
+  const transitions: Adr009WakeIntent[] = [];
+
+  if (result.length > 0) {
+    const unblockedIds = result.map((row) => row.relatedIssueId);
+
+    // Read every dependent's current state in one round-trip.
+    const dependentStates: Array<{
+      id: string;
+      status: string;
+      assigneeAgentId: string | null;
+      checkoutRunId: string | null;
+    }> = await dbOrTx
+      .select({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+      })
+      .from(issues)
+      .where(
+        and(eq(issues.companyId, companyId), inArray(issues.id, unblockedIds)),
+      );
+
+    // For each dependent we just unblocked, count remaining blockers. Skip
+    // any dependent whose status is not `blocked` (no-op per AC §4.1-b).
+    const remainingBlockerCounts = new Map<string, number>();
+    if (unblockedIds.length > 0) {
+      const remainingRows: Array<{ relatedIssueId: string; count: number }> = await dbOrTx
+        .select({
+          relatedIssueId: issueRelations.relatedIssueId,
+          count: sql<number>`count(*)::int`,
+        })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.type, "blocks"),
+            inArray(issueRelations.relatedIssueId, unblockedIds),
+          ),
+        )
+        .groupBy(issueRelations.relatedIssueId);
+      for (const row of remainingRows) {
+        remainingBlockerCounts.set(row.relatedIssueId, Number(row.count));
+      }
+    }
+
+    const now = new Date();
+    for (const dep of dependentStates) {
+      if (dep.status !== "blocked") continue;
+      const remaining = remainingBlockerCounts.get(dep.id) ?? 0;
+      if (remaining > 0) continue; // `after != []` → no-op
+
+      const nextStatus: "todo" | "in_progress" = dep.checkoutRunId ? "in_progress" : "todo";
+
+      // Apply the auto-transition. Preserve the active `checkoutRunId` so
+      // an already-running agent does not lose its lease; the path that
+      // transitions to `todo` only fires when there is no active run.
+      const updatePatch: Record<string, unknown> = {
+        status: nextStatus,
+        updatedAt: now,
+      };
+      if (nextStatus === "in_progress" && dep.checkoutRunId) {
+        updatePatch.startedAt = now;
+      }
+      await dbOrTx
+        .update(issues)
+        .set(updatePatch)
+        .where(
+          and(eq(issues.id, dep.id), eq(issues.companyId, companyId)),
+        );
+
+      transitions.push({
+        dependentId: dep.id,
+        closingIssueId,
+        fromStatus: "blocked",
+        toStatus: nextStatus,
+        assigneeAgentId: dep.assigneeAgentId,
+        idempotencyKey: `adr-009:§4.1-b:${dep.id}:${closingIssueId}`,
+        payload: {
+          issueId: dep.id,
+          closingIssueId,
+          trigger: "adr-009-§4.1-b",
+          fromStatus: "blocked",
+          toStatus: nextStatus,
+        },
+      });
+    }
+  }
+
   return {
     removed: result.length,
     skipped: dependentIds.length - result.length,
+    transitions,
   };
 }
 
@@ -226,9 +339,14 @@ async function sweepReverseDependentsOnTerminalCloseIfEnabled(
   companyId: string,
   dbOrTx: any,
   experimental: { enableAdr009ReconciliationHook?: boolean } | undefined,
-): Promise<{ removed: number; skipped: number; skippedReason?: "flag-disabled" }> {
+): Promise<{
+  removed: number;
+  skipped: number;
+  transitions: Adr009WakeIntent[];
+  skippedReason?: "flag-disabled";
+}> {
   if (!experimental?.enableAdr009ReconciliationHook) {
-    return { removed: 0, skipped: 0, skippedReason: "flag-disabled" };
+    return { removed: 0, skipped: 0, transitions: [], skippedReason: "flag-disabled" };
   }
   return sweepReverseDependentsOnTerminalClose(closingIssueId, companyId, dbOrTx);
 }
@@ -3374,7 +3492,35 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
-export function issueService(db: Db) {
+export type IssueServiceWakeupOptions = {
+  /**
+   * DI-injected heartbeat wake primitive. Wired from `heartbeatService` so the
+   * sweep can emit a Paperclip wake to the dependent's assignee after a
+   * blocker is cleared. When omitted (e.g. from tests or other callers that
+   * don't have a heartbeat service), wakes are collected but never fired.
+   */
+  enqueueWakeup?: (agentId: string, opts: IssueServiceWakeupCallOptions) => Promise<unknown>;
+};
+
+/**
+ * Subset of the heartbeat `WakeupOptions` shape that Sibling 2 needs to pass
+ * to the injected wake primitive. Mirrors the `WakeupOptions` interface in
+ * `services/heartbeat.ts` but is duplicated here to avoid a circular import
+ * (heartbeat.ts already imports from issues.ts).
+ */
+export type IssueServiceWakeupCallOptions = {
+  source?: "timer" | "assignment" | "on_demand" | "automation";
+  triggerDetail?: "manual" | "ping" | "callback" | "system" | null;
+  reason?: string | null;
+  payload?: Record<string, unknown> | null;
+  idempotencyKey?: string | null;
+  requestedByActorType?: "user" | "agent" | "system";
+  requestedByActorId?: string | null;
+  contextSnapshot?: Record<string, unknown>;
+};
+
+export function issueService(db: Db, options: IssueServiceWakeupOptions = {}) {
+  const { enqueueWakeup } = options;
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
 
@@ -5576,21 +5722,71 @@ export function issueService(db: Db) {
         // function reads the feature flag and short-circuits if disabled
         // (Sibling 3 wires the flag end-to-end). Idempotent by construction:
         // if the relation has already been cleared, no DB write is performed.
+        //
+        // Sibling 2 (§4.1-b) extension: the sweep also performs the
+        // `blocked` → `todo|in_progress` auto-transition for each dependent
+        // that has no remaining blockers. The wake itself is fired
+        // post-commit by the caller (see below) because the wake primitive
+        // is non-transactional and reads agent/budget state.
+        let wakeIntents: Adr009WakeIntent[] = [];
         if (
           (issueData.status === "done" || issueData.status === "cancelled") &&
           existing.status !== issueData.status
         ) {
-          await sweepReverseDependentsOnTerminalCloseIfEnabled(
+          const sweepResult = await sweepReverseDependentsOnTerminalCloseIfEnabled(
             existing.id,
             existing.companyId,
             tx,
             { enableAdr009ReconciliationHook: adr009ReconciliationEnabled },
           );
+          wakeIntents = sweepResult.transitions;
         }
-        return enriched;
+        return { enriched, wakeIntents };
       };
 
-      return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
+      const txResult =
+        dbOrTx === db ? await db.transaction(runUpdate) : await runUpdate(dbOrTx);
+
+      // Sibling 2 (§4.1-b) post-commit wake emission. The wake primitive is
+      // NOT transactional and reads agent/budget state, so it must run after
+      // the transaction commits. If `enqueueWakeup` was not injected (e.g.
+      // some callers bypass the heartbeat service), we still record the
+      // transitions but never fire wakes.
+      if (enqueueWakeup && txResult.wakeIntents.length > 0) {
+        for (const intent of txResult.wakeIntents) {
+          if (!intent.assigneeAgentId) continue;
+          try {
+            await enqueueWakeup(intent.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "adr-009-blocker-cleared",
+              payload: intent.payload,
+              idempotencyKey: intent.idempotencyKey,
+              requestedByActorType: "system",
+              requestedByActorId: "adr-009-reconciliation",
+              contextSnapshot: {
+                issueId: intent.dependentId,
+                taskId: intent.dependentId,
+                wakeReason: "adr-009-blocker-cleared",
+                source: "adr-009-reconciliation",
+                closingIssueId: intent.closingIssueId,
+                fromStatus: intent.fromStatus,
+                toStatus: intent.toStatus,
+              },
+            });
+          } catch (err) {
+            // Wake emission is best-effort: a wake failure must never roll
+            // back the already-committed status transition. Log the error
+            // and continue with the next intent.
+            console.error(
+              `[adr-009-§4.1-b] enqueueWakeup failed for dependent ${intent.dependentId} (closing ${intent.closingIssueId}):`,
+              err,
+            );
+          }
+        }
+      }
+
+      return txResult.enriched;
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
