@@ -19827,6 +19827,12 @@ export function heartbeatService(
     return recovery.reconcileResolvedDependencyWakeBackstop(opts);
   }
 
+  // ADR-009 §4.3 (NFM-3584) — daily 06:00 UTC reconciliation passthrough.
+  // Feature-flag-gated inside `recovery.reconcileBlockedByIssueIds`.
+  async function reconcileBlockedByIssueIds() {
+    return recovery.reconcileBlockedByIssueIds();
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -30125,6 +30131,10 @@ export function heartbeatService(
     sweepStaleIssueLocks,
 
     reconcileResolvedDependencyWakes,
+
+    // ADR-009 §4.3 (NFM-3584) — exposed so server/src/index.ts can fire the
+    // daily tick without importing the recovery service directly.
+    reconcileBlockedByIssueIds,
 
     scanSilentActiveRuns,
 
