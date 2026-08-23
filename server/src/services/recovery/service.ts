@@ -4001,6 +4001,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   /**
    * ADR-009 §4.3 (NFM-3584) — Sibling A: cron entry + scan loop + idempotence guard.
+   * ADR-009 §4.3 (NFM-3600) — §4.3-b: dry-run mode + per-wedge audit log.
    *
    * Walks every `issueRelations(type='blocks')` row, looks up the referenced
    * `issues.status`, and DELETEs the relation if the blocker is in a terminal
@@ -4013,23 +4014,51 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
    *
    * Sibling A does NOT auto-transition dependent status and does NOT wake the
    * assignee — those land in Siblings B and C (NFM-3585 / NFM-3586).
+   *
+   * Options (NFM-3600 §4.3-b):
+   * - `dryRun`: when true, scan but do NOT delete `issueRelations` rows and do
+   *   NOT write audit log rows. The `clearedDependencies` sample (first 10)
+   *   is still populated so the operator can preview what would change.
+   * - `auditLog`: when true AND `dryRun` is false, write one
+   *   `issue.cancelled_blocker_reconciled` row per cleared wedge with the
+   *   closing-issue UUID in `details.removedBlockerIds`. Defaults to false so
+   *   the daily cron keeps its audit-free contract from Sibling A.
    */
-  async function reconcileBlockedByIssueIds(): Promise<{
+  async function reconcileBlockedByIssueIds(opts?: {
+    dryRun?: boolean;
+    auditLog?: boolean;
+  }): Promise<{
     skippedFlagOff: boolean;
+    dryRun: boolean;
+    auditLog: boolean;
     dependentsScanned: number;
     dependentsUpdated: number;
     blockerRelationsRemoved: number;
     removedByStatus: { done: number; cancelled: number };
+    clearedDependencies: Array<{
+      companyId: string;
+      dependentIssueId: string;
+      beforeBlockerIssueIds: string[];
+      afterBlockerIssueIds: string[];
+      removedBlockerIssueIds: string[];
+      removedByStatus: { done: number; cancelled: number };
+    }>;
     flaggedCompanyIds: string[];
   }> {
+    const dryRun = opts?.dryRun === true;
+    const auditLog = opts?.auditLog === true && !dryRun;
+
     const experimental = await instanceSettings.getExperimental();
     if (!experimental.adr009ReconciliationHookEnabled) {
       return {
         skippedFlagOff: true,
+        dryRun,
+        auditLog,
         dependentsScanned: 0,
         dependentsUpdated: 0,
         blockerRelationsRemoved: 0,
         removedByStatus: { done: 0, cancelled: 0 },
+        clearedDependencies: [],
         flaggedCompanyIds: [],
       };
     }
@@ -4049,43 +4078,91 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     // Group relation IDs by (companyId, dependentIssueId) so we can compute
     // `after` and skip dependents whose set hasn't changed.
-    const grouped = new Map<string, { companyId: string; dependentId: string; relationIds: string[]; terminalStatuses: string[] }>();
+    const grouped = new Map<
+      string,
+      {
+        companyId: string;
+        dependentId: string;
+        allBlockerIds: string[];
+        terminalRelationIds: string[];
+        terminalStatuses: string[];
+        terminalBlockerIds: string[];
+      }
+    >();
     for (const row of rows) {
       const key = `${row.companyId}::${row.dependentIssueId}`;
       let bucket = grouped.get(key);
       if (!bucket) {
-        bucket = { companyId: row.companyId, dependentId: row.dependentIssueId, relationIds: [], terminalStatuses: [] };
+        bucket = {
+          companyId: row.companyId,
+          dependentId: row.dependentIssueId,
+          allBlockerIds: [],
+          terminalRelationIds: [],
+          terminalStatuses: [],
+          terminalBlockerIds: [],
+        };
         grouped.set(key, bucket);
       }
+      bucket.allBlockerIds.push(row.blockerIssueId);
       if (row.blockerStatus === "done" || row.blockerStatus === "cancelled") {
-        bucket.relationIds.push(row.relationId);
+        bucket.terminalRelationIds.push(row.relationId);
         bucket.terminalStatuses.push(row.blockerStatus);
+        bucket.terminalBlockerIds.push(row.blockerIssueId);
       }
     }
 
     const relationIdsToDelete: string[] = [];
     const removedByStatus = { done: 0, cancelled: 0 };
     const flaggedCompanyIds = new Set<string>();
+    const clearedDependencies: Array<{
+      companyId: string;
+      dependentIssueId: string;
+      beforeBlockerIssueIds: string[];
+      afterBlockerIssueIds: string[];
+      removedBlockerIssueIds: string[];
+      removedByStatus: { done: number; cancelled: number };
+    }> = [];
     let dependentsUpdated = 0;
 
     for (const bucket of grouped.values()) {
-      if (bucket.relationIds.length === 0) continue; // idempotence: after === before
+      if (bucket.terminalRelationIds.length === 0) continue; // idempotence: after === before
       dependentsUpdated += 1;
       flaggedCompanyIds.add(bucket.companyId);
+      const bucketRemovedByStatus = { done: 0, cancelled: 0 };
       for (const status of bucket.terminalStatuses) {
-        if (status === "done") removedByStatus.done += 1;
-        else if (status === "cancelled") removedByStatus.cancelled += 1;
+        if (status === "done") bucketRemovedByStatus.done += 1;
+        else if (status === "cancelled") bucketRemovedByStatus.cancelled += 1;
       }
-      relationIdsToDelete.push(...bucket.relationIds);
+      removedByStatus.done += bucketRemovedByStatus.done;
+      removedByStatus.cancelled += bucketRemovedByStatus.cancelled;
+      relationIdsToDelete.push(...bucket.terminalRelationIds);
+
+      // Capture a sample (first 10) cleared dependencies so the dry-run tool
+      // and §4.3-b fixture can render before/after `blockedByIssueIds`.
+      if (clearedDependencies.length < 10) {
+        const after = bucket.allBlockerIds.filter(
+          (id) => !bucket.terminalBlockerIds.includes(id),
+        );
+        clearedDependencies.push({
+          companyId: bucket.companyId,
+          dependentIssueId: bucket.dependentId,
+          beforeBlockerIssueIds: bucket.allBlockerIds,
+          afterBlockerIssueIds: after,
+          removedBlockerIssueIds: bucket.terminalBlockerIds,
+          removedByStatus: bucketRemovedByStatus,
+        });
+      }
     }
 
-    if (relationIdsToDelete.length > 0) {
+    if (!dryRun && relationIdsToDelete.length > 0) {
       await db
         .delete(issueRelations)
         .where(inArray(issueRelations.id, relationIdsToDelete));
 
       logger.info(
         {
+          dryRun,
+          auditLog,
           dependentsUpdated,
           blockerRelationsRemoved: relationIdsToDelete.length,
           removedByStatus,
@@ -4095,12 +4172,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       );
     }
 
+    if (auditLog && relationIdsToDelete.length > 0) {
+      for (const cleared of clearedDependencies) {
+        await logActivity(db, {
+          companyId: cleared.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.cancelled_blocker_reconciled",
+          entityType: "issue",
+          entityId: cleared.dependentIssueId,
+          details: {
+            source: "recovery.reconcile_blocked_by_issue_ids",
+            removedBlockerIds: cleared.removedBlockerIssueIds,
+            removedByStatus: cleared.removedByStatus,
+            beforeBlockedByIssueIds: cleared.beforeBlockerIssueIds,
+            afterBlockedByIssueIds: cleared.afterBlockerIssueIds,
+          },
+        });
+      }
+    }
+
     return {
       skippedFlagOff: false,
+      dryRun,
+      auditLog,
       dependentsScanned: grouped.size,
       dependentsUpdated,
       blockerRelationsRemoved: relationIdsToDelete.length,
       removedByStatus,
+      clearedDependencies,
       flaggedCompanyIds: [...flaggedCompanyIds],
     };
   }
