@@ -58,6 +58,12 @@ export const instanceExperimentalSettingsSchema = z.object({
     .min(MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .max(MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .default(DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS),
+  // ADR-009 §4.1-a: when an issue transitions to a terminal state (done|cancelled),
+  // sweep every dependent in `issue.blocks` and clear this issue's UUID from each
+  // dependent's `blockedByIssueIds` so they can transition out of `blocked`.
+  // Sibling 3 wires the rollout; the hook reads this flag and short-circuits when
+  // disabled.
+  enableAdr009ReconciliationHook: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();

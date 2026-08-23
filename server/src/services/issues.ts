@@ -131,6 +131,108 @@ function applyStatusSideEffects(
   return patch;
 }
 
+/**
+ * ADR-009 §4.1-a: terminal-transition reverse-dependency sweep.
+ *
+ * When an issue transitions to `done` or `cancelled`, walk `issue.blocks` (every
+ * dependent whose `blockedByIssueIds` lists this closing issue as a blocker)
+ * and remove the closing issue's UUID from each dependent's `blockedByIssueIds`.
+ *
+ * Idempotence guard: for each dependent, we first read the current
+ * `blockedByIssueIds` (i.e. the `issueRelations` rows where
+ * `relatedIssueId = dependent.id`). If the closing issue's UUID is NOT present,
+ * the dependent has already been reconciled and we skip the delete (no DB
+ * write). If it IS present, we delete that single `issueRelations` row.
+ *
+ * Scope notes (per sibling 1's AC):
+ * - This function does NOT auto-transition dependents out of `blocked` — that
+ *   is sibling 2's responsibility.
+ * - This function does NOT emit wakes or audit log entries — those are
+ *   sibling 2 (wake) and sibling 3 (audit + flag wiring) respectively.
+ * - The caller is responsible for the feature-flag short-circuit (see
+ *   `sweepReverseDependentsOnTerminalCloseIfEnabled`).
+ */
+async function sweepReverseDependentsOnTerminalClose(
+  closingIssueId: string,
+  companyId: string,
+  dbOrTx: any,
+): Promise<{ removed: number; skipped: number }> {
+  const dependentRows: Array<{ relatedIssueId: string }> = await dbOrTx
+    .select({ relatedIssueId: issueRelations.relatedIssueId })
+    .from(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.issueId, closingIssueId),
+        eq(issueRelations.type, "blocks"),
+      ),
+    );
+
+  if (dependentRows.length === 0) {
+    return { removed: 0, skipped: 0 };
+  }
+
+  const dependentIds: string[] = [
+    ...new Set(dependentRows.map((row) => row.relatedIssueId)),
+  ];
+
+  // Idempotence guard: only delete the `issueRelations` row if it currently
+  // exists for this (closingIssue, dependent) pair. Re-running on an
+  // already-reconciled tree is a no-op (`if before == after: continue`).
+  const stillPresentRows: Array<{ relatedIssueId: string }> = await dbOrTx
+    .select({ relatedIssueId: issueRelations.relatedIssueId })
+    .from(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.issueId, closingIssueId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.relatedIssueId, dependentIds),
+      ),
+    );
+  const stillPresent = new Set(stillPresentRows.map((row) => row.relatedIssueId));
+
+  const toReconcile: string[] = dependentIds.filter((id) => stillPresent.has(id));
+  if (toReconcile.length === 0) {
+    return { removed: 0, skipped: dependentIds.length };
+  }
+
+  const result: Array<{ relatedIssueId: string }> = await dbOrTx
+    .delete(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.issueId, closingIssueId),
+        eq(issueRelations.type, "blocks"),
+        inArray(issueRelations.relatedIssueId, toReconcile),
+      ),
+    )
+    .returning({ relatedIssueId: issueRelations.relatedIssueId });
+
+  return {
+    removed: result.length,
+    skipped: dependentIds.length - result.length,
+  };
+}
+
+/**
+ * Feature-flag-gated wrapper around {@link sweepReverseDependentsOnTerminalClose}.
+ * Reads `enableAdr009ReconciliationHook` from instance experimental settings and
+ * short-circuits when the flag is disabled. The flag is wired end-to-end in
+ * sibling 3; this sibling just reads it and no-ops if absent.
+ */
+async function sweepReverseDependentsOnTerminalCloseIfEnabled(
+  closingIssueId: string,
+  companyId: string,
+  dbOrTx: any,
+  experimental: { enableAdr009ReconciliationHook?: boolean } | undefined,
+): Promise<{ removed: number; skipped: number; skippedReason?: "flag-disabled" }> {
+  if (!experimental?.enableAdr009ReconciliationHook) {
+    return { removed: 0, skipped: 0, skippedReason: "flag-disabled" };
+  }
+  return sweepReverseDependentsOnTerminalClose(closingIssueId, companyId, dbOrTx);
+}
+
 function readStringFromRecord(record: unknown, key: string) {
   if (!record || typeof record !== "object") return null;
   const value = (record as Record<string, unknown>)[key];
@@ -5261,6 +5363,12 @@ export function issueService(db: Db) {
         delete issueData.executionWorkspaceSettings;
       }
 
+      // ADR-009 §4.1-a: read the reconciliation-hook feature flag once, then
+      // pass it into runUpdate. The sweep is called only when this flag is
+      // enabled AND the status is actually transitioning to done/cancelled.
+      const adr009ReconciliationEnabled = (await instanceSettings.getExperimental())
+        .enableAdr009ReconciliationHook;
+
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
       }
@@ -5461,6 +5569,23 @@ export function issueService(db: Db) {
                 ),
               );
           }
+        }
+        // ADR-009 §4.1-a: terminal-transition reverse-dependency sweep.
+        // After the status update commits, walk issue.blocks and clear the
+        // closing issue's UUID from each dependent's blockedByIssueIds. The
+        // function reads the feature flag and short-circuits if disabled
+        // (Sibling 3 wires the flag end-to-end). Idempotent by construction:
+        // if the relation has already been cleared, no DB write is performed.
+        if (
+          (issueData.status === "done" || issueData.status === "cancelled") &&
+          existing.status !== issueData.status
+        ) {
+          await sweepReverseDependentsOnTerminalCloseIfEnabled(
+            existing.id,
+            existing.companyId,
+            tx,
+            { enableAdr009ReconciliationHook: adr009ReconciliationEnabled },
+          );
         }
         return enriched;
       };
