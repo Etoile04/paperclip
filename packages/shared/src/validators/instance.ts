@@ -58,6 +58,14 @@ export const instanceExperimentalSettingsSchema = z.object({
     .min(MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .max(MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .default(DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS),
+  /**
+   * ADR-009 §4.1 (NFM-3571): enables the close-transition reverse-
+   * dependency sweep hook that runs after any issue reaches a terminal
+   * state. Defaults OFF in production; canary tier opts in explicitly.
+   * Independent from `adr009ReconciliationHookEnabled` (§4.3 daily
+   * backstop) so the two rollouts can be sequenced.
+   */
+  adr009CloseTransitionReconciliationHookEnabled: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();

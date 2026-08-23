@@ -59,6 +59,15 @@ export interface InstanceExperimentalSettings {
   autoRestartDevServerWhenIdle: boolean;
   enableIssueGraphLivenessAutoRecovery: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
+  /**
+   * ADR-009 §4.1 (NFM-3571): toggles the close-transition reverse-dependency
+   * sweep hook that fires after any issue transitions to `done` or
+   * `cancelled`. Separate from `adr009ReconciliationHookEnabled` (§4.3's
+   * daily 06:00 UTC backstop) so the canary tier can enable them
+   * independently. Off by default — the canary tier opts in after
+   * §4.3 has stabilized.
+   */
+  adr009CloseTransitionReconciliationHookEnabled: boolean;
 }
 
 export interface InstanceSettings {
