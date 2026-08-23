@@ -1,16 +1,18 @@
 /**
- * ADR-009 §4.3 (NFM-3584): Daily 06:00 UTC reconciliation routine.
+ * ADR-009 §4.3 (NFM-3584 + NFM-3585): Daily 06:00 UTC reconciliation routine.
  *
- * Sibling A — Cron entry + scan loop + idempotence guard.
- *
- * Verifies that `recoveryService.reconcileBlockedByIssueIds`:
+ * Sibling A (NFM-3584) — Cron entry + scan loop + idempotence guard:
  *   - returns early when `adr009ReconciliationHookEnabled` is false
  *   - scans every issue's blocker relations and removes UUIDs whose
  *     referenced issue is `done` or `cancelled`
  *   - leaves non-terminal blockers untouched
  *   - is idempotent (running twice yields zero second-pass changes)
- *   - does NOT yet auto-transition status or wake the assignee
- *     (those land in Siblings B and C)
+ *
+ * Sibling B (NFM-3585) is exercised in this file only via the Branch 3
+ * (`after != []` — other live blockers remain) path: when a dependent has
+ * non-terminal blockers alongside the cleared ones, §4.3-b MUST NOT
+ * transition or wake. The remaining branches (1, 2, 4 + idempotence) are
+ * covered exhaustively in `recovery-reconcile-blocked-by-issue-ids-b.test.ts`.
  */
 
 import { randomUUID } from "node:crypto";
@@ -192,9 +194,13 @@ describeEmbeddedPostgres("recoveryService.reconcileBlockedByIssueIds (ADR-009 §
 
     const remaining = (await blockerIdsFor(dependentId)).sort();
     expect(remaining).toEqual([inProgressBlocker, todoBlocker].sort());
-    // Sibling A scope: no auto-transition, no wake. Guard against scope creep.
-    expect(result.statusTransitions).toBeUndefined();
-    expect(result.wakesFired).toBeUndefined();
+    // §4.3-b Branch 3 (`after != []`): two live blockers remain after the
+    // terminal-blocker sweep, so the dependent must NOT be transitioned and
+    // NO wake may fire. Sibling B's other branches live in the sibling-B
+    // test file.
+    expect(result.statusTransitions).toEqual([]);
+    expect(result.dependentsTransitioned).toBe(0);
+    expect(result.wakesFired).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
@@ -277,7 +283,13 @@ describeEmbeddedPostgres("recoveryService.reconcileBlockedByIssueIds (ADR-009 §
     expect(await blockerIdsFor(dependentB)).toEqual([]);
   });
 
-  it("does not write an audit row or wake — Sibling B/C scope", async () => {
+  it("does not write an `activityLog` audit row — Sibling C scope (NFM-3586)", async () => {
+    // This test was originally written as a combined Sibling B/C scope guard
+    // ("no wake, no audit"). After Sibling B shipped (NFM-3585), the
+    // auto-transition + wake ARE expected for the single-blocker blocked
+    // dependent case below — but the `activityLog` audit emission remains
+    // Sibling C's responsibility (NFM-3586). The wake-side coverage for this
+    // exact scenario lives in `recovery-reconcile-blocked-by-issue-ids-b.test.ts`.
     const blockerId = randomUUID();
     const dependentId = randomUUID();
     await seedIssue({ id: blockerId, title: "Done", status: "done" });
@@ -294,6 +306,5 @@ describeEmbeddedPostgres("recoveryService.reconcileBlockedByIssueIds (ADR-009 §
       .where(inArray(activityLog.action, ["issue.blocker_reconcile_removed", "issue.blocker_reconcile_run"]))
       .then((rows) => rows);
     expect(audit).toEqual([]);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 });

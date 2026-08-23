@@ -4000,27 +4000,61 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
-   * ADR-009 §4.3 (NFM-3584) — Sibling A: cron entry + scan loop + idempotence guard.
+   * ADR-009 §4.3 (NFM-3584 + NFM-3585) — Daily 06:00 UTC reconciliation routine.
    *
-   * Walks every `issueRelations(type='blocks')` row, looks up the referenced
-   * `issues.status`, and DELETEs the relation if the blocker is in a terminal
-   * state (`done` or `cancelled`). Idempotent: a second pass in the same
-   * window touches nothing because the terminal-blocker rows are already gone.
+   * Sibling A (NFM-3584, master): scans every `issueRelations(type='blocks')`
+   * row, looks up the referenced `issues.status`, and DELETEs the relation if
+   * the blocker is in a terminal state (`done` or `cancelled`). Idempotent: a
+   * second pass in the same window touches nothing because the terminal-blocker
+   * rows are already gone.
+   *
+   * Sibling B (NFM-3585, this extension): for each dependent whose terminal
+   * blockers were just removed AND whose remaining-blocker count drops to zero
+   * AND whose status is currently `blocked`, auto-transition the dependent to:
+   *   - `in_progress` if it has an active `checkoutRunId` (preserve lease); or
+   *   - `todo`      otherwise.
+   *
+   * After the status transition commits, emit a Paperclip heartbeat wake to
+   * the dependent's `assigneeAgentId` via the existing `enqueueWakeup`
+   * primitive (DI'd via `recoveryService(db, { enqueueWakeup })`). The wake is
+   * intentionally NOT fired inside the transaction: the wake primitive writes
+   * to multiple tables and reads agent / budget state, so we defer emission to
+   * after the transaction commits.
+   *
+   * Conditional (all four required by NFM-3585 AC):
+   *   1. `blocked` + no checkoutRunId                  → `todo`,      wake
+   *   2. `blocked` + active checkoutRunId              → `in_progress`, wake
+   *   3. other live blockers remain (`after != []`)    → no transition, no wake
+   *   4. dependent.status != `blocked`                 → no transition, no wake
+   *
+   * Idempotence: a second pass in the same window is a no-op — the terminal
+   * relations are already gone (Sibling A guard), so `bucket.relationIds` is
+   * empty and the inner loop skips every bucket. Re-running against an
+   * already-cleared tree never double-wakes because `enqueueWakeup` itself is
+   * an idempotent primitive keyed on
+   * `adr-009:§4.3-b:<dependentId>:<sortedClearedBlockerIds>`.
    *
    * Gated by the `adr009ReconciliationHookEnabled` experimental flag (shared
    * with §4.1 / NFM-3571). When OFF, returns immediately with
    * `skippedFlagOff: true` and zero DB writes.
-   *
-   * Sibling A does NOT auto-transition dependent status and does NOT wake the
-   * assignee — those land in Siblings B and C (NFM-3585 / NFM-3586).
    */
   async function reconcileBlockedByIssueIds(): Promise<{
     skippedFlagOff: boolean;
     dependentsScanned: number;
     dependentsUpdated: number;
+    dependentsTransitioned: number;
     blockerRelationsRemoved: number;
     removedByStatus: { done: number; cancelled: number };
     flaggedCompanyIds: string[];
+    statusTransitions: Array<{
+      dependentId: string;
+      closingIssueIds: string[];
+      fromStatus: "blocked";
+      toStatus: "todo" | "in_progress";
+      assigneeAgentId: string | null;
+      ts: Date;
+    }>;
+    wakesFired: number;
   }> {
     const experimental = await instanceSettings.getExperimental();
     if (!experimental.adr009ReconciliationHookEnabled) {
@@ -4028,9 +4062,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         skippedFlagOff: true,
         dependentsScanned: 0,
         dependentsUpdated: 0,
+        dependentsTransitioned: 0,
         blockerRelationsRemoved: 0,
         removedByStatus: { done: 0, cancelled: 0 },
         flaggedCompanyIds: [],
+        statusTransitions: [],
+        wakesFired: 0,
       };
     }
 
@@ -4048,17 +4085,36 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(eq(issueRelations.type, "blocks"));
 
     // Group relation IDs by (companyId, dependentIssueId) so we can compute
-    // `after` and skip dependents whose set hasn't changed.
-    const grouped = new Map<string, { companyId: string; dependentId: string; relationIds: string[]; terminalStatuses: string[] }>();
+    // `after` and skip dependents whose set hasn't changed. Also retain the
+    // list of cleared blocker IDs per dependent so §4.3-b can:
+    //   - record them in the audit (Sibling C consumer),
+    //   - fold them into the wake `idempotencyKey`.
+    const grouped = new Map<
+      string,
+      {
+        companyId: string;
+        dependentId: string;
+        relationIds: string[];
+        clearedBlockerIssueIds: string[];
+        terminalStatuses: string[];
+      }
+    >();
     for (const row of rows) {
       const key = `${row.companyId}::${row.dependentIssueId}`;
       let bucket = grouped.get(key);
       if (!bucket) {
-        bucket = { companyId: row.companyId, dependentId: row.dependentIssueId, relationIds: [], terminalStatuses: [] };
+        bucket = {
+          companyId: row.companyId,
+          dependentId: row.dependentIssueId,
+          relationIds: [],
+          clearedBlockerIssueIds: [],
+          terminalStatuses: [],
+        };
         grouped.set(key, bucket);
       }
       if (row.blockerStatus === "done" || row.blockerStatus === "cancelled") {
         bucket.relationIds.push(row.relationId);
+        bucket.clearedBlockerIssueIds.push(row.blockerIssueId);
         bucket.terminalStatuses.push(row.blockerStatus);
       }
     }
@@ -4079,29 +4135,228 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       relationIdsToDelete.push(...bucket.relationIds);
     }
 
-    if (relationIdsToDelete.length > 0) {
-      await db
+    if (relationIdsToDelete.length === 0) {
+      return {
+        skippedFlagOff: false,
+        dependentsScanned: grouped.size,
+        dependentsUpdated: 0,
+        dependentsTransitioned: 0,
+        blockerRelationsRemoved: 0,
+        removedByStatus: { done: 0, cancelled: 0 },
+        flaggedCompanyIds: [],
+        statusTransitions: [],
+        wakesFired: 0,
+      };
+    }
+
+    // §4.3-b: delete terminal relations AND auto-transition dependents whose
+    // blocker set is now empty, atomically. The wake emission is deferred to
+    // after the transaction commits because `enqueueWakeup` is non-transactional
+    // and reads agent / budget state.
+    type ReconciledTransition = {
+      dependentId: string;
+      companyId: string;
+      closingIssueIds: string[];
+      fromStatus: "blocked";
+      toStatus: "todo" | "in_progress";
+      assigneeAgentId: string | null;
+      ts: Date;
+    };
+
+    const transitions: ReconciledTransition[] = [];
+
+    await db.transaction(async (tx) => {
+      await tx
         .delete(issueRelations)
         .where(inArray(issueRelations.id, relationIdsToDelete));
 
-      logger.info(
+      // For each dependent we just unblocked, decide whether to auto-transition.
+      const candidates: Array<{
+        companyId: string;
+        dependentId: string;
+        clearedBlockerIssueIds: string[];
+      }> = [];
+      for (const bucket of grouped.values()) {
+        if (bucket.relationIds.length === 0) continue; // already cleared
+        candidates.push({
+          companyId: bucket.companyId,
+          dependentId: bucket.dependentId,
+          clearedBlockerIssueIds: bucket.clearedBlockerIssueIds,
+        });
+      }
+
+      if (candidates.length === 0) return;
+
+      // One round-trip: count remaining blockers for every candidate.
+      const candidateIds = candidates.map((c) => c.dependentId);
+      const remainingRows = await tx
+        .select({
+          relatedIssueId: issueRelations.relatedIssueId,
+          count: sql<number>`count(*)::int`,
+        })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.type, "blocks"),
+            inArray(issueRelations.relatedIssueId, candidateIds),
+          ),
+        )
+        .groupBy(issueRelations.relatedIssueId);
+
+      const remainingByDependent = new Map<string, number>();
+      for (const row of remainingRows) {
+        remainingByDependent.set(row.relatedIssueId, Number(row.count));
+      }
+
+      // One round-trip: read every candidate dependent's current state.
+      const dependentStates = await tx
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(inArray(issues.id, candidateIds));
+
+      const stateByDependent = new Map<
+        string,
         {
-          dependentsUpdated,
-          blockerRelationsRemoved: relationIdsToDelete.length,
-          removedByStatus,
-          flaggedCompanyIds: [...flaggedCompanyIds],
-        },
-        "adr009 §4.3 reconcileBlockedByIssueIds: pruned terminal blockers",
-      );
+          id: string;
+          companyId: string;
+          status: string;
+          assigneeAgentId: string | null;
+          checkoutRunId: string | null;
+        }
+      >();
+      for (const dep of dependentStates) {
+        stateByDependent.set(dep.id, dep);
+      }
+
+      const now = new Date();
+      for (const candidate of candidates) {
+        const dep = stateByDependent.get(candidate.dependentId);
+        if (!dep) continue;
+
+        // Branch 4: dependent status is not `blocked` → no transition, no wake.
+        if (dep.status !== "blocked") continue;
+
+        // Branch 3: other live blockers remain (`after != []`) → no transition,
+        // no wake. The terminal relation was still removed by the DELETE above.
+        const remaining = remainingByDependent.get(candidate.dependentId) ?? 0;
+        if (remaining > 0) continue;
+
+        // Branch 1 + 2: status is `blocked` AND remaining blockers == 0.
+        const nextStatus: "todo" | "in_progress" = dep.checkoutRunId
+          ? "in_progress"
+          : "todo";
+
+        const updatePatch: Record<string, unknown> = {
+          status: nextStatus,
+          updatedAt: now,
+        };
+        if (nextStatus === "in_progress" && dep.checkoutRunId) {
+          updatePatch.startedAt = now;
+        }
+
+        await tx
+          .update(issues)
+          .set(updatePatch)
+          .where(
+            and(eq(issues.id, dep.id), eq(issues.companyId, dep.companyId)),
+          );
+
+        transitions.push({
+          dependentId: dep.id,
+          companyId: dep.companyId,
+          closingIssueIds: candidate.clearedBlockerIssueIds.slice().sort(),
+          fromStatus: "blocked",
+          toStatus: nextStatus,
+          assigneeAgentId: dep.assigneeAgentId,
+          ts: now,
+        });
+      }
+    });
+
+    logger.info(
+      {
+        dependentsUpdated,
+        dependentsTransitioned: transitions.length,
+        blockerRelationsRemoved: relationIdsToDelete.length,
+        removedByStatus,
+        flaggedCompanyIds: [...flaggedCompanyIds],
+      },
+      "adr009 §4.3 reconcileBlockedByIssueIds: pruned terminal blockers + auto-transitioned dependents",
+    );
+
+    // Post-commit: emit Paperclip heartbeat wakes to the assignees whose
+    // dependents were just transitioned out of `blocked`. Each wake carries an
+    // idempotencyKey derived from the (dependent, sorted-cleared-blocker)
+    // tuple so re-running the routine in the same window does not double-wake.
+    let wakesFired = 0;
+    for (const transition of transitions) {
+      if (!transition.assigneeAgentId) continue; // no agent to wake
+      const sortedBlockers = transition.closingIssueIds.join(",");
+      const idempotencyKey = `adr-009:§4.3-b:${transition.dependentId}:${sortedBlockers}`;
+      try {
+        await deps.enqueueWakeup(transition.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "adr-009-blocker-cleared-daily-reconcile",
+          payload: {
+            issueId: transition.dependentId,
+            trigger: "adr-009-§4.3-b",
+            fromStatus: transition.fromStatus,
+            toStatus: transition.toStatus,
+            clearedBlockerIssueIds: transition.closingIssueIds,
+          },
+          idempotencyKey,
+          requestedByActorType: "system",
+          requestedByActorId: "adr-009-reconciliation",
+          contextSnapshot: {
+            issueId: transition.dependentId,
+            taskId: transition.dependentId,
+            wakeReason: "adr-009-blocker-cleared-daily-reconcile",
+            source: "adr-009-§4.3-daily-reconcile",
+            fromStatus: transition.fromStatus,
+            toStatus: transition.toStatus,
+            clearedBlockerIssueIds: transition.closingIssueIds,
+          },
+        });
+        wakesFired += 1;
+      } catch (err) {
+        // Wake emission is best-effort: a wake failure must NEVER roll back
+        // the already-committed status transition. Log the error and continue.
+        logger.error(
+          {
+            dependentId: transition.dependentId,
+            assigneeAgentId: transition.assigneeAgentId,
+            closingIssueIds: transition.closingIssueIds,
+            err,
+          },
+          "adr009 §4.3-b enqueueWakeup failed for dependent",
+        );
+      }
     }
 
     return {
       skippedFlagOff: false,
       dependentsScanned: grouped.size,
       dependentsUpdated,
+      dependentsTransitioned: transitions.length,
       blockerRelationsRemoved: relationIdsToDelete.length,
       removedByStatus,
       flaggedCompanyIds: [...flaggedCompanyIds],
+      statusTransitions: transitions.map((t) => ({
+        dependentId: t.dependentId,
+        closingIssueIds: t.closingIssueIds,
+        fromStatus: t.fromStatus,
+        toStatus: t.toStatus,
+        assigneeAgentId: t.assigneeAgentId,
+        ts: t.ts,
+      })),
+      wakesFired,
     };
   }
 
