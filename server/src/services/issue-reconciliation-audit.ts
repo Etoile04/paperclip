@@ -27,6 +27,8 @@
 import type { Db } from "@paperclipai/db";
 import { activityLog } from "@paperclipai/db";
 
+type ReconciliationDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 export interface ReconciliationAuditEvent {
   companyId: string;
   agentId: string | null;
@@ -53,7 +55,7 @@ export const RECONCILIATION_AUDIT_ENTITY_TYPE = "issue";
  * the audit row together or not at all).
  */
 export async function emitReconciliationAudit(
-  dbOrTx: Db,
+  dbOrTx: ReconciliationDb,
   event: ReconciliationAuditEvent,
 ): Promise<void> {
   await dbOrTx.insert(activityLog).values({

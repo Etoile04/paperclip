@@ -1673,7 +1673,7 @@ function normalizeMaxConcurrentRuns(value: unknown) {
 
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
-  triggerDetail?: "manual" | "ping" | "callback" | "system";
+  triggerDetail?: "manual" | "ping" | "callback" | "system" | null;
   reason?: string | null;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;

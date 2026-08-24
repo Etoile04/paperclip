@@ -5747,6 +5747,16 @@ export function issueService(db: Db, options: IssueServiceWakeupOptions = {}) {
       const txResult =
         dbOrTx === db ? await db.transaction(runUpdate) : await runUpdate(dbOrTx);
 
+      // `runUpdate` returns null when the target row disappeared mid-update
+      // (see `if (!updated) return null;` above). Downstream code dereferences
+      // `txResult.enriched` / `txResult.wakeIntents`, so a null result must
+      // surface as a hard error rather than a TypeError later in the flow.
+      if (!txResult) {
+        throw new Error(
+          `updateIssue: runUpdate returned null for issue ${id} — row not found mid-update`,
+        );
+      }
+
       // Sibling 2 (§4.1-b) post-commit wake emission. The wake primitive is
       // NOT transactional and reads agent/budget state, so it must run after
       // the transaction commits. If `enqueueWakeup` was not injected (e.g.
