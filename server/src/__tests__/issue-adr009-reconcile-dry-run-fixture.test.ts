@@ -262,36 +262,32 @@ describeEmbeddedPostgres("ADR-009 §4.3-b dry-run 5-wedge fixture (NFM-3600)", (
     expect(second.removedByStatus.cancelled).toBe(0);
   });
 
-  it("does NOT yet write audit rows — §4.3-c scope (NFM-3586 / NFM-3594 follow-on)", async () => {
+  it("writes §4.3-c audit rows — §4.1-shape-compatible (NFM-3601 integration)", async () => {
     const { dependents } = await seedFiveWedges();
 
     await instanceSettingsService(db).updateExperimental({ adr009ReconciliationHookEnabled: true });
     const svc = recoveryService(db, { enqueueWakeup: recovery });
     await svc.reconcileBlockedByIssueIds();
 
-    // §4.3-a on master (NFM-3584) does not yet write §4.1-shaped audit
-    // entries — that lands in §4.3-c (NFM-3586, follow-on reconciliation
-    // branched from NFM-3594). When §4.3-c merges, replace this with the
-    // FORWARD_LOOKING shape:
-    //
-    //   const audits = await db.select().from(activityLog)
-    //     .where(and(
-    //       eq(activityLog.entityType, "issue"),
-    //       inArray(activityLog.entityId, dependents),
-    //     ));
-    //   expect(audits).toHaveLength(WEDGE_COUNT);
-    //   for (const a of audits) {
-    //     const details = a.details as Record<string, unknown>;
-    //     expect(details.routine).toBe("adr009-daily-reconcile");
-    //     expect(details.closing_issue_id).toMatch(/^[0-9a-f-]{36}$/i);
-    //     expect(details.dependent_id).toMatch(/^[0-9a-f-]{36}$/i);
-    //     expect(details.after_blockedByIssueIds).toEqual([]);
-    //   }
-    //
-    // Until then, the §4.3-a routine is silent in the activity log —
-    // which is the correct, in-scope behaviour.
-    const audits = await db.select().from(activityLog);
-    expect(audits).toEqual([]);
+    // §4.3-c (NFM-3601) audit rows: WEDGE_COUNT entries, one per dependent,
+    // shape-compatible with §4.1 (NFM-3571). Each row's details.before has
+    // the original 1-element blockedByIssueIds; details.after is [].
+    const audits = await db.select().from(activityLog)
+      .where(and(
+        eq(activityLog.entityType, "issue"),
+        inArray(activityLog.entityId, dependents),
+      ));
+    expect(audits).toHaveLength(WEDGE_COUNT);
+    for (const a of audits) {
+      const details = a.details as Record<string, unknown>;
+      expect(details.closingIssue).toBeDefined();
+      expect(details.dependent).toBeDefined();
+      const before = details.before as { blockedByIssueIds: string[] };
+      const after = details.after as { blockedByIssueIds: string[] };
+      expect(before.blockedByIssueIds).toHaveLength(1);
+      expect(after.blockedByIssueIds).toEqual([]);
+      expect(details.wakeFired).toBe(false);
+    }
 
     // Sanity: dependents are still cleared, so we know the routine ran.
     for (const depId of dependents) {

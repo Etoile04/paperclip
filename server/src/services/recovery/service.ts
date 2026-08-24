@@ -151,6 +151,10 @@ import {
   type RunOutputSilenceSummary,
   type WatchdogDecisionActor,
 } from "../../modules/active-run-watchdog/index.js";
+import {
+  emitReconciliationAudit,
+  type ReconciliationAuditEvent,
+} from "../adr009-reconcile-audit.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -6281,6 +6285,7 @@ export function recoveryService(
       ts: Date;
     }>;
     wakesFired: number;
+    dependentsAudited: number;
   }> {
     const experimental = await instanceSettings.getExperimental();
     if (!experimental.adr009ReconciliationHookEnabled) {
@@ -6289,6 +6294,7 @@ export function recoveryService(
         dependentsScanned: 0,
         dependentsUpdated: 0,
         dependentsTransitioned: 0,
+        dependentsAudited: 0,
         blockerRelationsRemoved: 0,
         removedByStatus: { done: 0, cancelled: 0 },
         flaggedCompanyIds: [],
@@ -6322,7 +6328,8 @@ export function recoveryService(
         dependentId: string;
         relationIds: string[];
         clearedBlockerIssueIds: string[];
-        terminalStatuses: string[];
+        clearedBlockerStatuses: string[];
+        allBlockerIssueIds: string[];
       }
     >();
     for (const row of rows) {
@@ -6334,14 +6341,16 @@ export function recoveryService(
           dependentId: row.dependentIssueId,
           relationIds: [],
           clearedBlockerIssueIds: [],
-          terminalStatuses: [],
+          clearedBlockerStatuses: [],
+          allBlockerIssueIds: [],
         };
         grouped.set(key, bucket);
       }
+      bucket.allBlockerIssueIds.push(row.blockerIssueId);
       if (row.blockerStatus === "done" || row.blockerStatus === "cancelled") {
         bucket.relationIds.push(row.relationId);
         bucket.clearedBlockerIssueIds.push(row.blockerIssueId);
-        bucket.terminalStatuses.push(row.blockerStatus);
+        bucket.clearedBlockerStatuses.push(row.blockerStatus);
       }
     }
 
@@ -6354,7 +6363,7 @@ export function recoveryService(
       if (bucket.relationIds.length === 0) continue; // idempotence: after === before
       dependentsUpdated += 1;
       flaggedCompanyIds.add(bucket.companyId);
-      for (const status of bucket.terminalStatuses) {
+      for (const status of bucket.clearedBlockerStatuses) {
         if (status === "done") removedByStatus.done += 1;
         else if (status === "cancelled") removedByStatus.cancelled += 1;
       }
@@ -6372,6 +6381,7 @@ export function recoveryService(
         flaggedCompanyIds: [],
         statusTransitions: [],
         wakesFired: 0,
+        dependentsAudited: 0,
       };
     }
 
@@ -6503,6 +6513,66 @@ export function recoveryService(
           ts: now,
         });
       }
+
+      // §4.3-c: emit audit log entries for every dependent that had
+      // blockers cleared. One entry per dependent, shape-compatible with
+      // §4.1's audit (NFM-3571).
+      const allIdsToResolve = new Set<string>();
+      for (const bucket of grouped.values()) {
+        if (bucket.relationIds.length === 0) continue;
+        allIdsToResolve.add(bucket.dependentId);
+        for (const id of bucket.clearedBlockerIssueIds) {
+          allIdsToResolve.add(id);
+        }
+      }
+      if (allIdsToResolve.size > 0) {
+        const resolvedIdentifiers = await tx
+          .select({ id: issues.id, identifier: issues.identifier })
+          .from(issues)
+          .where(inArray(issues.id, [...allIdsToResolve]));
+        const idToIdent = new Map<string, string>();
+        for (const r of resolvedIdentifiers) {
+          idToIdent.set(r.id, r.identifier ?? "unknown");
+        }
+
+        for (const bucket of grouped.values()) {
+          if (bucket.relationIds.length === 0) continue;
+          const beforeIds = bucket.allBlockerIssueIds;
+          const afterIds = beforeIds.filter(
+            (id) => !bucket.clearedBlockerIssueIds.includes(id),
+          );
+          const transition = transitions.find(
+            (t) => t.dependentId === bucket.dependentId,
+          );
+          const firstCleared = bucket.clearedBlockerIssueIds[0];
+          await emitReconciliationAudit(tx, {
+            companyId: bucket.companyId,
+            agentId: null,
+            runId: null,
+            closingIssue: {
+              id: firstCleared,
+              identifier: idToIdent.get(firstCleared) ?? "unknown",
+              status: "done",
+            },
+            dependent: {
+              id: bucket.dependentId,
+              identifier:
+                idToIdent.get(bucket.dependentId) ?? "unknown",
+            },
+            before: { blockedByIssueIds: beforeIds },
+            after: { blockedByIssueIds: afterIds },
+            statusTransition: transition
+              ? { from: transition.fromStatus, to: transition.toStatus }
+              : null,
+            wakeFired: false, // wakes are post-commit
+            clearedBlockers: bucket.clearedBlockerIssueIds.map((id, i) => ({
+              id,
+              identifier: idToIdent.get(id) ?? "unknown",
+              status: bucket.clearedBlockerStatuses[i] ?? "done",
+            })),
+          });
+        }
+      }
     });
 
     logger.info(
@@ -6583,6 +6653,7 @@ export function recoveryService(
         ts: t.ts,
       })),
       wakesFired,
+      dependentsAudited: dependentsUpdated,
     };
   }
 

@@ -14,6 +14,7 @@ export type InstanceSettingsWriteDb = Pick<
 import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   DEFAULT_BACKUP_RETENTION,
+  DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PAPERCLIP_CLOUD_MANAGED_BY,
   instanceGeneralSettingsSchema,
   type InstanceGeneralSettings,
@@ -301,7 +302,6 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableSimplifiedEnglishInteractions: false,
     enableFirstTaskPlanProposal: false,
     autoRestartDevServerWhenIdle: false,
-<<<<<<< HEAD
     enableWorkspaceBranchReconcileForward: true,
     enableWorkspaceDirtyQuarantineRepair: true,
     enableOwnerInstanceAdmin: false,
@@ -310,12 +310,10 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
-=======
     enableIssueGraphLivenessAutoRecovery: false,
     issueGraphLivenessAutoRecoveryLookbackHours:
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
     adr009ReconciliationHookEnabled: false,
->>>>>>> 4bc39e939 (feat: ADR-009 §4.3-a daily reconciliation scan + idempotence guard (NFM-3584))
   };
 }
 
