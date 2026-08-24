@@ -35,6 +35,15 @@
  * retry-safe: a second invocation against a partially-successful sweep
  * finds no work to do (idempotence guard) and yields zero new audit rows.
  *
+ * A dependent is treated as "successfully processed" only when its row
+ * actually exists in `issues` for the input company AND its per-
+ * dependent transaction commits. A non-existent dependent (the caller
+ * passed an id whose row was deleted, or never seeded) is rejected up
+ * front in `sweepDependent` — the exception is caught and the dependent
+ * is recorded in `failedDependents` without emitting an audit row.
+ * This prevents `dependentsProcessed` from overcounting phantom
+ * reconciliations and restores the retry-safe invariant (AC-7).
+ *
  * Idempotence
  * -----------
  * Each dependent is compared against the prior `beforeBlockers` and
@@ -44,7 +53,7 @@
 
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRelations } from "@paperclipai/db";
+import { issueRelations, issues } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
 import { emitReconciliationAudit } from "./issue-reconciliation-audit.js";
 
@@ -94,7 +103,10 @@ export interface CloseTransitionReconciliationResult {
    * performed zero DB writes / zero audit emissions.
    */
   skippedFlagOff: boolean;
-  /** Number of dependents successfully reconciled (relation + audit row committed). */
+  /** Number of dependents successfully reconciled: the dependent row existed,
+   * the closing-issue relation was removed, AND the audit row committed —
+   * all inside one transaction. Phantom dependents (id not present in
+   * `issues`) are NOT counted here; they appear in `failedDependents`. */
   dependentsProcessed: number;
   /** Number of `activity_log` rows emitted by this invocation. */
   auditRowsEmitted: number;
@@ -206,6 +218,32 @@ async function sweepDependent(
     // Defensive: the caller passed an `afterBlockers` that still
     // contains the closing issue, so there's no work to do here.
     return "skipped-idempotent";
+  }
+
+  // Pre-flight existence check: the dependent row must exist in this
+  // company. Without this, a stale caller (or one where the dependent
+  // was concurrently deleted) would silently "succeed" — the relation
+  // DELETE matches 0 rows and `activity_log.entityId` has no FK to
+  // `issues`, so the audit row would be emitted for a non-existent
+  // dependent and `dependentsProcessed` would overcount. Throw so the
+  // outer try/catch records this dependent in `failedDependents` and
+  // the sweep continues with the remaining dependents. The retry-safe
+  // invariant is restored: a dependent only counts as processed when
+  // its row was actually found and reconciled.
+  const existingRows = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.id, dep.dependentId),
+        eq(issues.companyId, input.companyId),
+      ),
+    )
+    .limit(1);
+  if (existingRows.length === 0) {
+    throw new Error(
+      `dependent ${dep.dependentIdentifier} (${dep.dependentId}) not found in company ${input.companyId}`,
+    );
   }
 
   // The blockers present in `before` but absent in `after` are what we
