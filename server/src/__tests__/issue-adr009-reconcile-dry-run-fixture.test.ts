@@ -24,6 +24,17 @@
  * re-enable the audit-shape block below (kept in-tree as a TODO for
  * that integration).
  *
+ * AC AMENDMENT REQUEST (CR aed30220, BLOCKER 2):
+ *   The original §4.3-b acceptance criterion reads "Test asserts 5 audit
+ *   log entries written with correct shape." That AC conflates §4.3-a
+ *   (NFM-3584, this branch) with §4.3-c (NFM-3586, follow-on). §4.3-a is
+ *   the cron entry + scan loop; §4.3-c is the activityLog writer. They
+ *   are independent slices. Asserting "5 audit rows" in this fixture
+ *   is impossible until §4.3-c merges. LE has flagged this for CPO
+ *   amendment: AC should read "Test asserts 5 cancelled-blocker wedges
+ *   are cleared; §4.3-c audit-row assertion is deferred to that issue's
+ *   own fixture."
+ *
  * Companion deliverable: `tools/reconcile_cancelled_blockers.py`
  * (read-only dry-run scanner for ops use on prod before the flag flip).
  */
@@ -36,6 +47,7 @@ import {
   agents,
   companies,
   createDb,
+  instanceSettings,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -102,6 +114,14 @@ describeEmbeddedPostgres("ADR-009 §4.3-b dry-run 5-wedge fixture (NFM-3600)", (
   });
 
   afterEach(async () => {
+    // Full instanceSettings singleton reset — the §4.3-a flag is persisted in
+    // this row's `experimental` JSONB column, and the test previously relied
+    // on `updateExperimental({false})` in `beforeEach` to clear stale state
+    // across tests. CR (aed30220) flagged a regression where 3/4 cases read
+    // `skippedFlagOff=true` even after `updateExperimental({true})` — most
+    // plausibly caused by stale JSONB state surviving across cases. Deleting
+    // the singleton row eliminates any state-leak class of bugs entirely.
+    await db.delete(instanceSettings);
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
