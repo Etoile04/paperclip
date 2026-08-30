@@ -287,6 +287,11 @@ import {
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import {
+  getMergeKindBlockReason,
+  recordSystemBypass,
+  resolveExecutionWorkspace,
+} from "../services/precompletion-merge-hook.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -12773,6 +12778,91 @@ export function issueRoutes(
           : issueWriteAuthorizationReason(req, true);
 
       const actor = getActorInfo(req);
+      // NFM-3857 / ADR-009 §4.4 — PreCompletionMerge gate. Fires only on the
+      // explicit `status=done` transition. Reads the experimental flag fresh
+      // (cached instance settings may lag a recent operator flip) and asks
+      // the workspace resolver to map the issue's executionWorkspaceId into
+      // a concrete cwd before shelling out to `git merge-base --is-ancestor`.
+      if (req.body.status === "done" && existing.status !== "done") {
+        const experimental = await instanceSettings.getExperimental();
+        const hookEnabled = experimental.precompletionMergeHookEnabled === true;
+        // `req.actor.type` may be `"system"` for cron / board-driven wakeups
+        // even though the typed `getActorInfo` helper only returns `"agent"`
+        // or `"user"`. The design doc explicitly carves out the system actor
+        // so cron-driven merges (NFM-3738 etc.) can land without firing the
+        // gate. We compare against the raw string and fall back to the typed
+        // actorType for any other actor.
+        const rawActorType = (req.actor as { type?: string }).type ?? actor.actorType;
+        const actorTypeForGate = rawActorType ?? null;
+        const workspaceResolution = await resolveExecutionWorkspace(
+          { id: existing.id, executionWorkspaceId: existing.executionWorkspaceId ?? null },
+          {
+            resolveWorkspace: async (probe) =>
+              probe.executionWorkspaceId
+                ? await executionWorkspacesSvc.getById(probe.executionWorkspaceId)
+                : null,
+            workspacePathFor: (workspace) => {
+              const raw = (workspace.cwd ?? workspace.providerRef ?? "").toString().trim();
+              return raw.length > 0 ? raw : null;
+            },
+          },
+        );
+        const block = await getMergeKindBlockReason({
+          issue: {
+            id: existing.id,
+            title: existing.title ?? null,
+            description: existing.description ?? null,
+            executionWorkspaceId: existing.executionWorkspaceId ?? null,
+          },
+          workspace: workspaceResolution
+            ? {
+                workspacePath: workspaceResolution.workspacePath,
+                branchName: workspaceResolution.workspace.branchName ?? null,
+              }
+            : null,
+          options: {
+            hookEnabled,
+            actorType: actorTypeForGate,
+          },
+        });
+        if (block) {
+          logger.warn(
+            {
+              issueId: existing.id,
+              code: block.code,
+              branch: block.branch ?? null,
+              actorType: actorTypeForGate,
+            },
+            "precompletion merge hook rejected status=done transition",
+          );
+          res.status(422).json({
+            error: block.error,
+            code: block.code,
+            ...(block.branch ? { branch: block.branch } : {}),
+            ...(block.evidence_command ? { evidence_command: block.evidence_command } : {}),
+            ...(block.hint ? { hint: block.hint } : {}),
+          });
+          return;
+        }
+        if (hookEnabled && actorTypeForGate === "system") {
+          const audit = recordSystemBypass({
+            issue: { id: existing.id, title: existing.title ?? null },
+            branch: null,
+            actorId: actor.actorId ?? null,
+          });
+          if (audit) {
+            await logActivity(db, {
+              companyId: existing.companyId,
+              actorType: "system",
+              actorId: actor.actorId ?? "system",
+              action: audit.action,
+              entityType: "issue",
+              entityId: existing.id,
+              details: audit.details,
+            });
+          }
+        }
+      }
       const isClosed = isClosedIssueStatus(existing.status);
       const isBlocked = existing.status === "blocked";
       const normalizedAssigneeAgentId =
