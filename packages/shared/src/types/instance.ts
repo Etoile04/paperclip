@@ -65,6 +65,12 @@ export interface InstanceExperimentalSettings {
    * `blockedByIssueIds`. See NFM-3554 / NFM-3571.
    */
   adr009ReconciliationHookEnabled: boolean;
+  /**
+   * NFM-3857: toggles the API-layer PreCompletionMerge gate on
+   * `PATCH /api/issues/{id}`. See design doc id
+   * `5f082df9-b131-4d6d-bf27-f678d4307325`.
+   */
+  precompletionMergeHookEnabled: boolean;
 }
 
 export interface InstanceSettings {

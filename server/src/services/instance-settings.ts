@@ -62,6 +62,8 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
         DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
       // ADR-009 §4.3 (NFM-3584) — daily reconciliation hook flag.
       adr009ReconciliationHookEnabled: parsed.data.adr009ReconciliationHookEnabled ?? false,
+      // NFM-3857 — API-layer PreCompletionMerge gate (default OFF).
+      precompletionMergeHookEnabled: parsed.data.precompletionMergeHookEnabled ?? false,
     };
   }
   return {
@@ -81,6 +83,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     issueGraphLivenessAutoRecoveryLookbackHours:
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
     adr009ReconciliationHookEnabled: false,
+    precompletionMergeHookEnabled: false,
   };
 }
 

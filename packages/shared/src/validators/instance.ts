@@ -67,6 +67,16 @@ export const instanceExperimentalSettingsSchema = z.object({
    * canary tier.
    */
   adr009ReconciliationHookEnabled: z.boolean().default(false),
+  /**
+   * NFM-3857: enables the API-layer PreCompletionMerge gate on
+   * `PATCH /api/issues/{id}`. When ON, the route refuses the
+   * `status=done` transition for merge-kind issues whose named feature
+   * branch is not yet an ancestor of `origin/main` (the §4.4 prevention
+   * hook that NFM-3855 anchors). Off by default — operators flip it ON
+   * after the §4.3 reconciliation routine has had time to clean any
+   * orphaned blockers on the canary tier.
+   */
+  precompletionMergeHookEnabled: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();
