@@ -65,6 +65,13 @@ export interface InstanceExperimentalSettings {
    * `blockedByIssueIds`. See NFM-3554 / NFM-3571.
    */
   adr009ReconciliationHookEnabled: boolean;
+  /**
+   * ADR-010 §D2 (NFM-3860): toggles the daily 05:00 UTC phantom-merge-pass
+   * backfill routine that scans for `done` issues with merge-style titles
+   * and zero comments (phantom pass cluster), then emits a recovery child
+   * blocked on the original. Off by default.
+   */
+  phantomBackfillHookEnabled: boolean;
 }
 
 export interface InstanceSettings {

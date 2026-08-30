@@ -134,6 +134,7 @@ import {
   resolveExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import * as phantomBackfill from "./phantom-backfill.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -8301,6 +8302,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileBlockedByIssueIds();
   }
 
+  // ADR-010 §D2 (NFM-3860) — daily 05:00 UTC phantom-merge-pass backfill.
+  // Reads the `phantomBackfillHookEnabled` experimental flag, then calls
+  // the standalone phantom-backfill service. The service itself is
+  // idempotent (it pre-fetches existing recovery-child identifiers and
+  // short-circuits on flag off), so duplicate fires within the same
+  // window are safe no-ops.
+  async function reconcilePhantomMergePasses() {
+    const experimental = await instanceSettings.getExperimental();
+    return phantomBackfill.reconcilePhantomMergePasses(db, {
+      flagEnabled: experimental.phantomBackfillHookEnabled,
+      createdAfter: phantomBackfill.DEFAULT_PHANTOM_WINDOW_START,
+      minAssigneeCount24h: phantomBackfill.DEFAULT_MIN_ASSIGNEE_COUNT_24H,
+      hookIssueId: process.env[phantomBackfill.HOOK_ISSUE_ID_ENV_VAR] ?? "",
+    });
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -12406,6 +12423,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // ADR-009 §4.3 (NFM-3584) — exposed so server/src/index.ts can fire the
     // daily tick without importing the recovery service directly.
     reconcileBlockedByIssueIds,
+
+    // ADR-010 §D2 (NFM-3860) — exposed so server/src/index.ts can fire the
+    // daily tick without importing the phantom-backfill service directly.
+    reconcilePhantomMergePasses,
 
     scanSilentActiveRuns,
 

@@ -67,6 +67,15 @@ export const instanceExperimentalSettingsSchema = z.object({
    * canary tier.
    */
   adr009ReconciliationHookEnabled: z.boolean().default(false),
+  /**
+   * ADR-010 §D2 (NFM-3860): enables the daily 05:00 UTC phantom-merge-pass
+   * backfill routine that scans for `done` issues matching the
+   * NFM-3850 phantom-pass signature and emits a recovery child per
+   * match (idempotent, blocked on the original). Off by default —
+   * operators enable it explicitly after the T4 dry-run confirms the
+   * SQL is bounded on production data.
+   */
+  phantomBackfillHookEnabled: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema.partial();
