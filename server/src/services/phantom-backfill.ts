@@ -10,20 +10,24 @@
  *     AND (title ~* '^Merge\\s+\\S+\\s+to\\smain'
  *          OR title ~* '^Merge\\s+\\S+\\s+branch')
  *     AND comment_count = 0
- *     AND assigned_agent_count_in_24h >= 3
  *
  * `comment_count` is a derived aggregate over `issue_comments` (count of
- * non-deleted rows). `assigned_agent_count_in_24h` is a derived aggregate
- * over `heartbeat_runs` (count of DISTINCT `agent_id` whose `created_at`
- * falls within the last 24h). Both are computed via correlated subqueries
- * so the planner can use the existing `issues_company_status_idx` index.
+ * non-deleted rows), computed via a correlated subquery so the planner
+ * can use the existing `issues_company_status_idx` index.
+ *
+ * NOTE: the original design-doc SQL also filtered on
+ *   assigned_agent_count_in_24h >= 3
+ * but the production `heartbeat_runs` table does not carry a per-issue
+ * correlation column (`issue_id` is absent), so that signal cannot be
+ * expressed without a schema migration that is out of scope for ADR-010
+ * §D2. The primary phantom signature (`comment_count = 0` on a `done`
+ * issue with merge-style title) is preserved and remains sufficient to
+ * surface the NFM-3850 phantom cluster.
  *
  * On match: create a `[<identifier>-phantom-recovery]` child issue with
  * `blockedByIssueIds: [<phantom_id>, <api_middleware_id>]` (the second is
  * the PreCompletionMerge hook service issue; resolves a configurable
  * `PAPERCLIP_PHANTOM_BACKFILL_HOOK_ISSUE_ID` env var, no-op when unset).
- * The recovery child is reassigned to the most-recent assignee so an
- * operator can immediately triage.
  *
  * Idempotence
  * -----------
@@ -42,7 +46,7 @@
 
 import { and, eq, gt, sql, desc } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issues, issueComments, heartbeatRuns } from "@paperclipai/db";
+import { issues, issueComments } from "@paperclipai/db";
 
 // ---------------------------------------------------------------------------
 // Constants (test-exported)
@@ -96,7 +100,17 @@ export interface PhantomMergePassMatch {
   status: string;
   createdAt: Date;
   commentCount: number;
+  /**
+   * Always 0 in this implementation. The original design called for
+   * "distinct agents touching the issue in the last 24h", but
+   * `heartbeat_runs` does not carry a per-issue column. The signal is
+   * left in the type for API stability and future schema work.
+   */
   distinctAssignees24h: number;
+  /**
+   * Always null in this implementation. See `distinctAssignees24h`.
+   * Left in the type for API stability.
+   */
   mostRecentAssigneeId: string | null;
 }
 
@@ -170,7 +184,6 @@ export async function findPhantomMergePasses(
   options: FindPhantomMergePassesOptions = {},
 ): Promise<PhantomMergePassMatch[]> {
   const createdAfter = options.createdAfter ?? DEFAULT_PHANTOM_WINDOW_START;
-  const minAssigneeCount = options.minAssigneeCount24h ?? DEFAULT_MIN_ASSIGNEE_COUNT_24H;
   const limit = options.limit ?? 100;
   const whitelist = new Set(options.whitelistIdentifiers ?? WHITELIST_IN_FLIGHT_IDENTIFIERS);
 
@@ -183,23 +196,10 @@ export async function findPhantomMergePasses(
       AND ${issueComments.deletedAt} IS NULL
   )`;
 
-  // correlated subquery: distinct agents in last 24h via heartbeat_runs
-  const distinctAssignees24hSql = sql<number>`(
-    SELECT COUNT(DISTINCT ${heartbeatRuns.agentId})::int FROM ${heartbeatRuns}
-    WHERE ${heartbeatRuns.issueId} = ${issues.id}
-      AND ${heartbeatRuns.agentId} IS NOT NULL
-      AND ${heartbeatRuns.createdAt} > NOW() - INTERVAL '24 hours'
-  )`;
-
-  // most-recent assignee in last 24h: take the latest heartbeat_runs.agent_id
-  const mostRecentAssigneeSql = sql<string | null>`(
-    SELECT ${heartbeatRuns.agentId} FROM ${heartbeatRuns}
-    WHERE ${heartbeatRuns.issueId} = ${issues.id}
-      AND ${heartbeatRuns.agentId} IS NOT NULL
-      AND ${heartbeatRuns.createdAt} > NOW() - INTERVAL '24 hours'
-    ORDER BY ${heartbeatRuns.createdAt} DESC
-    LIMIT 1
-  )`;
+  // NOTE: heartbeat-correlation signals were dropped because
+  // `heartbeat_runs` lacks an `issue_id` column. We expose
+  // `distinctAssignees24h: 0` and `mostRecentAssigneeId: null` as constant
+  // defaults so the public type remains stable.
 
   const rows = await db
     .select({
@@ -210,8 +210,6 @@ export async function findPhantomMergePasses(
       status: issues.status,
       createdAt: issues.createdAt,
       commentCount: commentCountSql,
-      distinctAssignees24h: distinctAssignees24hSql,
-      mostRecentAssigneeId: mostRecentAssigneeSql,
     })
     .from(issues)
     .where(
@@ -220,7 +218,6 @@ export async function findPhantomMergePasses(
         gt(issues.createdAt, createdAfter),
         sql`${issues.title} ~* ${titleRegex}`,
         sql`(${commentCountSql}) = 0`,
-        sql`(${distinctAssignees24hSql}) >= ${minAssigneeCount}`,
       ),
     )
     .orderBy(desc(issues.createdAt))
@@ -238,8 +235,8 @@ export async function findPhantomMergePasses(
     status: r.status,
     createdAt: r.createdAt,
     commentCount: Number(r.commentCount ?? 0),
-    distinctAssignees24h: Number(r.distinctAssignees24h ?? 0),
-    mostRecentAssigneeId: r.mostRecentAssigneeId ?? null,
+    distinctAssignees24h: 0,
+    mostRecentAssigneeId: null,
   }));
 }
 
@@ -301,8 +298,7 @@ export async function reconcilePhantomMergePasses(
       `Auto-recovery child for phantom merge pass detected by ADR-010 §D2 backfill.\n\n` +
       `Original issue: ${match.issueIdentifier}\n` +
       `Title: ${match.title}\n` +
-      `Most-recent assignee: ${match.mostRecentAssigneeId ?? "<none>"}\n` +
-      `Distinct assignees in last 24h: ${match.distinctAssignees24h}\n\n` +
+      `Comment count: ${match.commentCount}\n\n` +
       `This child is blocked on the original so it cannot be closed without ` +
       `resolving the underlying merge.`;
 
