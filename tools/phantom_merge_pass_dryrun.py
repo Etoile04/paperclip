@@ -76,9 +76,15 @@ DEFAULT_WHITELIST: tuple[str, ...] = ("NFM-3738",)
 # out of scope.
 DEFAULT_WINDOW_START = "2026-08-01T00:00:00Z"
 
-# Threshold for "at least N distinct assignees in the last 24h". The
-# production SQL uses >=3 (3 hand-offs in 24h is the heuristic).
-DEFAULT_MIN_ASSIGNEE_COUNT_24H = 3
+# NOTE: the production SQL previously also filtered on
+# `assigned_agent_count_in_24h >= 3`, but `heartbeat_runs` does not carry
+# a per-issue correlation column. The dry-run now mirrors that drop —
+# the primary phantom-pass signature (`comment_count = 0` on a `done`
+# issue with merge-style title) is sufficient and is what the production
+# routine now uses. The constant is retained as 0 so the CLI flag stays
+# stable and the dry-run cannot accidentally surface phantoms that the
+# routine would skip.
+DEFAULT_MIN_ASSIGNEE_COUNT_24H = 0
 
 _UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -306,8 +312,17 @@ def _distinct_assignees_24h(
     issue_id: str,
     now: datetime,
 ) -> tuple[int, str | None]:
-    """Return (distinct agents in last 24h, most-recent assignee id)."""
-    cutoff = (now - timedelta(hours=24)).isoformat()
+    """Return (distinct agents in last 24h, most-recent assignee id).
+
+    The production heartbeat table does not carry a per-issue column,
+    so we cannot compute a per-issue correlation here without a schema
+    migration that is out of scope for ADR-010 §D2. We return (0, None)
+    so the dry-run report surfaces the same set the production routine
+    will — anything that fails the upstream title + comment-count
+    filter is still filtered out by the routine's SQL.
+    """
+    _ = (company_id, issue_id, now)  # keep signature stable
+    return (0, None)
     agents: set[str] = set()
     most_recent_agent: str | None = None
     most_recent_at: datetime | None = None
