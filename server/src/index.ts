@@ -50,6 +50,10 @@ import {
   shouldFireAdr009DailyReconcile,
 } from "./services/adr009-daily-schedule.js";
 import {
+  ADR010_DAILY_PHANTOM_BACKFILL_CRON,
+  shouldFireAdr010DailyPhantomBackfill,
+} from "./services/adr010-phantom-backfill-schedule.js";
+import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
@@ -885,6 +889,39 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "routine scheduler tick failed");
         });
+
+      // ADR-010 §D2 (NFM-3860): daily 05:00 UTC phantom-merge-pass
+      // backfill tick. Fires one hour BEFORE the §4.3 tick so any
+      // recovery children emitted by D2 are visible to §4.3-a's next
+      // prune sweep. Feature-flag-gated inside the phantom-backfill
+      // service (`phantomBackfillHookEnabled`).
+      if (shouldFireAdr010DailyPhantomBackfill(new Date())) {
+        logger.info(
+          { cron: ADR010_DAILY_PHANTOM_BACKFILL_CRON, tz: "UTC" },
+          "adr010 §D2 daily phantom-merge-pass backfill tick firing",
+        );
+        void heartbeat
+          .reconcilePhantomMergePasses()
+          .then((result) => {
+            if (result.recoveryChildrenCreated > 0) {
+              logger.warn(
+                { ...result },
+                "adr010 §D2 phantom-merge-pass backfill emitted recovery children",
+              );
+            } else if (!result.skippedFlagOff) {
+              logger.info(
+                { ...result },
+                "adr010 §D2 phantom-merge-pass backfill completed (no-op)",
+              );
+            }
+          })
+          .catch((err) => {
+            logger.error(
+              { err },
+              "adr010 §D2 phantom-merge-pass backfill tick failed",
+            );
+          });
+      }
 
       // ADR-009 §4.3 (NFM-3584): daily 06:00 UTC reconciliation tick.
       // The schedule lives in code (see `adr009-daily-schedule.ts`). The

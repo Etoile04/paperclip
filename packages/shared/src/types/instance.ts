@@ -71,6 +71,13 @@ export interface InstanceExperimentalSettings {
    * `5f082df9-b131-4d6d-bf27-f678d4307325`.
    */
   precompletionMergeHookEnabled: boolean;
+  /**
+   * ADR-010 §D2 (NFM-3860): toggles the daily 05:00 UTC phantom-merge-pass
+   * backfill routine that scans for `done` issues with merge-style titles
+   * and zero comments (phantom pass cluster), then emits a recovery child
+   * blocked on the original. Off by default.
+   */
+  phantomBackfillHookEnabled: boolean;
 }
 
 export interface InstanceSettings {
