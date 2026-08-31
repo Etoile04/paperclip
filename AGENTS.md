@@ -178,6 +178,7 @@ A change is done when all are true:
 3. Contracts are synced across db/shared/server/ui
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
+6. If the issue is **merge-kind**, the merge is evidenced in git before `done` — see §12 PreCompletionMerge Hook
 
 ## 11. Fork-Specific: HenkDz/paperclip
 
@@ -220,3 +221,102 @@ PR #2218 (`feat/external-adapter-phase1`) adds external adapter support. See roo
 - `createServerAdapter()` must include ALL optional fields (especially `detectModel`)
 - Built-in UI adapters can shadow external plugin parsers; external override pause/resume should restore the built-in parser.
 - Reference external adapters: Droid (npm); Hermes can also be tested as an override package.
+
+## 12. PreCompletionMerge Hook — what CTO agents must NOT trip on
+
+> Numbering note: the issue that commissioned this section (NFM-3862 / NFM-3877)
+> specified "§9, after §8". That assumed a different file layout — this file's
+> §9 is already **UI Expectations**, and §8 is **API and Auth Expectations**.
+> Inserting there would renumber three sections and break existing references,
+> so the section is appended as §12 and cross-linked from §11 Definition of Done.
+
+**Read this before marking any merge-kind issue `done`.**
+
+The PreCompletionMerge hook (ADR-009 §4.4, NFM-3853/3855/3857) is an API-layer
+gate in front of `PATCH /api/issues/{id}`. It refuses the `status=done`
+transition with a `422` when an issue *claims* to be a merge but the named
+branch is not yet an ancestor of the base ref. It exists because of the
+NFM-3850 **phantom pass** cluster: issues marked `done` for merges that never
+landed in git. Paperclip said merged; git said nothing; the work was stranded.
+
+### When the gate fires
+
+An issue is **merge-kind** when its title starts with `merge ` (case-insensitive)
+**and** either the title targets `to main` / `to origin/main`, **or** the
+description mentions `gh pr merge`. For a merge-kind issue the PreCompletionMerge
+gate runs `git merge-base --is-ancestor <branch> <baseRef>` in the issue's
+execution workspace. Exit 0 allows the transition; exit 1 blocks it.
+
+Ordinary issues are never touched — the gate returns immediately for anything
+that is not merge-kind.
+
+### The three 422 codes
+
+| `code` | Meaning | What to do |
+| --- | --- | --- |
+| `merge_kind_unmerged_branch` | the branch is not an ancestor of the base ref | actually merge it, then retry `done` |
+| `merge_kind_missing_branch` | title is merge-kind but names no extractable branch | fix the title to `Merge <branch> to main` |
+| `merge_kind_no_workspace` | merge-kind issue has no execution workspace | attach a workspace, or the gate cannot verify anything |
+
+A `merge_kind_unmerged_branch` response carries `branch`, `hint`, and an
+`evidence_command` — the literal git invocation that produced the rejection.
+Run it. If it exits 0 the gate is wrong and you have found a bug; file it
+rather than working around it.
+
+### Feature flag
+
+`precompletionMergeHookEnabled`, an instance experimental setting,
+`z.boolean().default(false)` — **default OFF**. When off, the PreCompletionMerge
+hook is a complete no-op. The route re-reads the flag on every `status=done`
+PATCH, so an operator flip takes effect without a restart.
+
+The backfill (ADR-010 §D2, NFM-3860) has a separate flag,
+`phantomBackfillHookEnabled`. Enabling the gate does not enable the backfill.
+
+**Fork deployments:** the hook defaults its base ref to `origin/main`, but this
+fork's default branch is `master`. Set
+`PAPERCLIP_PRECOMPLETION_BASE_REF=origin/master` before enabling the flag here,
+or every merge-kind issue will block against a ref that does not exist.
+
+### Metrics
+
+- `paperclip_precompletion_merge_rejected_total{reason}` — 422s emitted by the gate.
+- `paperclip_precompletion_bypass_total{actor_kind}` — transitions let through
+  despite being merge-kind, because the actor was trusted.
+
+Be aware the `reason` label values (`non_ancestor_branch`,
+`no_extractable_branch`, `no_execution_workspace`) do **not** currently match
+the 422 `code` values above; dashboards cannot join the two vocabularies until
+that is reconciled.
+
+### System-actor bypass
+
+Actors of type `system` (cron and board-driven wakeups) bypass the gate
+entirely and increment `paperclip_precompletion_bypass_total`, writing an
+`issue.precompletion_bypass` activity row. This is deliberate — it lets
+legitimate in-flight merges land — but it is **audited, not free**. Every
+bypass is a row an operator can ask you about.
+
+### Ghost-merge recovery
+
+If the gate blocks a merge you believe is legitimate (typically: the merge is
+genuinely in flight, or the branch was squash-merged so its tip is not literally
+an ancestor), the only sanctioned path is:
+
+1. Reproduce with the `evidence_command` from the 422 body.
+2. If it exits 1, the gate is right — finish the merge in git first.
+3. If the merge truly cannot be completed in git, route the transition through
+   the system actor so the bypass is recorded.
+
+NFM-3738 is the reference case for a truthful in-flight merge and is
+whitelisted in the backfill; it must never be flagged as a phantom.
+
+### For CTO orchestrators specifically
+
+Do not mark a merge-kind issue `done` on the strength of an agent's handoff
+comment. The comment is a claim; `git merge-base --is-ancestor` is the evidence.
+If the PreCompletionMerge gate is disabled in your instance, run the check
+yourself before closing the issue — that is exactly the step whose absence
+produced NFM-3850.
+
+Full scenario coverage: [`docs/precompletion-merge-hook-test-plan.md`](docs/precompletion-merge-hook-test-plan.md).
