@@ -49,7 +49,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any
 
 # --- Configuration -----------------------------------------------------------
@@ -314,68 +314,18 @@ def _distinct_assignees_24h(
 ) -> tuple[int, str | None]:
     """Return (distinct agents in last 24h, most-recent assignee id).
 
-    The production heartbeat table does not carry a per-issue column,
-    so we cannot compute a per-issue correlation here without a schema
-    migration that is out of scope for ADR-010 §D2. We return (0, None)
-    so the dry-run report surfaces the same set the production routine
-    will — anything that fails the upstream title + comment-count
-    filter is still filtered out by the routine's SQL.
+    Deliberate no-op: the production heartbeat table does not carry a
+    per-issue correlation column, so we cannot compute this metric
+    here without a schema migration that is out of scope for ADR-010
+    §D2. Returning ``(0, None)`` keeps the dry-run report aligned with
+    the production routine — anything that fails the upstream title +
+    comment-count filter is still filtered out by the routine's SQL.
+
+    The signature is preserved so the call site in :func:`run_dry_run`
+    stays stable; the parameters are intentionally unused.
     """
-    _ = (company_id, issue_id, now)  # keep signature stable
+    del company_id, issue_id, now  # signature-stable deliberate no-op
     return (0, None)
-    agents: set[str] = set()
-    most_recent_agent: str | None = None
-    most_recent_at: datetime | None = None
-    cursor: str | None = None
-    page = 0
-    while True:
-        params: dict[str, str] = {"limit": "200"}
-        if cursor:
-            params["after"] = cursor
-        try:
-            result = _http_get(
-                f"/api/companies/{company_id}/heartbeat-runs",
-                params,
-            )
-        except ApiError as exc:
-            if exc.status == 404:
-                return (0, None)
-            raise
-        if isinstance(result, dict):
-            items = (
-                result.get("data")
-                or result.get("runs")
-                or result.get("items")
-                or []
-            )
-        else:
-            items = result
-        if not isinstance(items, list):
-            break
-        for run in items:
-            if run.get("issueId") != issue_id and run.get("issue_id") != issue_id:
-                continue
-            created = run.get("createdAt") or run.get("created_at") or ""
-            if created < cutoff:
-                continue
-            agent = run.get("agentId") or run.get("agent_id")
-            if not agent:
-                continue
-            agents.add(agent)
-            try:
-                created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if most_recent_at is None or created_dt > most_recent_at:
-                most_recent_at = created_dt
-                most_recent_agent = agent
-        if len(items) < 200:
-            break
-        cursor = items[-1].get("id") or items[-1].get("runId")
-        page += 1
-        if page > 100:
-            break
-    return (len(agents), most_recent_agent)
 
 
 # --- Scan logic --------------------------------------------------------------
