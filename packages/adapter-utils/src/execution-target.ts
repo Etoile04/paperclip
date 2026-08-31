@@ -72,6 +72,10 @@ import {
   type DuplexObservabilityRecorder,
   type Http2TelemetryEventName,
 } from "./duplex-observability.js";
+import {
+  createPrecompletionBridgeGuard,
+  type PrecompletionBridgeGuard,
+} from "./precompletion-bridge-guard.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
@@ -4380,6 +4384,19 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     `[paperclip] Starting sandbox callback bridge for ${input.adapterKey} in ${bridgeRuntimeDir}.\n`,
   );
 
+  // NFM-3858 — defense-in-depth: create the precompletion bridge guard.
+  // The guard runs in the host process and intercepts done-transition
+  // PATCHes before they reach the API server, mirroring the API-layer
+  // PreCompletionMerge gate at the adapter-runtime boundary.
+  const precompletionGuard: PrecompletionBridgeGuard | null = target.remoteCwd.trim().length > 0
+    ? createPrecompletionBridgeGuard({
+        apiUrl: hostApiUrl,
+        apiToken: hostApiToken,
+        workspacePath: target.remoteCwd,
+        runId: input.runId,
+      })
+    : null;
+
   const bridgeAsset = await createSandboxCallbackBridgeAsset();
 
   // The provider-scoped telemetry facade for the fixed duplex observability
@@ -4861,12 +4878,65 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       client,
       queueDir,
       maxBodyBytes,
+<<<<<<< HEAD
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
         reservation: options?.reservation,
       }),
+=======
+      handleRequest: async (request) => {
+        // NFM-3858 defense-in-depth: precompletion merge guard
+        if (precompletionGuard) {
+          const guardResult = await precompletionGuard.intercept(request);
+          if (guardResult) {
+            if (bridgeDebugEnabled) {
+              await onLog(
+                "stdout",
+                `[paperclip] Bridge precompletion guard blocked ${request.method} ${request.path}\n`,
+              );
+            }
+            return {
+              status: guardResult.status,
+              headers: guardResult.headers,
+              body: guardResult.body,
+            };
+          }
+        }
+        const method = request.method.trim().toUpperCase() || "GET";
+        if (bridgeDebugEnabled) {
+          await onLog(
+            "stdout",
+            `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
+          );
+        }
+        const headers = new Headers();
+        for (const [key, value] of Object.entries(request.headers)) {
+          if (value.trim().length === 0) continue;
+          headers.set(key, value);
+        }
+        headers.set("authorization", `Bearer ${hostApiToken}`);
+        headers.set("x-paperclip-run-id", input.runId);
+        const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), {
+          method,
+          headers,
+          ...(method === "GET" || method === "HEAD" ? {} : { body: request.body }),
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (bridgeDebugEnabled) {
+          await onLog(
+            "stdout",
+            `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
+          );
+        }
+        return {
+          status: response.status,
+          headers: buildBridgeResponseHeaders(response),
+          body: await readBridgeForwardResponseBody(response, maxBodyBytes),
+        };
+      },
+>>>>>>> 6bcee4c3e (feat(adr-009 44): ADK runtime PreCompletionMerge bridge guard (NFM-3858))
     });
     server = await startSandboxCallbackBridgeServer({
       runner,
