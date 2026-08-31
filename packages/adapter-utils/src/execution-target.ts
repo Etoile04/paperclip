@@ -18,6 +18,10 @@ import {
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
 } from "./sandbox-callback-bridge.js";
+import {
+  createPrecompletionBridgeGuard,
+  type PrecompletionBridgeGuard,
+} from "./precompletion-bridge-guard.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
@@ -1119,6 +1123,19 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     `[paperclip] Starting sandbox callback bridge for ${input.adapterKey} in ${bridgeRuntimeDir}.\n`,
   );
 
+  // NFM-3858 — defense-in-depth: create the precompletion bridge guard.
+  // The guard runs in the host process and intercepts done-transition
+  // PATCHes before they reach the API server, mirroring the API-layer
+  // PreCompletionMerge gate at the adapter-runtime boundary.
+  const precompletionGuard: PrecompletionBridgeGuard | null = target.remoteCwd.trim().length > 0
+    ? createPrecompletionBridgeGuard({
+        apiUrl: hostApiUrl,
+        apiToken: hostApiToken,
+        workspacePath: target.remoteCwd,
+        runId: input.runId,
+      })
+    : null;
+
   const bridgeAsset = await createSandboxCallbackBridgeAsset();
   let server: Awaited<ReturnType<typeof startSandboxCallbackBridgeServer>> | null = null;
   let worker: Awaited<ReturnType<typeof startSandboxCallbackBridgeWorker>> | null = null;
@@ -1141,6 +1158,23 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       queueDir,
       maxBodyBytes,
       handleRequest: async (request) => {
+        // NFM-3858 defense-in-depth: precompletion merge guard
+        if (precompletionGuard) {
+          const guardResult = await precompletionGuard.intercept(request);
+          if (guardResult) {
+            if (bridgeDebugEnabled) {
+              await onLog(
+                "stdout",
+                `[paperclip] Bridge precompletion guard blocked ${request.method} ${request.path}\n`,
+              );
+            }
+            return {
+              status: guardResult.status,
+              headers: guardResult.headers,
+              body: guardResult.body,
+            };
+          }
+        }
         const method = request.method.trim().toUpperCase() || "GET";
         if (bridgeDebugEnabled) {
           await onLog(
