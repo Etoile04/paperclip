@@ -187,7 +187,15 @@ async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedF
     // Filter to only non-private IPs instead of rejecting the entire request
     // when some IPs are private. This handles multi-homed hosts that resolve
     // to both private and public addresses.
-    const safeResults = results.filter((entry) => !isPrivateIP(entry.address));
+    //
+    // PAPERCLIP_PLUGIN_FETCH_ALLOW_PRIVATE=1 (local fork): bypass the private/
+    // reserved-range block. Single-operator local control plane — trusted
+    // plugins (honcho/hindsight) talk to localhost services (127.0.0.1:8000).
+    // Default (unset/0) keeps upstream SSRF behavior unchanged.
+    const allowPrivate = process.env.PAPERCLIP_PLUGIN_FETCH_ALLOW_PRIVATE === "1";
+    const safeResults = allowPrivate
+      ? results
+      : results.filter((entry) => !isPrivateIP(entry.address));
     if (safeResults.length === 0) {
       throw new Error(
         `All resolved IPs for ${originalHostname} are in private/reserved ranges`,
