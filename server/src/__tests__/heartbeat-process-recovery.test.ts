@@ -1614,6 +1614,80 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
   });
 
+  it("does not queue a finish-handoff corrective wake when open executing child issues own the next action (NFM-4279 Layer 1)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const childAgentId = randomUUID();
+    const childIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: childAgentId,
+      companyId,
+      name: "ChildWorker",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: issueId,
+      title: "Delegated detector build",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: childAgentId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Delegated the detector build to child issues, did not choose a final issue state.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Delegated the detector build to child issues, did not choose a final issue state.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    // The run finished successfully without a disposition, but the open executing
+    // child is a valid delegation disposition: no corrective wake, no handoff
+    // notice, no handoff activity — the children own the next action.
+    const handoffWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "finish_successful_run_handoff")));
+    expect(handoffWakeups).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY)).toBe(false);
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(false);
+
+    const parent = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parent?.status).toBe("in_progress");
+  });
+
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const idempotencyKey = `finish_successful_run_handoff:${issueId}:${runId}:1`;
@@ -1976,6 +2050,67 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       latestRunStatus: "succeeded",
       missingDisposition: "clear_next_step",
     });
+  });
+
+  it("skips exhausted successful-run handoff escalation when open executing child issues own the next action (NFM-4279 Layer 2)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: issueId,
+      title: "Delegated detector build still running",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Delegation is still in flight: no escalation, no blocked flip, no recovery action.
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(result.issueIds).toEqual([]);
+
+    const parent = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(parent?.status).toBe("in_progress");
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY)).toBe(false);
   });
 
   it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {
