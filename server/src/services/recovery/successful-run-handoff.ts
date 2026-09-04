@@ -6,6 +6,7 @@ import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
 export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state";
+export const OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON = "open child issues own the next action (delegation)";
 export const DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS = 1;
 export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
   "Paperclip needs a disposition before this issue can continue.";
@@ -346,6 +347,7 @@ export function decideSuccessfulRunHandoff(input: {
   taskKey: string | null;
   hasActiveExecutionPath: boolean;
   hasQueuedWake: boolean;
+  hasOpenExecutingChildren: boolean;
   hasPendingInteractionOrApproval: boolean;
   hasExplicitBlockerPath: boolean;
   hasOpenRecoveryIssue: boolean;
@@ -385,6 +387,9 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (input.hasActiveExecutionPath) return { kind: "skip", reason: "issue already has an active execution path" };
   if (input.hasQueuedWake) return { kind: "skip", reason: "issue already has a queued or deferred wake" };
+  if (input.hasOpenExecutingChildren) {
+    return { kind: "skip", reason: OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON };
+  }
   if (input.hasPendingInteractionOrApproval) {
     return { kind: "skip", reason: "pending interaction or approval owns the next action" };
   }

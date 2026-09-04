@@ -5433,6 +5433,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       budgetBlock,
       pauseHold,
       activeRoutineContinuation,
+      openExecutingChildren,
     ] = await Promise.all([
       issue
         ? db
@@ -5572,6 +5573,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .limit(1)
           .then((rows) => rows[0] ?? null)
         : Promise.resolve(null),
+      // NFM-4279 Layer 1: open executing children are a valid delegation
+      // disposition for an in_progress parent — no corrective wake needed.
+      issue
+        ? recovery.hasOpenExecutingChildIssues(issue.companyId, issue.id)
+        : Promise.resolve(false),
     ]);
 
     const decision = decideSuccessfulRunHandoff({
@@ -5583,6 +5589,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       taskKey,
       hasActiveExecutionPath: Boolean(activeExecutionPath),
       hasQueuedWake: Boolean(queuedWake),
+      hasOpenExecutingChildren: openExecutingChildren === true,
       hasPendingInteractionOrApproval: Boolean(pendingInteraction || pendingApproval),
       hasExplicitBlockerPath: Boolean(explicitBlocker),
       hasOpenRecoveryIssue: Boolean(openRecoveryIssue),
@@ -5592,7 +5599,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       idempotentWakeExists: Boolean(existingWake),
     });
 
-    if (decision.kind !== "enqueue" || !issue) return;
+    if (decision.kind !== "enqueue" || !issue) {
+      // NFM-4279: make skip reasons observable so delegation skips can be counted.
+      if (decision.kind === "skip") {
+        logger.info(
+          {
+            issueId: issue?.id ?? null,
+            issueIdentifier: issue?.identifier ?? null,
+            runId: run.id,
+            agentId: run.agentId,
+            reason: decision.reason,
+          },
+          "successful run handoff skipped",
+        );
+      }
+      return;
+    }
 
     const handoffRun = await enqueueWakeup(run.agentId, {
       source: "automation",

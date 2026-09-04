@@ -48,6 +48,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     taskKey: "issue-1",
     hasActiveExecutionPath: false,
     hasQueuedWake: false,
+    hasOpenExecutingChildren: false,
     hasPendingInteractionOrApproval: false,
     hasExplicitBlockerPath: false,
     hasOpenRecoveryIssue: false,
@@ -129,6 +130,20 @@ describe("successful run handoff decision", () => {
       kind: "skip",
       reason: "explicit blocker path owns the next action",
     });
+  });
+
+  it("T1 (NFM-4279): does not queue a corrective wake when open executing child issues own the next action", () => {
+    expect(decide({ hasOpenExecutingChildren: true })).toEqual({
+      kind: "skip",
+      reason: "open child issues own the next action (delegation)",
+    });
+  });
+
+  it("T3 (NFM-4279): parents without open executing children keep the current enqueue behavior", () => {
+    const decision = decide({ hasOpenExecutingChildren: false });
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.idempotencyKey).toBe("finish_successful_run_handoff:issue-1:run-1:1");
   });
 
   it("does not queue when the issue is the recurring parent of an active routine", () => {
