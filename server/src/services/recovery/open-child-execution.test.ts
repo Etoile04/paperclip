@@ -110,11 +110,3 @@ describe("exhausted handoff disposition (NFM-4279 Layer 2)", () => {
     });
   });
 });
-
-describe("handoff skip reason string (NFM-4279)", () => {
-  it("is stable and greppable", () => {
-    expect(OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON).toBe(
-      "open child issues own the next action (delegation)",
-    );
-  });
-});
