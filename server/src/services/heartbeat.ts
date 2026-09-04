@@ -13441,6 +13441,7 @@ export function heartbeatService(
       budgetBlock,
       pauseHold,
       activeRoutineContinuation,
+      openExecutingChildren,
     ] = await Promise.all([
       issue
         ? db
@@ -13586,6 +13587,11 @@ export function heartbeatService(
             .limit(1)
             .then((rows) => rows[0] ?? null)
         : Promise.resolve(null),
+      // NFM-4279 Layer 1: open executing children are a valid delegation
+      // disposition for an in_progress parent — no corrective wake needed.
+      issue
+        ? recovery.hasOpenExecutingChildIssues(issue.companyId, issue.id)
+        : Promise.resolve(false),
     ]);
 
     const decision = decideSuccessfulRunHandoff({
@@ -13599,10 +13605,14 @@ export function heartbeatService(
       taskKey,
       hasActiveExecutionPath: Boolean(activeExecutionPath),
       hasQueuedWake: Boolean(queuedWake),
+      hasOpenExecutingChildren: openExecutingChildren === true,
       hasPendingInteractionOrApproval: Boolean(
         pendingInteraction || pendingApproval,
       ),
       hasPersistedMonitor: Boolean(issue?.monitorNextCheckAt),
+      hasOpenExecutingChildren: openExecutingChildren === true,
+      hasPendingInteractionOrApproval: Boolean(pendingInteraction || pendingApproval),
+>>>>>>> 407ebf801 (feat(nfm-4279): open executing child issues are a valid handoff disposition)
       hasExplicitBlockerPath: Boolean(explicitBlocker),
       hasOpenRecoveryIssue: Boolean(openRecoveryIssue),
       hasPauseHold: Boolean(pauseHold),
@@ -13623,6 +13633,22 @@ export function heartbeatService(
     }
 
     if (decision.kind !== "enqueue" || !issue) return;
+    if (decision.kind !== "enqueue" || !issue) {
+      // NFM-4279: make skip reasons observable so delegation skips can be counted.
+      if (decision.kind === "skip") {
+        logger.info(
+          {
+            issueId: issue?.id ?? null,
+            issueIdentifier: issue?.identifier ?? null,
+            runId: run.id,
+            agentId: run.agentId,
+            reason: decision.reason,
+          },
+          "successful run handoff skipped",
+        );
+      }
+      return;
+    }
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db

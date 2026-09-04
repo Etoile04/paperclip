@@ -108,10 +108,6 @@ import {
   shouldFireAdr010DailyPhantomBackfill,
 } from "./services/adr010-phantom-backfill-schedule.js";
 import {
-  ADR010_DAILY_PHANTOM_BACKFILL_CRON,
-  shouldFireAdr010DailyPhantomBackfill,
-} from "./services/adr010-phantom-backfill-schedule.js";
-import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";

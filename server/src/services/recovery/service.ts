@@ -26,6 +26,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import type { SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   hasCommittedNativeBoardResponseWait,
@@ -120,6 +121,7 @@ import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+  OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
   isPluginManagedIssueLifecycle,
@@ -737,6 +739,65 @@ export function classifyContinuationFailure(
     baseBackoffMs: 0,
     errorCode,
   };
+}
+
+// NFM-4279: an `in_progress` delegation parent with open children that are
+// actively executing owns a valid disposition — the children hold the next
+// action, so the missing-disposition handoff machinery must not fire.
+
+export type OpenChildIssueRow = {
+  id: string;
+  companyId: string;
+  identifier: string | null;
+  assigneeAgentId: string | null;
+};
+
+export type ChildIssueExecutionProbe = {
+  isAgentInvokable: (agentId: string) => Promise<boolean>;
+  hasActiveExecutionPath: (companyId: string, issueId: string) => Promise<boolean>;
+};
+
+// The `executing` qualifier is load-bearing: an open child with no invokable
+// assignee and no active execution path does NOT satisfy the delegation skip
+// (a stuck child means the parent should still be nudged). Probes are injected
+// so the predicate stays unit-testable without a database.
+export async function hasExecutingChildIssue(
+  children: readonly OpenChildIssueRow[],
+  probe: ChildIssueExecutionProbe,
+): Promise<boolean> {
+  for (const child of children) {
+    if (child.assigneeAgentId != null && (await probe.isAgentInvokable(child.assigneeAgentId))) {
+      return true;
+    }
+    if (await probe.hasActiveExecutionPath(child.companyId, child.id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Shared open-children filter: parentId match, not hidden, not terminal.
+// Mirrors blocker semantics — cancelled children never count as resolved.
+export function buildOpenChildIssuesWhere(companyId: string, parentId: string): SQL<unknown> {
+  return and(
+    eq(issues.companyId, companyId),
+    eq(issues.parentId, parentId),
+    isNull(issues.hiddenAt),
+    notInArray(issues.status, ["done", "cancelled"]),
+  ) as SQL<unknown>;
+}
+
+export type ExhaustedHandoffDisposition = { kind: "escalate" } | { kind: "skip"; reason: string };
+
+// Layer 2 (defensive): before escalating an exhausted corrective handoff run,
+// re-check the issue for a now-valid disposition. Open executing children mean
+// delegation is still in flight and escalation would loop (NFM-4277).
+export function decideExhaustedHandoffDisposition(input: {
+  hasOpenExecutingChildren: boolean;
+}): ExhaustedHandoffDisposition {
+  return input.hasOpenExecutingChildren
+    ? { kind: "skip", reason: OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON }
+    : { kind: "escalate" };
 }
 
 function successfulRunHandoffRecoveryEvidence(
@@ -2866,20 +2927,6 @@ export function recoveryService(
     );
   }
 
-  async function openChildIssues(issue: typeof issues.$inferSelect) {
-    return db
-      .select({ id: issues.id, identifier: issues.identifier })
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, issue.companyId),
-          eq(issues.parentId, issue.id),
-          visibleIssueCondition(),
-          notInArray(issues.status, ["done", "cancelled"]),
-        ),
-      );
-  }
-
   async function healthyOpenChildIssues(issue: typeof issues.$inferSelect, sameWorkspaceOnly = false) {
     if (sameWorkspaceOnly && !issue.projectWorkspaceId) return [];
     const childCandidates = await db
@@ -2922,6 +2969,34 @@ export function recoveryService(
         ...openChildren.map((row) => row.id),
       ]),
     ];
+  async function listOpenChildIssues(companyId: string, parentId: string) {
+    return db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(buildOpenChildIssuesWhere(companyId, parentId));
+  }
+
+  async function hasOpenExecutingChildIssues(companyId: string, issueId: string) {
+    const openChildren = await listOpenChildIssues(companyId, issueId);
+    return hasExecutingChildIssue(openChildren, {
+      isAgentInvokable: async (agentId) => {
+        const agent = await getAgent(agentId);
+        return Boolean(agent && agent.companyId === companyId && (await isAgentInvokable(agent)));
+      },
+      hasActiveExecutionPath: (childCompanyId, childIssueId) =>
+        hasActiveExecutionPath(childCompanyId, childIssueId),
+    });
+  }
+
+  async function resolveContinuationWaitingOnReview(issue: typeof issues.$inferSelect) {
+    const existingBlockers = await existingUnresolvedBlockerIssues(issue.companyId, issue.id);
+    const openChildren = await listOpenChildIssues(issue.companyId, issue.id);
+    const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
     if (blockedByIssueIds.length === 0) return null;
 
     const updated = await issuesSvc.update(issue.id, {
@@ -5283,6 +5358,26 @@ export function recoveryService(
           }
         }
 
+        // NFM-4279 Layer 2: re-check for a now-valid disposition before
+        // escalating. Open executing children mean delegation is still in
+        // flight — escalating here re-creates the escalate/unblock loop.
+        const disposition = decideExhaustedHandoffDisposition({
+          hasOpenExecutingChildren: await hasOpenExecutingChildIssues(issue.companyId, issue.id),
+        });
+        if (disposition.kind === "skip") {
+          logger.info(
+            {
+              issueId: issue.id,
+              identifier: issue.identifier,
+              runId: latestRun?.id ?? null,
+              reason: disposition.reason,
+            },
+            "exhausted successful-run handoff escalation skipped: valid delegation disposition",
+          );
+          result.skipped += 1;
+          continue;
+        }
+
         const updated = await escalateStrandedAssignedIssue({
           issue,
           previousStatus: "in_progress",
@@ -6669,6 +6764,8 @@ export function recoveryService(
     sweepStaleIssueLocks,    reconcileResolvedDependencyWakeBackstop,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
-    reconcileBlockedByIssueIds,    readRecoveryTimerIntervalMs,
+    reconcileBlockedByIssueIds,
+    listOpenChildIssues,
+    hasOpenExecutingChildIssues,
   };
 }
