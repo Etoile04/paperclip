@@ -2148,6 +2148,30 @@ export function pluginLoader(
       }
 
       // ------------------------------------------------------------------
+      // 4b. Load stored company configs BEFORE starting the worker
+      // ------------------------------------------------------------------
+      // The worker authorizes its proactive (no-invocation) company scopes from
+      // its configured companies. A proactive plugin issues its one-shot
+      // events.subscribe / config.get calls from setup(), which runs while
+      // startWorker is still awaiting the worker's initialize response, so
+      // the authorized company set must be seeded onto the worker handle BEFORE
+      // startWorker spawns the process — not after startWorker resolves
+      // (LOOA-695). The same rows drive startup config delivery in step 5b.
+      let configRows: Awaited<ReturnType<typeof registry.listConfigs>> = [];
+      try {
+        configRows = await registry.listConfigs(pluginId);
+      } catch (listErr) {
+        log.debug(
+          {
+            pluginId,
+            pluginKey,
+            err: listErr instanceof Error ? listErr.message : String(listErr),
+          },
+          "plugin-loader: could not list stored configs before worker start",
+        );
+      }
+
+      // ------------------------------------------------------------------
       // 5. Spawn worker process
       // ------------------------------------------------------------------
       const workerOptions: WorkerStartOptions = {
@@ -2160,6 +2184,10 @@ export function pluginLoader(
         hostHandlers,
         autoRestart: true,
         env: buildPluginWorkerEnv({ manifest, instanceInfo }),
+        // Authorize the worker to act on each configured company from its
+        // proactive loops/timers (LOOA-629). Seeded here so it is in place
+        // before any setup()-time worker→host call (LOOA-695).
+        proactiveCompanyScopes: configRows.map((row) => row.companyId),
       };
 
       // Repo-local plugin installs can resolve workspace TS sources at runtime
