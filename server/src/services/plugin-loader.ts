@@ -39,6 +39,7 @@ import type {
   PluginUiSlotDeclaration,
 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { pluginManifestValidator } from "./plugin-manifest-validator.js";
 import { pluginCapabilityValidator } from "./plugin-capability-validator.js";
 import { pluginRegistryService } from "./plugin-registry.js";
@@ -2177,6 +2178,75 @@ export function pluginLoader(
       );
 
       // ------------------------------------------------------------------
+      // 5b. Deliver stored configuration to the freshly-started worker
+      // ------------------------------------------------------------------
+      // The worker is spawned with an empty bootstrap config and is expected to
+      // read company-scoped config via ctx.config.get(companyId). That call
+      // only resolves inside a company-scoped invocation (event/action/tool),
+      // so a proactive plugin that does company work from setup() — e.g. the
+      // chat gateway opening a Slack Socket Mode connection — can never read
+      // its own config and comes up inert. Replay each configured company's
+      // config through the same configChanged path an operator config-save
+      // uses (routes/plugins.ts), so the worker receives it at startup.
+      // Best-effort: a worker that doesn't implement onConfigChanged
+      // (METHOD_NOT_IMPLEMENTED) or is momentarily unavailable simply keeps the
+      // runtime ctx.config.get(companyId) model. onConfigChanged is idempotent
+      // for well-behaved plugins, so replaying an unchanged config is safe.
+      try {
+        const configRows = await registry.listConfigs(pluginId);
+
+        // Authorize the worker to act on each configured company from its
+        // proactive loops (LOOA-629). A proactive plugin (e.g. the chat
+        // gateway's notifier drain) makes company-scoped worker→host calls
+        // outside any host-issued invocation; without this the governed-access
+        // gate rejects them with "company context is required". The authorized
+        // set is exactly the plugin's configured companies — proactive access
+        // never reaches an unconfigured company.
+        workerManager.setProactiveCompanyScopes(
+          pluginId,
+          configRows.map((row) => row.companyId),
+        );
+
+        for (const row of configRows) {
+          try {
+            await workerManager.call(pluginId, "configChanged", {
+              config: (row.configJson ?? {}) as Record<string, unknown>,
+              companyId: row.companyId,
+            });
+          } catch (configErr) {
+            // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
+            // than collapse onto a second company's config — surface that at
+            // warn so the misconfiguration (multiple distinct companies
+            // configured for a single-tenant plugin) is visible, instead of
+            // being lost in the best-effort debug stream.
+            const code = (configErr as { code?: number } | null)?.code;
+            const details = {
+              pluginId,
+              pluginKey,
+              companyId: row.companyId,
+              code,
+              err: configErr instanceof Error ? configErr.message : String(configErr),
+            };
+            if (code === PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED) {
+              log.warn(
+                details,
+                "plugin-loader: startup config delivery rejected — single-tenant plugin configured for multiple companies",
+              );
+            } else {
+              log.debug(details, "plugin-loader: startup config delivery skipped for company");
+            }
+          }
+        }
+      } catch (listErr) {
+        log.debug(
+          {
+            pluginId,
+            pluginKey,
+            err: listErr instanceof Error ? listErr.message : String(listErr),
+          },
+          "plugin-loader: could not list stored configs for startup delivery",
+        );
+      }
       // 6. Sync job declarations and register with scheduler
       // ------------------------------------------------------------------
       const jobDeclarations = manifest.jobs ?? [];
