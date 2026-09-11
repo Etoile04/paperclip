@@ -12,6 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import { applyL1Jitter } from "./agent-burn-budget.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -984,8 +985,17 @@ export function buildInitialIssueMonitorFields(input: {
   }
 
   const monitorState = buildScheduledMonitorState(null, input.policy.monitor);
+  // ADR-014 L1: apply per-agent wake jitter so the fleet does not synchronously
+  // fire on the per-tick selector. Offset is stable per agentId via SHA-1
+  // (applyL1Jitter), bounded to ±JITTER_CEIL_MINUTES. The scheduler's nominal
+  // cadence is preserved; only the absolute firing time is shifted.
+  const assigneeAgentId = input.assigneeAgentId ?? null;
+  const baseNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
+  const jitteredNextCheckAt = assigneeAgentId
+    ? applyL1Jitter(baseNextCheckAt, assigneeAgentId)
+    : baseNextCheckAt;
   return {
-    monitorNextCheckAt: new Date(input.policy.monitor.nextCheckAt),
+    monitorNextCheckAt: jitteredNextCheckAt,
     monitorWakeRequestedAt: null,
     monitorNotes: input.policy.monitor.notes ?? null,
     monitorScheduledBy: input.policy.monitor.scheduledBy,

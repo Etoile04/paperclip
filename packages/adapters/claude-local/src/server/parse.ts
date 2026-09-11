@@ -13,6 +13,17 @@ const CLAUDE_TRANSIENT_UPSTREAM_RE =
   /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
 const CLAUDE_EXTRA_USAGE_RESET_RE =
   /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+// Shared-account 5h usage-cap exhaustion surfaces as `429 [1308]`. The zh
+// wording is the belt-and-braces arm: it keeps classification working if the
+// numeric tag is ever dropped or reformatted. See NFM-4661 / NFM-4657.
+const CLAUDE_USAGE_CAP_EXHAUSTED_RE = /\[\s*1308\s*\]|已达到[\s\S]{0,30}?使用上限/;
+// Absolute reset timestamps rendered by the CLI in the engine host's locale:
+// zh `将在 2026-09-11 03:44:07 重置` and English `resets at 2026-09-11 03:44:07`.
+const CLAUDE_ABSOLUTE_RESET_DATETIME_RE =
+  /(?:将\s*在|resets?\s+at\s+)\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/i;
+// The 5h usage cap bounds the plausible reset horizon; anything further out
+// (or in the past) is treated as a misparse rather than a usable hint.
+const CLAUDE_USAGE_CAP_RESET_HORIZON_MS = 6 * 60 * 60 * 1000;
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -394,6 +405,26 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
   return retryAt;
 }
 
+function parseClaudeAbsoluteResetTime(match: RegExpMatchArray, now: Date): Date | null {
+  const year = Number.parseInt(match[1] ?? "", 10);
+  const month = Number.parseInt(match[2] ?? "", 10);
+  const day = Number.parseInt(match[3] ?? "", 10);
+  const hour = Number.parseInt(match[4] ?? "", 10);
+  const minute = Number.parseInt(match[5] ?? "", 10);
+  const second = Number.parseInt(match[6] ?? "0", 10);
+  if (![year, month, day, hour, minute, second].every(Number.isInteger)) return null;
+
+  // The CLI that rendered the message runs on the same host as the engine, so
+  // the wall-clock timestamp is interpreted as engine-host-local time — no
+  // timezone conversion applies.
+  const candidate = new Date(year, month - 1, day, hour, minute, second, 0);
+  if (Number.isNaN(candidate.getTime())) return null;
+
+  const deltaMs = candidate.getTime() - now.getTime();
+  if (deltaMs <= 0 || deltaMs > CLAUDE_USAGE_CAP_RESET_HORIZON_MS) return null;
+  return candidate;
+}
+
 export function extractClaudeRetryNotBefore(
   input: {
     parsed?: Record<string, unknown> | null;
@@ -404,9 +435,27 @@ export function extractClaudeRetryNotBefore(
   now = new Date(),
 ): Date | null {
   const haystack = buildClaudeTransientHaystack(input);
+  const absoluteMatch = haystack.match(CLAUDE_ABSOLUTE_RESET_DATETIME_RE);
+  if (absoluteMatch) {
+    const absolute = parseClaudeAbsoluteResetTime(absoluteMatch, now);
+    // A clamped absolute timestamp is not usable on its own; fall through so a
+    // trailing relative clock hint (e.g. "resets 4pm (UTC)") can still apply.
+    if (absolute) return absolute;
+  }
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   if (!match) return null;
   return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
+}
+
+export function isClaudeUsageCapExhaustedError(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = buildClaudeTransientHaystack(input);
+  if (!haystack) return false;
+  return CLAUDE_USAGE_CAP_EXHAUSTED_RE.test(haystack);
 }
 
 export function isClaudeTransientUpstreamError(input: {
@@ -429,5 +478,9 @@ export function isClaudeTransientUpstreamError(input: {
 
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;
+  // Usage-cap exhaustion is transient by definition (the cap resets), so the
+  // distinct `claude_usage_cap_exhausted` errorCode always stays inside the
+  // transient_upstream family and keeps its retryNotBefore contract.
+  if (CLAUDE_USAGE_CAP_EXHAUSTED_RE.test(haystack)) return true;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
