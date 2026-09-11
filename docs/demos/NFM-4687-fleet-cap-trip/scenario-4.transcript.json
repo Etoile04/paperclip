@@ -1,0 +1,20 @@
+{
+  "scenario": "scenario-4-recovery-clears-trip",
+  "fixture_sequence": [
+    { "remainingByAgent": { "agent-recover": 0.25 }, "expected_verdict": "block" },
+    { "remainingByAgent": { "agent-recover": 0.36 }, "expected_verdict": "allow", "note": "0.36 ≥ FLEET_CAP_RECOVER_REMAINING_PCT (0.35)" }
+  ],
+  "expected_outcome": "recovery lifts the trip; new heavy dispatch lands normally",
+  "second_contextSnapshot": {
+    "fleet_dispatch": {
+      "verdict": "allow",
+      "reason": "heavy_under_budget",
+      "blocked": false,
+      "burn": {
+        "remainingPctOfCeiling": 0.36,
+        "tripped": false
+      }
+    }
+  },
+  "transcript_note": "Trip threshold is 0.30 (REMAINING_PCT_BELOW_TRIP). Recovery threshold is 0.35 (FLEET_CAP_RECOVER_REMAINING_PCT). The gap prevents oscillation at the boundary."
+}

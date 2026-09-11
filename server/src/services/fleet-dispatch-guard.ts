@@ -91,6 +91,16 @@ export function evaluateDispatch(input: DispatchGuardInput): DispatchGuardResult
 /**
  * Attach the guard outcome to a contextSnapshot. Idempotent: does not
  * overwrite existing keys, just enriches.
+ *
+ * NFM-4695 / ADR-014 §6: reviewOnly:true is the degraded-instruction-set
+ * cue for the agent harness. When the L4 burn budget is tripped and the
+ * dispatch is heavy:
+ *   - verdict=block         → reviewOnly:true (wake not enqueued, but the
+ *                              audit trail records the degraded state)
+ *   - verdict=allow_demoted  → reviewOnly:true (wake proceeds with read-only
+ *                              preamble; harness strips file-edit / git /
+ *                              WebSearch / Agent tools)
+ *   - verdict=allow (non-heavy) → reviewOnly absent (no degraded state)
  */
 export function annotateContextSnapshot(
   base: Record<string, unknown> | null | undefined,
@@ -112,6 +122,12 @@ export function annotateContextSnapshot(
   };
   if (result.blocked) {
     out.dispatch = { ...(out.dispatch as Record<string, unknown> | undefined), blocked: true };
+  }
+  // NFM-4695: reviewOnly flag for the degraded instruction set. Block and
+  // allow_demoted both indicate the agent should restrict itself; non-heavy
+  // wakes are not degraded even if the budget is tripped.
+  if (result.verdict === DISPATCH_VERDICT_BLOCK || result.verdict === DISPATCH_VERDICT_ALLOW_DEMOTED) {
+    out.reviewOnly = true;
   }
   return out;
 }

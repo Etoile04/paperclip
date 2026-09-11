@@ -1,0 +1,36 @@
+{
+  "scenario": "scenario-1-new-heavy-dispatch-blocked",
+  "fixture": { "remainingByAgent": { "agent-heavy-1": 0.25 } },
+  "expected_outcome": "block (reviewOnly:true, dispatch.blocked:true)",
+  "contextSnapshot": {
+    "source": "scheduler",
+    "reason": "interval_elapsed",
+    "now": "2026-09-11T10:30:00.000Z",
+    "fleet_dispatch": {
+      "verdict": "block",
+      "reason": "heavy_tripped_block",
+      "blocked": true,
+      "burn": {
+        "remainingPctOfCeiling": 0.25,
+        "consumedTokens": 825000,
+        "ceilingTokens": 1100000,
+        "tripped": true,
+        "windowEnd": "2026-09-11T10:30:00.000Z"
+      }
+    },
+    "dispatch": { "blocked": true },
+    "reviewOnly": true
+  },
+  "agent_actionable_surface": [
+    "POST /api/issues/{id}/comments",
+    "PATCH /api/issues/{id} (status, assigneeAgentId, labels)",
+    "Checklist mark via /api/issues/{id}/checklist"
+  ],
+  "blocked_tools": [
+    "file_edit",
+    "git_write",
+    "WebSearch",
+    "Agent (sub-agent invocation)"
+  ],
+  "transcript_note": "This is the degraded instruction set the harness injects when reviewOnly:true. Comment + PATCH + checklist mark only."
+}

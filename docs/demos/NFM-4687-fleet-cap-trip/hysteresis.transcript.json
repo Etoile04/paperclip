@@ -1,0 +1,21 @@
+{
+  "scenario": "hysteresis-no-flap",
+  "state_machine": "decideFleetPressure (L3 fleet-pressure.ts)",
+  "hysteresis_ticks": 3,
+  "fixture_sequence": [
+    { "tick": 1, "remainingPctOfCeiling": 0.29, "tripped": true,  "expected_state": "incident", "expected_transition": true },
+    { "tick": 2, "remainingPctOfCeiling": 0.36, "tripped": false, "expected_state": "incident", "expected_transition": false, "note": "consecNormal=1, hysteresis unsatisfied" },
+    { "tick": 3, "remainingPctOfCeiling": 0.29, "tripped": true,  "expected_state": "incident", "expected_transition": false, "note": "consecNormal resets on tripped" },
+    { "tick": 4, "remainingPctOfCeiling": 0.36, "tripped": false, "expected_state": "incident", "expected_transition": false, "note": "consecNormal=1, hysteresis unsatisfied" },
+    { "tick": 5, "remainingPctOfCeiling": 0.36, "tripped": false, "expected_state": "incident", "expected_transition": false, "note": "consecNormal=2, hysteresis still unsatisfied — no flap" }
+  ],
+  "counter_test": {
+    "scenario": "hysteresis-clears-without-oscillation",
+    "fixture_sequence": [
+      { "tick": 1, "remainingPctOfCeiling": 0.36, "tripped": false, "consec_after": 1 },
+      { "tick": 2, "remainingPctOfCeiling": 0.36, "tripped": false, "consec_after": 2 },
+      { "tick": 3, "remainingPctOfCeiling": 0.36, "tripped": false, "consec_after": 3, "expected_state": "normal", "expected_transition": true }
+    ]
+  },
+  "transcript_note": "Oscillating 29%↔36% does not accumulate enough consecutive normal readings to clear the incident. Trip self-clears only when 3+ consecutive normal readings are observed."
+}

@@ -21,6 +21,7 @@ import {
   BURN_BUDGET_BOOTSTRAP_FACTOR,
   REMAINING_PCT_BELOW_TRIP,
 } from "./fleet-throttle-constants.js";
+import { resolveFleetCapReading } from "./fleet-cap-test-seam.js";
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
@@ -100,6 +101,27 @@ export async function readBurnBudgetForAgent(
   config: BurnBudgetConfig = DEFAULT_BURN_BUDGET_CONFIG,
 ): Promise<BurnBudgetState> {
   const windowStart = new Date(now.getTime() - FIVE_HOURS_MS);
+  const ceiling = Math.max(1, config.ceilingTokens);
+
+  // NFM-4695 test seam: if a synthetic fixture is loaded for this agent
+  // (or fleet-wide), short-circuit the DB query. The seam is fail-closed —
+  // resolveFleetCapReading returns null when no fixture is loaded, so the
+  // default code path runs unchanged.
+  const fixtureReading = resolveFleetCapReading(agentId, { consumedTokens: 0, ceilingTokens: ceiling });
+  if (fixtureReading) {
+    return computeBurnBudgetFromSlice(
+      {
+        agentId,
+        windowStart,
+        windowEnd: now,
+        inputTokens: fixtureReading.consumedTokens,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+      },
+      config,
+    );
+  }
+
   const row = await db
     .select({
       inputTokens: sql<number>`COALESCE(SUM(${costEvents.inputTokens}), 0)`,

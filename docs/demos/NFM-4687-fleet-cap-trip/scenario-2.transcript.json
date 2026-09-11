@@ -1,0 +1,21 @@
+{
+  "scenario": "scenario-2-in-flight-demote",
+  "fixture_sequence": [
+    { "tick": 1, "remainingByAgent": { "agent-inflight": 0.60 }, "expected_verdict": "allow" },
+    { "tick": 2, "remainingByAgent": { "agent-inflight": 0.25 }, "expected_verdict": "block", "note": "trip fires mid-flight at next enqueueWakeup boundary" }
+  ],
+  "expected_outcome": "in-flight heavy run demoted to read-only-mode without crashing",
+  "second_contextSnapshot": {
+    "fleet_dispatch": {
+      "verdict": "block",
+      "reason": "heavy_tripped_block",
+      "blocked": true,
+      "burn": {
+        "remainingPctOfCeiling": 0.25,
+        "tripped": true
+      }
+    },
+    "reviewOnly": true
+  },
+  "transcript_note": "The in-flight heavy run does NOT crash — it gets the degraded instruction set injected at the next enqueueWakeup call. The agent's existing tool calls in-flight complete normally; only subsequent calls are gated."
+}

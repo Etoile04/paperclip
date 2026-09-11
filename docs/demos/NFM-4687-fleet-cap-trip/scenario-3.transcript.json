@@ -1,0 +1,17 @@
+{
+  "scenario": "scenario-3-light-work-continues",
+  "fixture": { "remainingByAgent": { "agent-light": 0.25 } },
+  "expected_outcome": "comment + PATCH + checklist mark work continues (L4 demotes heavy, not all work)",
+  "contextSnapshot": {
+    "fleet_dispatch": {
+      "verdict": "allow",
+      "reason": "non_heavy",
+      "blocked": false,
+      "burn": {
+        "remainingPctOfCeiling": 0.25,
+        "tripped": true
+      }
+    }
+  },
+  "transcript_note": "reviewOnly is undefined for non-heavy dispatches even when the budget is tripped. The 5_000 estimated tokens is well below HEAVY_DISPATCH_TOKEN_THRESHOLD=50_000."
+}

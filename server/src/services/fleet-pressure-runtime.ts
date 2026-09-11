@@ -22,6 +22,7 @@ import {
   type FleetPressureState,
 } from "./fleet-pressure.js";
 import { REMAINING_PCT_BELOW_TRIP } from "./fleet-throttle-constants.js";
+import { resolveFleetCapReading } from "./fleet-cap-test-seam.js";
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
@@ -58,6 +59,19 @@ export async function readFleetPressureReading(
   // When no DB is provided (tests), return a safe-default non-tripped reading.
   if (!db) {
     return { remainingPctOfCeiling: 1, tripped: false };
+  }
+  // NFM-4695 test seam: when a fleet-wide synthetic fixture is loaded, short-
+  // circuit the DB aggregate. The seam is fail-closed — no fixture means
+  // production behaviour.
+  const fixture = resolveFleetCapReading("__fleet__", {
+    consumedTokens: 0,
+    ceilingTokens: 1_100_000 * 8,
+  });
+  if (fixture) {
+    return {
+      remainingPctOfCeiling: fixture.remainingPctOfCeiling,
+      tripped: fixture.remainingPctOfCeiling < REMAINING_PCT_BELOW_TRIP,
+    };
   }
   const windowStart = new Date(now.getTime() - FIVE_HOURS_MS);
   const row = await db
