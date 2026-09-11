@@ -141,6 +141,69 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
   );
 
   it(
+    "bootstraps a fresh database through migration 0126 with account.issuer in place",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      await applyPendingMigrations(connectionString);
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const columns = await sql.unsafe<{ is_nullable: string; column_default: string }[]>(
+          `
+            SELECT is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'account'
+              AND column_name = 'issuer'
+          `,
+        );
+        expect(columns).toHaveLength(1);
+        expect(columns[0].is_nullable).toBe("NO");
+        expect(columns[0].column_default).toBe("'local:credential'::text");
+      } finally {
+        await sql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "replays migration 0126 safely when its schema changes already exist",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      await applyPendingMigrations(connectionString);
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const codifyHash = await migrationHash(
+          "0126_codify_20260908_emergency_schema_patches.sql",
+        );
+
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${codifyHash}'`,
+        );
+      } finally {
+        await sql.end();
+      }
+
+      const pendingState = await inspectMigrations(connectionString);
+      expect(pendingState).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0126_codify_20260908_emergency_schema_patches.sql"],
+        reason: "pending-migrations",
+      });
+
+      await applyPendingMigrations(connectionString);
+
+      const finalState = await inspectMigrations(connectionString);
+      expect(finalState.status).toBe("upToDate");
+    },
+    20_000,
+  );
+
+  it(
     "enforces a unique board_api_keys.key_hash after migration 0044",
     async () => {
       const connectionString = await createTempDatabase();
