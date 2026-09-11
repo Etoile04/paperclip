@@ -289,6 +289,18 @@ export function pluginRegistryService(db: Db) {
         .then((rows) => rows[0] ?? null),
 
     /**
+     * List all per-company config rows for a plugin, ordered deterministically
+     * by companyId (LOOA-695 backport). Drives proactive company-scope seeding
+     * and startup config delivery for freshly-started workers.
+     */
+    listConfigs: (pluginId: string) =>
+      db
+        .select()
+        .from(pluginConfig)
+        .where(eq(pluginConfig.pluginId, pluginId))
+        .orderBy(asc(pluginConfig.companyId)),
+
+    /**
      * Create or fully replace a plugin's instance configuration.
      * If a config row already exists for the plugin it is replaced;
      * otherwise a new row is inserted.

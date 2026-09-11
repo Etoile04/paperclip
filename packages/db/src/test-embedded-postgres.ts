@@ -2,7 +2,14 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { applyPendingMigrations, ensurePostgresDatabase } from "./client.js";
+import postgres from "postgres";
+import {
+  applyPendingMigrations,
+  applyPendingMigrationsManually,
+  ensurePostgresDatabase,
+  inspectMigrations,
+  readMigrationFileContent,
+} from "./client.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 
 type EmbeddedPostgresInstance = {
@@ -143,6 +150,67 @@ export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgres
   return await embeddedPostgresSupportPromise;
 }
 
+// NFM-4666: migration 0126 codifies schema patches that were applied ad-hoc via
+// psql to the running production database during the 2026-09-07/08 LOOA-695
+// incident. `account.issuer` was created by that emergency patch and no
+// migration in the lineage ever creates it, so replaying 0126 against a fresh
+// database fails unless the column is scaffolded first — mirroring the physical
+// production state 0126 was written against. Migrations stay untouched:
+// rewriting 0126 instead (option (a) in the NFM-4666 write-up) requires SRE/RE
+// coordination because it changes the hash recorded in production's journal.
+const LEGACY_EMERGENCY_PATCH_ALTER_PATTERN = /ALTER\s+TABLE\s+"account"\s+ALTER\s+COLUMN\s+"issuer"/i;
+const LEGACY_EMERGENCY_PATCH_SCAFFOLDING_STATEMENTS = [
+  `ALTER TABLE "account" ADD COLUMN IF NOT EXISTS "issuer" text NOT NULL DEFAULT 'local:credential'`,
+];
+
+async function applyLegacyEmergencyPatchScaffolding(url: string): Promise<void> {
+  const sql = postgres(url, { max: 1, onnotice: () => {} });
+  try {
+    for (const statement of LEGACY_EMERGENCY_PATCH_SCAFFOLDING_STATEMENTS) {
+      await sql.unsafe(statement);
+    }
+  } finally {
+    await sql.end();
+  }
+}
+
+async function applyEmbeddedPostgresTestMigrations(url: string): Promise<void> {
+  const initialState = await inspectMigrations(url);
+  if (initialState.status === "upToDate") return;
+
+  // Migration file names carry zero-padded journal indexes, so file-name order
+  // matches the journal order the migration runner itself enforces.
+  const pendingMigrations = [...initialState.pendingMigrations].sort((left, right) =>
+    left.localeCompare(right),
+  );
+
+  // First migration that assumes the legacy emergency-patch physical state.
+  let splitIndex = -1;
+  for (let index = 0; index < pendingMigrations.length; index += 1) {
+    const content = await readMigrationFileContent(pendingMigrations[index] ?? "");
+    if (LEGACY_EMERGENCY_PATCH_ALTER_PATTERN.test(content)) {
+      splitIndex = index;
+      break;
+    }
+  }
+
+  if (splitIndex === -1) {
+    await applyPendingMigrations(url);
+    return;
+  }
+
+  await applyPendingMigrationsManually(url, pendingMigrations.slice(0, splitIndex));
+  await applyLegacyEmergencyPatchScaffolding(url);
+  await applyPendingMigrationsManually(url, pendingMigrations.slice(splitIndex));
+
+  const finalState = await inspectMigrations(url);
+  if (finalState.status !== "upToDate") {
+    throw new Error(
+      `Failed to bootstrap embedded PostgreSQL test database migrations: ${finalState.pendingMigrations.join(", ")}`,
+    );
+  }
+}
+
 export async function startEmbeddedPostgresTestDatabase(
   tempDirPrefix: string,
 ): Promise<EmbeddedPostgresTestDatabase> {
@@ -160,7 +228,7 @@ export async function startEmbeddedPostgresTestDatabase(
     const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
-    await applyPendingMigrations(connectionString);
+    await applyEmbeddedPostgresTestMigrations(connectionString);
 
     return {
       connectionString,

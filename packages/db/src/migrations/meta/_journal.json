@@ -876,6 +876,20 @@
       "when": 1782440000000,
       "tag": "0124_agent_api_key_scope_config",
       "breakpoints": true
+    },
+    {
+      "idx": 125,
+      "version": "7",
+      "when": 1782440000001,
+      "tag": "0125_liveness_fanout_opt_out",
+      "breakpoints": true
+    },
+    {
+      "idx": 126,
+      "version": "7",
+      "when": 1788902405129,
+      "tag": "0126_codify_20260908_emergency_schema_patches",
+      "breakpoints": true
     }
   ]
 }
