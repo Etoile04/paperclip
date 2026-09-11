@@ -19,7 +19,10 @@ import type { Db } from "@paperclipai/db";
 import { agents, costEvents } from "@paperclipai/db";
 import {
   BURN_BUDGET_BOOTSTRAP_FACTOR,
+  BURN_BUDGET_HYSTERESIS_TICKS,
+  REMAINING_PCT_ABOVE_RECOVER,
   REMAINING_PCT_BELOW_TRIP,
+  TEST_BURN_BUDGET_OVERRIDE_ENV,
 } from "./fleet-throttle-constants.js";
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
@@ -92,6 +95,13 @@ export function computeBurnBudgetFromSlice(
  * BurnBudgetState. Returns a non-tripped state with zero consumed if the
  * agent has no events in the window (the safe default — we only trip on
  * observed pressure, not on absence).
+ *
+ * Test seam: when `PAPERCLIP_TEST_BURN_BUDGET_OVERRIDE_REMAINING_PCT` is set
+ * to a numeric value in [0, 1], this function returns a synthetic state
+ * with `remainingPctOfCeiling` equal to the override. The synthetic state
+ * still has a real `ceilingTokens` and a `consumedTokens` derived from the
+ * override (so callers that introspect the slice don't observe odd shapes).
+ * See `readBurnBudgetOverride` and `fleet-throttle-constants.ts`.
  */
 export async function readBurnBudgetForAgent(
   db: Db,
@@ -99,7 +109,22 @@ export async function readBurnBudgetForAgent(
   now: Date = new Date(),
   config: BurnBudgetConfig = DEFAULT_BURN_BUDGET_CONFIG,
 ): Promise<BurnBudgetState> {
+  const overrideRemaining = readBurnBudgetOverride();
   const windowStart = new Date(now.getTime() - FIVE_HOURS_MS);
+  if (overrideRemaining !== null) {
+    const ceiling = Math.max(1, config.ceilingTokens);
+    const consumed = Math.round(ceiling * (1 - overrideRemaining));
+    return {
+      agentId,
+      ceilingTokens: ceiling,
+      consumedTokens: consumed,
+      remainingTokens: Math.max(0, ceiling - consumed),
+      remainingPctOfCeiling: overrideRemaining,
+      tripped: overrideRemaining < REMAINING_PCT_BELOW_TRIP,
+      windowStart,
+      windowEnd: now,
+    };
+  }
   const row = await db
     .select({
       inputTokens: sql<number>`COALESCE(SUM(${costEvents.inputTokens}), 0)`,
@@ -142,6 +167,91 @@ export function perAgentJitterOffsetMs(agentId: string, ceilMinutes: number = JI
   const unit = raw / 0xFFFFFFFF; // [0, 1]
   const signed = unit * 2 - 1; // [-1, +1]
   return Math.round(signed * ceilMinutes * 60 * 1000);
+}
+
+/**
+ * Stateful L4 trip-state machine with hysteresis. Wraps the stateless
+ * `remainingPctOfCeiling < REMAINING_PCT_BELOW_TRIP` check with a
+ * `REMAINING_PCT_ABOVE_RECOVER` recovery band and a consecutive-tick
+ * counter (`BURN_BUDGET_HYSTERESIS_TICKS`) so a single recovered reading
+ * does not immediately re-trip on the next tick.
+ *
+ * Transition table (prev → current):
+ *   not tripped, remaining < 0.30          → tripped (immediate)
+ *   not tripped, remaining >= 0.30         → not tripped (no-op)
+ *   not tripped, 0.30 <= remaining < 0.35  → not tripped (hysteresis zone, no-op)
+ *   tripped,     remaining < 0.30          → tripped (no-op)
+ *   tripped,     remaining >= 0.35         → check consecutive normal ticks
+ *     normalTicks + 1 >= BURN_BUDGET_HYSTERESIS_TICKS → not tripped (recovered)
+ *     otherwise                                  → still tripped
+ *   tripped,     0.30 <= remaining < 0.35  → still tripped (hysteresis zone hold)
+ *
+ * The 0.30–0.35 hysteresis zone holds the previous state in both directions,
+ * so a single tick that lands in the zone cannot cause a flap.
+ *
+ * Spec: NFM-4682 / NFM-4689 (CTO comment 2026-09-11). NFM-4695 e2e demo
+ * exercises the 29%→36%→29% no-flap path.
+ */
+export interface BurnBudgetTripState {
+  tripped: boolean;
+  /** Consecutive ticks observed at or above REMAINING_PCT_ABOVE_RECOVER. Reset on any non-recovering tick. */
+  consecutiveNormalTicks: number;
+  /** True iff `tripped` flipped on this evaluation. */
+  transitioned: boolean;
+}
+
+export function computeBurnBudgetTripState(
+  prev: BurnBudgetTripState,
+  remainingPctOfCeiling: number,
+): BurnBudgetTripState {
+  // Trip band: below the lower threshold. Immediate trip in both directions.
+  if (remainingPctOfCeiling < REMAINING_PCT_BELOW_TRIP) {
+    return {
+      tripped: true,
+      consecutiveNormalTicks: 0,
+      transitioned: !prev.tripped,
+    };
+  }
+  // Recover band: at or above the upper threshold. Recovery only after N consecutive ticks.
+  if (remainingPctOfCeiling >= REMAINING_PCT_ABOVE_RECOVER) {
+    if (!prev.tripped) {
+      // Already not tripped — staying not tripped, no counter change.
+      return { tripped: false, consecutiveNormalTicks: 0, transitioned: false };
+    }
+    const nextNormalTicks = prev.consecutiveNormalTicks + 1;
+    if (nextNormalTicks >= BURN_BUDGET_HYSTERESIS_TICKS) {
+      return { tripped: false, consecutiveNormalTicks: nextNormalTicks, transitioned: true };
+    }
+    return { tripped: true, consecutiveNormalTicks: nextNormalTicks, transitioned: false };
+  }
+  // Hysteresis zone (REMAINING_PCT_BELOW_TRIP <= x < REMAINING_PCT_ABOVE_RECOVER).
+  // Hold the previous state — neither trip nor recover. Counter resets so a
+  // single in-zone reading cannot accumulate towards recovery.
+  return {
+    tripped: prev.tripped,
+    consecutiveNormalTicks: 0,
+    transitioned: false,
+  };
+}
+
+/**
+ * Read a process-level test override. When the env flag is set to a numeric
+ * value in [0, 1], return the override; otherwise return null. The seam is
+ * intentionally cheap to call so it can sit at the top of readBurnBudgetForAgent
+ * without measurable overhead in production.
+ *
+ * NOTE: production paths MUST NOT call this directly — the override is a
+ * test-only path. The seam is namespaced and the function lives in this file
+ * (not in a public route handler) so accidental prod enablement is a code
+ * review failure, not a runtime risk.
+ */
+function readBurnBudgetOverride(): number | null {
+  const raw = process.env[TEST_BURN_BUDGET_OVERRIDE_ENV];
+  if (raw === undefined || raw === "") return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed < 0 || parsed > 1) return null;
+  return parsed;
 }
 
 // Local mirror of JITTER_CEIL_MINUTES so this module is self-contained for tests.

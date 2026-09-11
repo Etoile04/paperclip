@@ -1,0 +1,44 @@
+
+ RUN  v4.1.8 /Users/lwj04/Services/paperclip-server
+
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L1 — per-agent wake jitter > returns a deterministic offset for a fixed agentId 1ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L1 — per-agent wake jitter > produces differing offsets for distinct agents 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L1 — per-agent wake jitter > stays within ±JITTER_CEIL_MINUTES bound 1ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L1 — per-agent wake jitter > applyL1Jitter shifts the timestamp by the per-agent offset 1ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — per-agent token-burn budget > returns not-tripped when nothing consumed 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — per-agent token-burn budget > trips exactly when remaining fraction drops below REMAINING_PCT_BELOW_TRIP 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — per-agent token-burn budget > includes cached tokens in consumed total 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — per-agent token-burn budget > clamps consumed to ceiling (no negative remaining) 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — burn-budget trip state machine (hysteresis) > trips immediately when remaining drops below REMAINING_PCT_BELOW_TRIP 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — burn-budget trip state machine (hysteresis) > holds previous state when reading lands in the hysteresis zone (0.30–0.35) 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — burn-budget trip state machine (hysteresis) > recovers only after BURN_BUDGET_HYSTERESIS_TICKS consecutive readings ≥ REMAINING_PCT_ABOVE_RECOVER 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — burn-budget trip state machine (hysteresis) > oscillating 29% → 36% → 29% does not flap the demote flag 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — burn-budget trip state machine (hysteresis) > in-zone reading while not-tripped stays not-tripped (no false trip) 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — burn-budget trip state machine (hysteresis) > exact-boundary readings: 0.30 stays, 0.35 starts recovery counter 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — env-flag test seam (NFM-4695 demo) > env flag unset → readBurnBudgetForAgent reads costEvents (no override) 1ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — env-flag test seam (NFM-4695 demo) > env flag set to 0.25 → returns synthetic state with remainingPctOfCeiling=0.25, tripped=true 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — env-flag test seam (NFM-4695 demo) > env flag set to 0.36 (recovery zone) → tripped=false (stateless raw check) 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — env-flag test seam (NFM-4695 demo) > env flag set to invalid value → ignored (seam is no-op) 0ms
+ ✓ |@paperclipai/server| src/services/agent-burn-budget.test.ts > L4 — env-flag test seam (NFM-4695 demo) > env flag out of [0, 1] → ignored (seam is no-op) 0ms
+ ✓ |@paperclipai/server| src/services/fleet-cap-trip-e2e.test.ts > NFM-4695 — E2E demo: 25%-remaining cap trip > AC1 — new heavy dispatch at 25% remaining → reviewOnly=true, blocked=true 2ms
+ ✓ |@paperclipai/server| src/services/fleet-cap-trip-e2e.test.ts > NFM-4695 — E2E demo: 25%-remaining cap trip > AC2 — in-flight heavy run demoted at 25% → allow_demoted with degraded instruction set 0ms
+ ✓ |@paperclipai/server| src/services/fleet-cap-trip-e2e.test.ts > NFM-4695 — E2E demo: 25%-remaining cap trip > AC3 — light work (comment / status / PATCH) continues while tripped 0ms
+ ✓ |@paperclipai/server| src/services/fleet-cap-trip-e2e.test.ts > NFM-4695 — E2E demo: 25%-remaining cap trip > AC4 — recovery to 36% lifts trip → heavy dispatch lands normally 0ms
+ ✓ |@paperclipai/server| src/services/fleet-cap-trip-e2e.test.ts > NFM-4695 — E2E demo: 25%-remaining cap trip > AC5 — hysteresis: oscillating 29% → 36% → 29% does not flap the demote flag 0ms
+ ✓ |@paperclipai/server| src/services/fleet-cap-trip-e2e.test.ts > NFM-4695 — E2E demo: 25%-remaining cap trip > AC6 — boundary semantics: 0.30 holds, 0.35 starts recovery counter 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — fleet-dispatch guard (verdict matrix) > non-heavy + not tripped → allow 2ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — fleet-dispatch guard (verdict matrix) > heavy + not tripped → allow 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — fleet-dispatch guard (verdict matrix) > heavy + tripped → block (TRIP_POLICY_BLOCK_NEW_HEAVY=true) 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — fleet-dispatch guard (verdict matrix) > heavy + tripped via forceHeavy → block 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — fleet-dispatch guard (verdict matrix) > isHeavyDispatch respects HEAVY_DISPATCH_TOKEN_THRESHOLD boundary 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — in-flight heavy demote path (NFM-4695) > heavy in-flight + not tripped → allow 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — in-flight heavy demote path (NFM-4695) > heavy in-flight + tripped → allow_demoted (not block) 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — annotateContextSnapshot > adds fleet_dispatch block and dispatch.blocked:true on block verdict 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — annotateContextSnapshot > annotates allow_demoted with reviewOnly=true + demotePolicy=read_only_review 0ms
+ ✓ |@paperclipai/server| src/services/fleet-dispatch-guard.test.ts > L5 — annotateContextSnapshot > does not set dispatch.blocked on non-block verdicts 0ms
+
+ Test Files  3 passed (3)
+      Tests  35 passed (35)
+   Start at  18:19:07
+   Duration  1.06s (transform 271ms, setup 99ms, import 724ms, tests 12ms, environment 0ms)
+
