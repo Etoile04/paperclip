@@ -9,6 +9,7 @@ export {
 export {
   parseClaudeStreamJson,
   describeClaudeFailure,
+  extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,

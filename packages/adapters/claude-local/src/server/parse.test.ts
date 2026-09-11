@@ -2,11 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
   isClaudeTransientUpstreamError,
+  isClaudeUsageCapExhaustedError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
 } from "./parse.js";
+
+// Exact incident string from the shared-account 5h usage-cap outage
+// (429 [1308], engine host TZ Asia/Shanghai).
+const USAGE_CAP_1308_INCIDENT =
+  "API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。您的限额将在 2026-09-11 03:44:07 重置]";
 
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as transient", () => {
@@ -303,5 +309,70 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
+  });
+
+  it("parses the zh absolute reset datetime from the 429 [1308] incident as engine-host-local", () => {
+    const now = new Date(2026, 8, 11, 1, 0, 0);
+    const extracted = extractClaudeRetryNotBefore({ stderr: USAGE_CAP_1308_INCIDENT }, now);
+    expect(extracted?.getTime()).toBe(new Date(2026, 8, 11, 3, 44, 7).getTime());
+  });
+
+  it("parses an English absolute resets-at datetime as engine-host-local", () => {
+    const now = new Date(2026, 8, 11, 1, 0, 0);
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "Usage cap reached. Resets at 2026-09-11 03:44" },
+      now,
+    );
+    expect(extracted?.getTime()).toBe(new Date(2026, 8, 11, 3, 44, 0).getTime());
+  });
+
+  it("clamps absolute reset hints beyond now + 6h to null", () => {
+    const now = new Date(2026, 8, 11, 1, 0, 0);
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "Usage cap reached. Resets at 2026-09-11 08:00:00" },
+        now,
+      ),
+    ).toBeNull();
+  });
+
+  it("clamps already-past absolute reset hints to null", () => {
+    const now = new Date(2026, 8, 11, 3, 45, 0);
+    expect(
+      extractClaudeRetryNotBefore({ stderr: USAGE_CAP_1308_INCIDENT }, now),
+    ).toBeNull();
+  });
+});
+
+describe("isClaudeUsageCapExhaustedError", () => {
+  it("classifies the 429 [1308] shared-account usage-cap incident", () => {
+    expect(isClaudeUsageCapExhaustedError({ stderr: USAGE_CAP_1308_INCIDENT })).toBe(true);
+    expect(
+      isClaudeUsageCapExhaustedError({
+        parsed: { is_error: true, result: USAGE_CAP_1308_INCIDENT },
+      }),
+    ).toBe(true);
+  });
+
+  it("belt-and-braces: matches the zh usage-cap wording without [1308]", () => {
+    expect(
+      isClaudeUsageCapExhaustedError({
+        errorMessage: "已达到 5 小时的使用上限。您的限额将在 2026-09-11 03:44:07 重置",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not classify generic 429s without the usage-cap signature", () => {
+    expect(isClaudeUsageCapExhaustedError({ stderr: "HTTP 429: Too Many Requests" })).toBe(false);
+    expect(isClaudeUsageCapExhaustedError({ errorMessage: "Overloaded. Try again later." })).toBe(false);
+  });
+
+  it("keeps the usage-cap incident inside the transient-upstream family", () => {
+    expect(isClaudeTransientUpstreamError({ stderr: USAGE_CAP_1308_INCIDENT })).toBe(true);
+    expect(
+      isClaudeTransientUpstreamError({
+        errorMessage: "已达到 5 小时的使用上限。您的限额将在 2026-09-11 03:44:07 重置",
+      }),
+    ).toBe(true);
   });
 });

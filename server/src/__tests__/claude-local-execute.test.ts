@@ -1395,6 +1395,125 @@ describe("claude execute", () => {
     }
   });
 
+  it("classifies the shared-account 429 [1308] usage-cap incident (parsed result) as claude_usage_cap_exhausted", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-usage-cap-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    // Exact incident string from the shared-account 5h usage-cap outage
+    // (engine host TZ Asia/Shanghai; parsed as engine-host-local below).
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "error",
+        session_id: "99999999-9999-4999-8999-999999999999",
+        is_error: true,
+        result:
+          "API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。您的限额将在 2026-09-11 03:44:07 重置]",
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 8, 11, 1, 0, 0));
+
+    try {
+      const result = await execute({
+        runId: "run-claude-usage-cap",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("claude_usage_cap_exhausted");
+      // The distinct code must NOT break the transient-recovery contract.
+      expect(result.errorFamily).toBe("transient_upstream");
+      const expectedRetryNotBefore = new Date(2026, 8, 11, 3, 44, 7).toISOString();
+      expect(result.retryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.resultJson?.retryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.resultJson?.errorFamily).toBe("transient_upstream");
+    } finally {
+      vi.useRealTimers();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies the shared-account 429 [1308] usage-cap incident (unparsed stderr) as claude_usage_cap_exhausted", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-usage-cap-raw-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeTextFailingClaudeCommand(commandPath, {
+      stderr:
+        "API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。您的限额将在 2026-09-11 03:44:07 重置]\n",
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 8, 11, 1, 0, 0));
+
+    try {
+      const result = await execute({
+        runId: "run-claude-usage-cap-raw",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("claude_usage_cap_exhausted");
+      expect(result.errorFamily).toBe("transient_upstream");
+      expect(result.retryNotBefore).toBe(new Date(2026, 8, 11, 3, 44, 7).toISOString());
+      expect(result.errorMessage ?? "").toContain("1308");
+    } finally {
+      vi.useRealTimers();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not reclassify deterministic Claude failures (auth, max turns) as transient", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-max-turns-"));
     const workspace = path.join(root, "workspace");
