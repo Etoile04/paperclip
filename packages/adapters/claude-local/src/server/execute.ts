@@ -55,6 +55,7 @@ import {
   isClaudeRefusalResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
+  isClaudeUsageCapExhaustedError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeImageProcessingError,
 } from "./parse.js";
@@ -856,8 +857,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
+      // Shared-account 5h usage-cap exhaustion gets its own errorCode ahead of
+      // the generic transient branch; errorFamily stays transient_upstream so
+      // the retry-suppression contract still applies. See NFM-4661.
+      const usageCapExhausted =
+        !loginMeta.requiresLogin &&
+        (proc.exitCode ?? 0) !== 0 &&
+        isClaudeUsageCapExhaustedError({
+          parsed: null,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const errorCode = loginMeta.requiresLogin
         ? "claude_auth_required"
+        : usageCapExhausted
+        ? "claude_usage_cap_exhausted"
         : transientUpstream
         ? "claude_transient_upstream"
         : null;
@@ -953,12 +968,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    // Shared-account 5h usage-cap exhaustion gets its own errorCode ahead of
+    // the generic transient branch; errorFamily stays transient_upstream so
+    // the retry-suppression contract still applies. See NFM-4661.
+    const usageCapExhausted =
+      failed &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      isClaudeUsageCapExhaustedError({
+        parsed,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        errorMessage,
+      });
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && clearSessionForMaxTurns
       ? "max_turns_exhausted"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
+      : usageCapExhausted
+      ? "claude_usage_cap_exhausted"
       : transientUpstream
       ? "claude_transient_upstream"
       : claudeRefusal

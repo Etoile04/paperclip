@@ -14,6 +14,7 @@ import {
   issueRelations,
   issues,
 } from "@paperclipai/db";
+import { extractClaudeRetryNotBefore } from "@paperclipai/adapter-claude-local/server";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -1444,5 +1445,54 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  it("schedules a bounded retry for claude_usage_cap_exhausted at the extracted 429 [1308] reset time", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    // Injected now keeps the host-local reset-time extraction deterministic:
+    // the incident reset (2026-09-11 03:44:07 host-local) is 2h44m ahead.
+    const now = new Date(2026, 8, 11, 1, 0, 0);
+    // Exact incident string from the shared-account 5h usage-cap outage.
+    const incident =
+      "API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。您的限额将在 2026-09-11 03:44:07 重置]";
+    const retryNotBefore = extractClaudeRetryNotBefore({ stderr: incident }, now);
+    expect(retryNotBefore?.getTime()).toBe(new Date(2026, 8, 11, 3, 44, 7).getTime());
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "claude_usage_cap_exhausted",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      retryNotBefore: retryNotBefore?.toISOString() ?? new Date(0).toISOString(),
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    // The distinct usage-cap errorCode must still ride the transient-retry
+    // contract: the retry fires exactly at the account reset time.
+    expect(scheduled.dueAt.getTime()).toBe(retryNotBefore?.getTime());
+
+    const retryRun = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(retryNotBefore?.getTime());
+    const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    expect(contextSnapshot.transientRetryNotBefore).toBe(retryNotBefore?.toISOString());
   });
 });
