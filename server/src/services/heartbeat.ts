@@ -58,6 +58,14 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
+import { readBurnBudgetForAgent } from "./agent-burn-budget.js";
+import {
+  decideFleetPressure,
+  readFleetPressureReading,
+  loadFleetPressureState,
+  persistFleetPressureState,
+} from "./fleet-pressure-runtime.js";
+import { annotateContextSnapshot, evaluateDispatch } from "./fleet-dispatch-guard.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
@@ -4423,7 +4431,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    // ADR-014 L3: fleet-pressure-aware tick throttle. The per-tick monitor
+    // dispatch limit and staleClaimThreshold are derived from the fleet
+    // pressure state machine, not hardcoded. In incident state, limit
+    // halves (50 → 25) and staleClaimThreshold doubles (5min → 10min).
+    const fleetReading = await readFleetPressureReading(now, db);
+    const fleetState = loadFleetPressureState();
+    const fleetDecision = decideFleetPressure(
+      fleetReading,
+      fleetState.state,
+      fleetState.consecutiveNormalTicks,
+    );
+    await persistFleetPressureState(fleetDecision, fleetReading, fleetState);
+    const staleClaimThreshold = new Date(now.getTime() - fleetDecision.staleClaimThresholdMs);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
@@ -4443,7 +4463,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       )
       .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
-      .limit(50);
+      .limit(fleetDecision.limit);
 
     let triggered = 0;
     let skipped = 0;
@@ -12468,6 +12488,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+      let blockedByGuard = 0;
 
       for (const agent of allAgents) {
         const invokability = evaluateAgentInvokability(toAgentOrgRow(agent), agentsByCompany.get(agent.companyId) ?? []);
@@ -12480,17 +12501,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
+        // ADR-014 L4+L5: per-agent burn budget + dispatch guard for heavy wakes.
+        // Heavy + tripped → block (dispatch.blocked:true, wake not enqueued).
+        const burnBudget = await readBurnBudgetForAgent(db, agent.id, now);
+        const guard = evaluateDispatch({
+          // No caller estimate on timer ticks — treat timer wake as not heavy
+          // unless the agent role flag (TODO post-ship) marks it heavy.
+          forceHeavy: false,
+          burnBudget,
+        });
+        if (guard.blocked) {
+          blockedByGuard += 1;
+          logger.warn(
+            { agentId: agent.id, remainingPctOfCeiling: burnBudget.remainingPctOfCeiling },
+            "fleet_dispatch_blocked",
+          );
+          continue;
+        }
+
+        const annotatedSnapshot = guard.verdict === "allow_demoted"
+          ? annotateContextSnapshot(
+              {
+                source: "scheduler",
+                reason: "interval_elapsed",
+                now: now.toISOString(),
+              },
+              guard,
+              burnBudget,
+            )
+          : {
+              source: "scheduler",
+              reason: "interval_elapsed",
+              now: now.toISOString(),
+            };
+
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
           reason: "heartbeat_timer",
           requestedByActorType: "system",
           requestedByActorId: "heartbeat_scheduler",
-          contextSnapshot: {
-            source: "scheduler",
-            reason: "interval_elapsed",
-            now: now.toISOString(),
-          },
+          contextSnapshot: annotatedSnapshot,
         });
         if (run) enqueued += 1;
         else skipped += 1;
@@ -12502,6 +12553,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         checked: checked + issueMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
         skipped: skipped + issueMonitors.skipped,
+        blockedByGuard,
       };
     },
 
