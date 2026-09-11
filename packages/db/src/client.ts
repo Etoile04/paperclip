@@ -106,7 +106,7 @@ async function listJournalMigrationFiles(): Promise<string[]> {
   return entries.map((entry) => entry.fileName);
 }
 
-async function readMigrationFileContent(migrationFile: string): Promise<string> {
+export async function readMigrationFileContent(migrationFile: string): Promise<string> {
   return readFile(new URL(`./migrations/${migrationFile}`, import.meta.url), "utf8");
 }
 
@@ -230,7 +230,7 @@ async function recordMigrationHistoryEntry(
   );
 }
 
-async function applyPendingMigrationsManually(
+export async function applyPendingMigrationsManually(
   url: string,
   pendingMigrations: string[],
 ): Promise<void> {
