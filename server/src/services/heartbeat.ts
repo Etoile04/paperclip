@@ -71,6 +71,23 @@ import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES 
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
+import {
+  AGENT_BURN_WINDOW_MS,
+  DEMOTE_POLICY_VALUE,
+  FLEET_BURN_CEILING_CENTS_PER_AGENT_5H,
+} from "./fleet-throttle-constants.js";
+import {
+  FLEET_PRESSURE_DEFAULT_MEMORY,
+  evaluateFleetPressure,
+  type FleetPressureMemory,
+  type FleetPressureTickParams,
+} from "./fleet-pressure.js";
+import {
+  computeAgentBudgetSnapshot,
+  evaluateAgentTrip,
+  type TripState,
+} from "./agent-burn-budget.js";
+import { attachReadOnlyPreamble } from "./fleet-dispatch-guard.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
@@ -233,6 +250,136 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
 ];
+
+// ─── ADR-014 (NFM-4682) fleet-throttle module state ─────────────────────────
+// Lives outside the heartbeatService closure so it survives per-request
+// Drizzle transactions and persists across the service lifetime.
+//
+//   fleetPressureMemory       — L3 state-machine memory
+//   fleetPressureParams       — last per-tick params (limit, staleClaim,
+//                               skipNonBlockerPinnedHeartbeats)
+//   agentTripState            — Map<agentId, "normal"|"tripped"> for L4
+//                               burn-budget hysteresis persistence
+//
+// Refreshed at the top of each `tickTimers` call via `refreshFleetThrottle`.
+// Consumers (`tickDueIssueMonitors`, the heartbeat_timer wake loop) read
+// the snapshot directly — no per-tick recomputation.
+const FLEET_PRESSURE_CLASSIFIED_ERROR_CODE = "claude_usage_cap_exhausted";
+let fleetPressureMemory: FleetPressureMemory = { ...FLEET_PRESSURE_DEFAULT_MEMORY };
+let fleetPressureParams: FleetPressureTickParams = {
+  monitorLimit: 50,
+  staleClaimThresholdMs: 5 * 60 * 1000,
+  skipNonBlockerPinnedHeartbeats: false,
+};
+const agentTripState = new Map<string, TripState>();
+
+/**
+ * Count `claude_usage_cap_exhausted` classified runs (NFM-4658) in the
+ * trailing `FLEET_PRESSURE_OBSERVATION_WINDOW_MS` (1h) window. Powers the
+ * L3 state-machine transition; errorCode is indexed on heartbeatRuns.
+ */
+async function countRecentClassifiedRuns(now: Date): Promise<number> {
+  const cutoff = new Date(now.getTime() - 60 * 60 * 1000);
+  const rows = await db
+    .select({ total: sql<number>`count(*)::int8` })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.errorCode, FLEET_PRESSURE_CLASSIFIED_ERROR_CODE),
+        gte(heartbeatRuns.startedAt, cutoff),
+      ),
+    );
+  return Number(rows[0]?.total ?? 0);
+}
+
+/**
+ * True when the agent has at least one assigned issue (in_progress or
+ * in_review) that another issue is currently blocking on via the
+ * `issueRelations` table (type='blocks'). Used by L3 to skip
+ * non-blocker-pinned wakes when fleet-pressure = incident.
+ */
+async function isAgentBlockerPinnedQuery(agentId: string): Promise<boolean> {
+  const rows = await db
+    .select({ exists: sql<boolean>`true` })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issues.id, issueRelations.issueId))
+    .where(
+      and(
+        eq(issueRelations.type, "blocks"),
+        eq(issues.assigneeAgentId, agentId),
+        inArray(issues.status, ["in_progress", "in_review"]),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
+}
+
+/**
+ * Compute the L3 state transition + refresh the module snapshot. Pure
+ * transition; the caller passes the observed classifiedRunCount from
+ * heartbeatRuns. Side effect: writes `fleetPressureMemory` and
+ * `fleetPressureParams`.
+ */
+function refreshFleetPressureMemory(classifiedRunCount: number, now: Date): void {
+  const r = evaluateFleetPressure(fleetPressureMemory, {
+    classifiedRunCount,
+    now,
+  });
+  fleetPressureMemory = r.memory;
+  fleetPressureParams = r.params;
+}
+
+/**
+ * Read trailing-5h cost in cents for an agent. Powers L4 burn-budget
+ * `remainingPctOfCeiling`. Returns 0 when the agent has no cost rows —
+ * caller treats 0 as fully remaining.
+ */
+async function sumAgentCostCents(agentId: string, now: Date): Promise<number> {
+  const cutoff = new Date(now.getTime() - AGENT_BURN_WINDOW_MS);
+  const rows = await db
+    .select({ total: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int8` })
+    .from(costEvents)
+    .where(
+      and(
+        eq(costEvents.agentId, agentId),
+        gte(costEvents.occurredAt, cutoff),
+      ),
+    );
+  return Number(rows[0]?.total ?? 0);
+}
+
+/**
+ * L4 burn-budget verdict for a single agent. Persists the trip state in
+ * the module-level cache for hysteresis across ticks.
+ *
+ * `ceilingCents` is the per-agent cap inside the 5h window. ADR-014 §4
+ * forbids hand-tuning; the 1.1x bootstrap factor lives in
+ * `fleet-throttle-constants.ts`.
+ */
+async function evaluateAgentBurnBudget(input: {
+  agentId: string;
+  ceilingCents: number;
+  now: Date;
+}): Promise<TripState> {
+  const usedCents = await sumAgentCostCents(input.agentId, input.now);
+  const snapshot = computeAgentBudgetSnapshot({
+    agentId: input.agentId,
+    events: [
+      // Reconstruct a single event so the snapshot math runs end-to-end.
+      {
+        agentId: input.agentId,
+        costCents: usedCents,
+        occurredAt: input.now,
+      },
+    ],
+    now: input.now,
+    ceilingCents: input.ceilingCents,
+  });
+  const previous = agentTripState.get(input.agentId) ?? "normal";
+  const r = evaluateAgentTrip({ snapshot, previous });
+  agentTripState.set(input.agentId, r.next);
+  return r.next;
+}
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -4423,7 +4570,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
-    const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    // L3 (ADR-014 §3) — fleet-pressure-aware tick throttle. When the state
+    // machine reports `incident`, the per-tick limit drops from 50→25 and
+    // the stale-claim window doubles from 5→10 min. Defaults match the
+    // module-snapshot at boot (`normal` state).
+    const staleClaimThreshold = new Date(now.getTime() - fleetPressureParams.staleClaimThresholdMs);
+    const monitorLimit = fleetPressureParams.monitorLimit;
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
@@ -4443,7 +4595,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       )
       .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
-      .limit(50);
+      .limit(monitorLimit);
 
     let triggered = 0;
     let skipped = 0;
@@ -12459,6 +12611,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     buildRunOutputSilence,
 
     tickTimers: async (now = new Date()) => {
+      // ADR-014 §3 (NFM-4682) — refresh fleet-throttle snapshot at the top of
+      // every tick. Cost is one indexed COUNT over heartbeatRuns (error_code
+      // column) bounded by the trailing 1h window.
+      const classifiedRunCount = await countRecentClassifiedRuns(now);
+      refreshFleetPressureMemory(classifiedRunCount, now);
+
       const allAgents = await db
         .select({ ...getTableColumns(agents) })
         .from(agents)
@@ -12480,17 +12638,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
+        // L3 (ADR-014 §3) — when fleet-pressure state = incident, skip
+        // heartbeat_timer wakes for agents that are not blocker-pinned.
+        // The agent is blocker-pinned iff any peer has a `blocks` relation
+        // pointing at one of its assigned in-progress issues; the wake is
+        // required to unblock the peer.
+        if (fleetPressureParams.skipNonBlockerPinnedHeartbeats) {
+          const pinned = await isAgentBlockerPinnedQuery(agent.id);
+          if (!pinned) {
+            skipped += 1;
+            continue;
+          }
+        }
+
+        // L4 (ADR-014 §3) — compute burn-budget verdict for the agent and
+        // attach the read-only preamble to the wake when tripped. The L5
+        // block verdict is intentionally NOT applied to heartbeat_timer
+        // wakes (they are scheduler ticks, not heavy model invocations);
+        // the demote preamble is the correct mechanism on this code path.
+        //
+        // `FLEET_BURN_CEILING_CENTS_PER_AGENT_5H` is the bootstrap per-agent
+        // cap. The 1.1x factor in `agent-burn-budget.ts` multiplies this
+        // before computing `remainingPctOfCeiling`. Per ADR-014 §4, the
+        // empirical revisit after 7 days replaces this with the observed
+        // fleet-level ceiling.
+        const baseContextSnapshot: Record<string, unknown> = {
+          source: "scheduler",
+          reason: "interval_elapsed",
+          now: now.toISOString(),
+        };
+        const ceilingCents = FLEET_BURN_CEILING_CENTS_PER_AGENT_5H;
+        const tripped = await evaluateAgentBurnBudget({
+          agentId: agent.id,
+          ceilingCents,
+          now,
+        });
+        const contextSnapshot =
+          tripped === "tripped"
+            ? attachReadOnlyPreamble(baseContextSnapshot, DEMOTE_POLICY_VALUE)
+            : baseContextSnapshot;
+
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
           reason: "heartbeat_timer",
           requestedByActorType: "system",
           requestedByActorId: "heartbeat_scheduler",
-          contextSnapshot: {
-            source: "scheduler",
-            reason: "interval_elapsed",
-            now: now.toISOString(),
-          },
+          contextSnapshot,
         });
         if (run) enqueued += 1;
         else skipped += 1;

@@ -12,6 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import { applyL1Stagger } from "./l1-stagger.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -984,8 +985,16 @@ export function buildInitialIssueMonitorFields(input: {
   }
 
   const monitorState = buildScheduledMonitorState(null, input.policy.monitor);
+  // L1 (ADR-014 §3) — per-agent wake stagger. Stable SHA-1 of agentId shifts
+  // `monitorNextCheckAt` by ±HEARTBEAT_JITTER_MINUTES so a fleet of agents
+  // does not fire synchronously on the per-tick selector. Skip the stagger
+  // when there is no agent yet (the nominal nextCheckAt is preserved).
+  const nominalNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
+  const monitorNextCheckAt = input.assigneeAgentId
+    ? applyL1Stagger(nominalNextCheckAt, input.assigneeAgentId)
+    : nominalNextCheckAt;
   return {
-    monitorNextCheckAt: new Date(input.policy.monitor.nextCheckAt),
+    monitorNextCheckAt,
     monitorWakeRequestedAt: null,
     monitorNotes: input.policy.monitor.notes ?? null,
     monitorScheduledBy: input.policy.monitor.scheduledBy,
