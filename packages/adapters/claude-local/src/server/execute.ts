@@ -70,6 +70,7 @@ import {
   isClaudeRefusalResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
+  isClaudeUsageCapExhaustedError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeImageProcessingError,
   isClaudeModelNotFoundError,
@@ -1042,7 +1043,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
-      const errorCode = proc.errorCode
+      // Shared-account 5h usage-cap exhaustion gets its own errorCode ahead of
+      // the generic transient branch; errorFamily stays transient_upstream so
+      // the retry-suppression contract still applies. See NFM-4661.
+      const usageCapExhausted =
+        !loginMeta.requiresLogin &&
+        (proc.exitCode ?? 0) !== 0 &&
+        isClaudeUsageCapExhaustedError({
+          parsed: null,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
         // Forward the transport-level error code from the run-disposition seam
         // first, even on the unparsed path. A lost duplex control channel
         // surfaces the typed `duplex_channel_lost` code before any provider
@@ -1059,6 +1071,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? "model_not_found"
         : providerQuota
         ? "provider_quota"
+        : usageCapExhausted
+        ? "claude_usage_cap_exhausted"
         : transientUpstream
         ? "claude_transient_upstream"
         : null;
@@ -1187,6 +1201,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
       : loginMeta.requiresLogin
+      const usageCapExhausted =
+        failed &&
+        !loginMeta.requiresLogin &&
+        !clearSessionForMaxTurns &&
+        !poisonedPreviousMessageId &&
+        isClaudeUsageCapExhaustedError({
+          parsed,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage,
+        });
       ? "claude_auth_required"
       : failed && isClaudeModelNotFoundError({
         parsed,
@@ -1201,6 +1226,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "claude_poisoned_previous_message_id"
       : providerQuota
       ? "provider_quota"
+      : usageCapExhausted
+      ? "claude_usage_cap_exhausted"
       : transientUpstream
       ? "claude_transient_upstream"
       : claudeRefusal
