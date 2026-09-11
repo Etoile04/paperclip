@@ -19,12 +19,12 @@
  */
 
 import {
+  DEMOTE_POLICY,
   DISPATCH_VERDICT_ALLOW,
   DISPATCH_VERDICT_ALLOW_DEMOTED,
   DISPATCH_VERDICT_BLOCK,
   HEAVY_DISPATCH_TOKEN_THRESHOLD,
   TRIP_POLICY_BLOCK_NEW_HEAVY,
-  TRIP_POLICY_DEMOTE_INFLIGHT,
   type FleetDispatchVerdict,
 } from "./fleet-throttle-constants.js";
 import type { BurnBudgetState } from "./agent-burn-budget.js";
@@ -52,8 +52,12 @@ export function isHeavyDispatch(input: { estimatedTokens?: number; forceHeavy?: 
 }
 
 /**
- * Evaluate the dispatch verdict. Pure function so the unit test covers
- * the full input matrix deterministically.
+ * Evaluate the dispatch verdict for a NEW wake. Pure function so the unit
+ * test covers the full input matrix deterministically.
+ *
+ * Trip policy:
+ *   TRIP_POLICY_BLOCK_NEW_HEAVY=true → heavy+tripped returns BLOCK (the
+ *     wake is not enqueued and `dispatch.blocked:true` is propagated).
  */
 export function evaluateDispatch(input: DispatchGuardInput): DispatchGuardResult {
   const heavy = isHeavyDispatch(input);
@@ -65,22 +69,15 @@ export function evaluateDispatch(input: DispatchGuardInput): DispatchGuardResult
   if (!tripped) {
     return { verdict: DISPATCH_VERDICT_ALLOW, reason: "heavy_under_budget", blocked: false };
   }
-  // Heavy + tripped — apply trip policy.
+  // Heavy + tripped — new dispatch policy.
   if (TRIP_POLICY_BLOCK_NEW_HEAVY) {
     return {
       verdict: DISPATCH_VERDICT_BLOCK,
-      reason: "heavy_tripped_block",
+      reason: "fleet_cap_tripped",
       blocked: true,
     };
   }
-  if (TRIP_POLICY_DEMOTE_INFLIGHT) {
-    return {
-      verdict: DISPATCH_VERDICT_ALLOW_DEMOTED,
-      reason: "heavy_tripped_demoted",
-      blocked: false,
-    };
-  }
-  // Trip policy disabled both flags — fall through to allow but flagged.
+  // Trip policy disabled the new-block flag — fall through to allow but flagged.
   return {
     verdict: DISPATCH_VERDICT_ALLOW,
     reason: "heavy_tripped_no_policy",
@@ -89,8 +86,46 @@ export function evaluateDispatch(input: DispatchGuardInput): DispatchGuardResult
 }
 
 /**
+ * Evaluate the dispatch verdict for an IN-FLIGHT heavy run that crossed
+ * the L4 trip boundary mid-execution. Always treats the dispatch as heavy
+ * (`forceHeavy:true`) and applies the demote policy: heavy+tripped →
+ * ALLOW_DEMOTED. The run proceeds but the caller is expected to inject the
+ * DEMOTE_POLICY ("read_only_review") degraded instruction set via
+ * `annotateContextSnapshot`.
+ *
+ * This is the L5 mid-run demote path. It is intentionally separate from
+ * `evaluateDispatch` so that the new-dispatch BLOCK policy and the
+ * in-flight DEMOTE policy can be reasoned about independently.
+ */
+export function evaluateInflightHeavyDispatch(input: {
+  burnBudget: BurnBudgetState;
+}): DispatchGuardResult {
+  // In-flight path: caller asserts this is an existing heavy run, not a new wake.
+  const heavy = true;
+  const tripped = input.burnBudget.tripped;
+
+  if (!tripped) {
+    return { verdict: DISPATCH_VERDICT_ALLOW, reason: "inflight_heavy_under_budget", blocked: false };
+  }
+  if (!heavy) {
+    // Defensive: should not happen — forceHeavy:true is always set at the call site.
+    return { verdict: DISPATCH_VERDICT_ALLOW, reason: "inflight_non_heavy", blocked: false };
+  }
+  return {
+    verdict: DISPATCH_VERDICT_ALLOW_DEMOTED,
+    reason: "fleet_cap_tripped",
+    blocked: false,
+  };
+}
+
+/**
  * Attach the guard outcome to a contextSnapshot. Idempotent: does not
  * overwrite existing keys, just enriches.
+ *
+ * When the verdict is ALLOW_DEMOTED, also sets `contextSnapshot.reviewOnly=true`
+ * and `contextSnapshot.reason="fleet_cap_tripped"` so the agent runtime can
+ * surface the degraded instruction set (comment + PATCH + checklist mark
+ * only — no file edit, no git write, no WebSearch, no Agent invocation).
  */
 export function annotateContextSnapshot(
   base: Record<string, unknown> | null | undefined,
@@ -102,6 +137,7 @@ export function annotateContextSnapshot(
     verdict: result.verdict,
     reason: result.reason,
     blocked: result.blocked,
+    demotePolicy: result.verdict === DISPATCH_VERDICT_ALLOW_DEMOTED ? DEMOTE_POLICY : null,
     burn: {
       remainingPctOfCeiling: burnBudget.remainingPctOfCeiling,
       consumedTokens: burnBudget.consumedTokens,
@@ -112,6 +148,12 @@ export function annotateContextSnapshot(
   };
   if (result.blocked) {
     out.dispatch = { ...(out.dispatch as Record<string, unknown> | undefined), blocked: true };
+    out.reviewOnly = true;
+    out.reason = "fleet_cap_tripped";
+  }
+  if (result.verdict === DISPATCH_VERDICT_ALLOW_DEMOTED) {
+    out.reviewOnly = true;
+    out.reason = "fleet_cap_tripped";
   }
   return out;
 }
