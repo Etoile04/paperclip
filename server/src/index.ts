@@ -1325,6 +1325,15 @@ async function startServerWithDatabaseTeardown(
       heartbeat.drainActiveRunExecutions();
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
+  // Wired into the SIGTERM/SIGINT shutdown path so in-flight adapter children
+  // are terminated and their runs finalized before the process exits (NFM-4785).
+  let heartbeatForShutdown: {
+    terminateActiveRunsForShutdown: () => Promise<{ terminated: string[] }>;
+  } | null = null;
+
+  if (config.heartbeatSchedulerEnabled) {
+    const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    heartbeatForShutdown = heartbeat;
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
     const issues = issueService(db as any);
@@ -2007,6 +2016,22 @@ async function startServerWithDatabaseTeardown(
   ) => {
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
+    // Drain in-flight heartbeat runs first: terminate tracked adapter
+    // children and finalize their runs as process_lost (with retry) so a
+    // deploy restart cannot orphan a live child against a severed output
+    // channel. Must run before embedded PostgreSQL is stopped (NFM-4785).
+    try {
+      const drain = await heartbeatForShutdown?.terminateActiveRunsForShutdown();
+      if (drain && drain.terminated.length > 0) {
+        logger.warn(
+          { runIds: drain.terminated },
+          "terminated in-flight heartbeat runs on shutdown",
+        );
+      }
+    } catch (err) {
+      logger.error({ err }, "failed to drain in-flight heartbeat runs on shutdown");
+    }
+
     unsubscribeChatCompletions();
     clearInterval(executionControlInterval);
     if (heartbeatSchedulerInterval) {

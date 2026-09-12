@@ -8995,6 +8995,17 @@ async function terminateHeartbeatRunProcess(input: {
   );
 }
 
+const DEFAULT_DETACHED_RUN_MAX_AGE_MS = 15 * 60_000;
+
+// Max age (ms) a run may sit detached (live child, no in-memory handle) before
+// the reaper reclaims the orphaned child and finalizes the run. Overridable
+// via PAPERCLIP_DETACHED_RUN_MAX_AGE_MS; values <= 0 disable the bound.
+function resolveDetachedRunMaxAgeMs(override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override)) return Math.max(0, override);
+  const raw = Number(process.env.PAPERCLIP_DETACHED_RUN_MAX_AGE_MS);
+  return Number.isFinite(raw) ? Math.max(0, raw) : DEFAULT_DETACHED_RUN_MAX_AGE_MS;
+}
+
 function buildProcessLossMessage(
   run: {
     processPid: number | null;
@@ -9569,6 +9580,11 @@ export function heartbeatService(
     environmentRuntime,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
+  const activeRunExecutions = new Set<string>();
+  // First observation (ms epoch) of a run sitting in the detached state
+  // (running row + live child pid + no in-memory handle). Bounds how long an
+  // orphaned child can keep a run "running" with a severed output channel.
+  const detachedSinceAt = new Map<string, number>();
   const liveRunExecutions = {
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
@@ -14012,6 +14028,9 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     if (!updated) return null;
 
+    // The detached child is still producing side effects; restart the
+    // detached-age clock so productive orphans are not reclaimed mid-work.
+    detachedSinceAt.delete(runId);
     await appendRunEvent(updated, {
       eventType: "lifecycle",
       stream: "system",
@@ -19486,7 +19505,41 @@ export function heartbeatService(
             });
           }
         }
-        continue;
+        if (!detachedSinceAt.has(run.id)) detachedSinceAt.set(run.id, Date.now());
+        const detachedMaxAgeMs = resolveDetachedRunMaxAgeMs(opts?.detachedMaxAgeMs);
+        const detachedAgeMs = Date.now() - (detachedSinceAt.get(run.id) ?? Date.now());
+        if (detachedMaxAgeMs <= 0 || detachedAgeMs < detachedMaxAgeMs) {
+          continue;
+        }
+        // NFM-4784 safety invariant applies to the reclaim as well: a still-
+        // advancing transcript means the orphaned child is productive, so the
+        // detached bound alone is not death evidence. Defer the destructive
+        // termination while the transcript grows; the detached-age clock
+        // keeps running from the original detach.
+        if (await shouldDeferRunTerminationForTranscriptGrowth(run, now)) {
+          continue;
+        }
+        // The orphaned child outlived the detached bound: reclaim it and fall
+        // through to the shared process_lost finalization so the run cannot
+        // stay "running" forever with a severed output channel (NFM-4785).
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
+        detachedSinceAt.delete(run.id);
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message:
+            `Detached child pid ${run.processPid} exceeded max detached age ${detachedMaxAgeMs}ms; ` +
+            "terminated orphaned child and finalizing run as process_lost",
+          payload: {
+            processPid: run.processPid,
+            detachedMaxAgeMs,
+            detachedAgeMs,
+          },
+        });
       }
 
       const runContext = parseObject(run.contextSnapshot);
@@ -19574,6 +19627,7 @@ export function heartbeatService(
         continue;
       }
 
+      const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
         descendantOnlyCleanup = true;
