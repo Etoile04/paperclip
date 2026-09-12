@@ -414,7 +414,8 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+// NFM-4784: observability_lost is terminal — outcome unknown, verify via transcript.
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "observability_lost"]);
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 

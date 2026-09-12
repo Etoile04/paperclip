@@ -40,6 +40,7 @@ import { issueTreeControlService } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
+import { probeRunTranscriptLiveness, type RunTranscriptLiveness } from "../run-transcript-liveness.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -69,7 +70,9 @@ import {
   type ReconciliationAuditEvent,
 } from "../adr009-reconcile-audit.js";
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+// NFM-4784: observability_lost is unsuccessful-but-outcome-unknown — recovery
+// must not treat it as a clean completion, nor synthesize a verdict from it.
+const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out", "observability_lost"] as const;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -157,7 +160,7 @@ export type RunOutputSilenceSummary = {
   lastOutputStream: "stdout" | "stderr" | null;
   silenceStartedAt: Date | null;
   silenceAgeMs: number | null;
-  level: "not_applicable" | "ok" | "suspicious" | "critical" | "snoozed";
+  level: "not_applicable" | "ok" | "suspicious" | "critical" | "snoozed" | "observability_lost";
   suspicionThresholdMs: number;
   criticalThresholdMs: number;
   snoozedUntil: Date | null;
@@ -1044,7 +1047,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function buildRunOutputSilence(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
+      "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt" | "outputChannelState"
     >,
     now = new Date(),
   ): Promise<RunOutputSilenceSummary> {
@@ -1058,11 +1061,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       ? "not_applicable"
       : quietUntilDecision
         ? "snoozed"
-        : (silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS
-          ? "critical"
-          : (silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS
-            ? "suspicious"
-            : "ok";
+        : // NFM-4784 remedy (b): a severed channel is not silence evidence —
+          // classify observability_lost ahead of the silence thresholds.
+          run.outputChannelState === "severed"
+          ? "observability_lost"
+          : (silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS
+            ? "critical"
+            : (silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS
+              ? "suspicious"
+              : "ok";
     return {
       lastOutputAt: run.lastOutputAt ?? null,
       lastOutputSeq: run.lastOutputSeq ?? 0,
@@ -1259,17 +1266,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
   }
 
-  async function finalizeAgentAfterSourceResolvedRun(run: typeof heartbeatRuns.$inferSelect, status: "succeeded" | "cancelled") {
+  async function finalizeAgentAfterSourceResolvedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    status: "succeeded" | "cancelled" | "observability_lost",
+  ) {
     const [runningCountRow] = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running")));
     const runningCount = Number(runningCountRow?.count ?? 0);
     const nextStatus = runningCount > 0 ? "running" : status === "succeeded" || status === "cancelled" ? "idle" : "error";
+    // NFM-4784: observability_lost leaves the agent in error — operators must
+    // verify the outcome via the session transcript before resuming work.
+    const errorReason = status === "observability_lost" ? "observability_lost: run outcome unknown; verify via session transcript" : null;
     await db
       .update(agents)
       .set({
         status: nextStatus,
+        errorReason,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -1287,8 +1301,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     now: Date;
   }) {
     if (!input.evidence) return { kind: "skipped" as const };
-    const cleanup = await cleanupSourceResolvedRunProcess({ run: input.run, runningAgent: input.runningAgent });
-    const finalRunStatus = input.sourceIssue.status === "cancelled" ? "cancelled" : "succeeded";
+    // NFM-4784 contract #5 (terminal honesty): a severed run never ends in a
+    // synthetic success/failure — even when the source issue resolved. And the
+    // safety invariant still holds: no destructive kill while the recorded
+    // transcript shows the work may still be advancing.
+    const channelSevered = input.run.outputChannelState === "severed";
+    const transcript = await probeRunTranscriptLiveness({
+      transcriptPath: input.run.transcriptPath ?? null,
+      silenceStartedAt: input.silenceStartedAt,
+      now: input.now,
+    });
+    const cleanup = channelSevered && transcript.status === "growing"
+      ? {
+        attempted: false,
+        outcome: "skipped_transcript_growing",
+        adapterType: input.runningAgent.adapterType,
+      }
+      : await cleanupSourceResolvedRunProcess({ run: input.run, runningAgent: input.runningAgent });
+    const finalRunStatus = channelSevered
+      ? "observability_lost" as const
+      : input.sourceIssue.status === "cancelled"
+        ? "cancelled" as const
+        : "succeeded" as const;
     const resultJson = {
       ...parseObject(input.run.resultJson),
       sourceResolvedWatchdogFold: {
@@ -1311,8 +1345,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .set({
           status: finalRunStatus,
           finishedAt: input.now,
-          error: null,
-          errorCode: null,
+          error: channelSevered
+            ? "observability_lost: output channel severed before completion; source issue resolved — outcome unknown, verify via session transcript"
+            : null,
+          errorCode: channelSevered ? "observability_lost" : null,
           resultJson,
           updatedAt: input.now,
         })
@@ -1324,9 +1360,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         await tx
           .update(agentWakeupRequests)
           .set({
-            status: finalRunStatus === "succeeded" ? "completed" : "cancelled",
+            status: finalRunStatus === "succeeded" ? "completed" : finalRunStatus === "cancelled" ? "cancelled" : "failed",
             finishedAt: input.now,
-            error: null,
+            error: channelSevered
+              ? "observability_lost: outcome unknown; output channel severed before completion"
+              : null,
             updatedAt: input.now,
           })
           .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.run.companyId)));
@@ -1766,6 +1804,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
     }
 
+    // NFM-4784 remedy (b): a severed output channel is not silence evidence.
+    // Classify observability_lost — operator alert YES, destructive auto-action
+    // NO — instead of the suspicious-silence path. The transcript probe is
+    // mandatory here: it feeds the alert's verify-via-transcript instructions
+    // (growing => alive-unobservable; static => stalled or finished).
+    if (input.run.outputChannelState === "severed") {
+      return createOrUpdateObservabilityLostEvaluation({
+        run: input.run,
+        runningAgent,
+        sourceIssue,
+        existing,
+        silenceStartedAt,
+        now: input.now,
+      });
+    }
+
     const prefix = await getCompanyIssuePrefix(input.run.companyId);
     const evidence = await collectStaleRunEvidence({
       run: input.run,
@@ -1888,6 +1942,181 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { kind: "created" as const, evaluationIssueId: evaluation.id };
   }
 
+  // NFM-4784: idempotent activity record for transcript-growth withholds.
+  // Logged once per distinct transcript observation (size/mtime pair) so a
+  // long-lived growing run does not spam the activity log every scan cycle.
+  // The observation is persisted WITHOUT bumping updatedAt — the run is still
+  // a silent-active-run candidate and must keep scanning.
+  async function maybeLogTranscriptGrowingWithheld(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "transcriptPath" | "transcriptStatJson">,
+    transcript: RunTranscriptLiveness,
+    now: Date,
+  ) {
+    const prev = parseObject(run.transcriptStatJson);
+    const unchanged =
+      prev.sizeBytes === transcript.sizeBytes && prev.mtimeMs === transcript.mtimeMs;
+    await db
+      .update(heartbeatRuns)
+      .set({
+        transcriptStatJson: {
+          sizeBytes: transcript.sizeBytes,
+          mtimeMs: transcript.mtimeMs,
+          observedAt: now.toISOString(),
+          status: "growing",
+        },
+      })
+      .where(eq(heartbeatRuns.id, run.id));
+    if (unchanged) return;
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: run.agentId,
+      runId: run.id,
+      action: "heartbeat.output_stale_withheld_transcript_growing",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        transcriptPath: transcript.path,
+        transcriptSizeBytes: transcript.sizeBytes,
+        transcriptMtimeMs: transcript.mtimeMs,
+        silenceWithheldAt: now.toISOString(),
+      },
+    });
+  }
+
+  // NFM-4784 remedies (b)+(c): observability_lost evaluation for runs whose
+  // output channel is severed. The operator alert still fires (someone must
+  // verify the outcome via the session transcript), but it is framed as
+  // outcome-unknown and explicitly forbids destructive auto-actions. Reuses the
+  // same origin dedupe as the silence evaluation, so a run can never carry both
+  // an observability_lost and a suspicious-silence alert simultaneously.
+  async function createOrUpdateObservabilityLostEvaluation(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: typeof agents.$inferSelect;
+    sourceIssue: typeof issues.$inferSelect | null;
+    existing: Awaited<ReturnType<typeof findOpenStaleRunEvaluation>>;
+    silenceStartedAt: Date | null;
+    now: Date;
+  }) {
+    const transcript = await probeRunTranscriptLiveness({
+      transcriptPath: input.run.transcriptPath ?? null,
+      silenceStartedAt: input.silenceStartedAt,
+      now: input.now,
+    });
+    if (input.existing) {
+      return { kind: "observability_lost" as const, evaluationIssueId: input.existing.id };
+    }
+
+    const ownerAgentId = await resolveStaleRunOwnerAgentId({
+      run: input.run,
+      runningAgent: input.runningAgent,
+      sourceIssue: input.sourceIssue,
+    });
+    const transcriptDetail = transcript.status === "growing"
+      ? `Growing — last write at ${new Date(transcript.mtimeMs ?? 0).toISOString()} (${transcript.sizeBytes ?? 0} bytes) after the silence began. The agent is likely alive but unobservable through the output channel.`
+      : transcript.status === "static"
+        ? `Static — last write at ${new Date(transcript.mtimeMs ?? 0).toISOString()} (${transcript.sizeBytes ?? 0} bytes), predating the silence window. The agent may have stalled or finished unobserved.`
+        : "Unavailable — no transcript was recorded on the run record, so secondary liveness could not be verified.";
+    const description = [
+      "Paperclip lost the output channel on an active heartbeat run (classification: `observability_lost`).",
+      "",
+      "The channel is severed, so output silence is NOT evidence about the work. The run outcome is unknown until verified against the agent session transcript.",
+      "",
+      "## Run",
+      "",
+      `- Run: \`${input.run.id}\``,
+      `- Agent: ${input.runningAgent.name} (${input.runningAgent.adapterType})`,
+      `- Source issue: ${input.sourceIssue ? `${input.sourceIssue.identifier ?? input.sourceIssue.id}` : "none"}`,
+      `- Channel severed at: ${input.run.severedAt?.toISOString() ?? "unknown"}`,
+      `- Severed reason: ${input.run.severedReason ?? "unknown"}`,
+      `- Last output at: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"} (sequence ${input.run.lastOutputSeq ?? 0})`,
+      `- Transcript: ${transcript.path || "none recorded"}`,
+      `- Transcript liveness: ${transcriptDetail}`,
+      "",
+      "## Required Operator Steps (non-destructive)",
+      "",
+      "1. Read the session transcript at the recorded path to establish what the run actually did.",
+      "2. If the transcript shows completed work, reconcile the source issue by hand from that evidence.",
+      "3. If the transcript shows in-progress work, decide whether to let it finish or stop it through the explicit run recovery controls.",
+      "",
+      "## Constraints",
+      "",
+      "- Do NOT cancel, kill, force-fail, or reassign the run from this alert alone.",
+      "- Absence of telemetry is never sufficient evidence for a destructive action; destructive paths require positive death evidence (process gone AND transcript static).",
+      "- This evaluation exists so a human verifies the outcome; closing it does not imply the run succeeded or failed.",
+    ].join("\n");
+    let evaluation: Awaited<ReturnType<typeof issuesSvc.create>>;
+    try {
+      evaluation = await issuesSvc.create(input.run.companyId, {
+        title: `Observability lost on active run for ${input.runningAgent.name}`,
+        description,
+        status: "todo",
+        priority: "high",
+        parentId: input.sourceIssue && !["done", "cancelled"].includes(input.sourceIssue.status) ? input.sourceIssue.id : null,
+        projectId: input.sourceIssue?.projectId ?? null,
+        goalId: input.sourceIssue?.goalId ?? null,
+        billingCode: input.sourceIssue?.billingCode ?? null,
+        assigneeAgentId: ownerAgentId,
+        assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+        originKind: STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND,
+        originId: input.run.id,
+        originRunId: input.run.id,
+        originFingerprint: staleActiveRunOriginFingerprint(input.run.companyId, input.run.id),
+      });
+    } catch (error) {
+      if (!isUniqueStaleRunEvaluationConflict(error)) throw error;
+      const raced = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
+      if (!raced) throw error;
+      return { kind: "observability_lost" as const, evaluationIssueId: raced.id };
+    }
+
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: ownerAgentId,
+      runId: input.run.id,
+      action: "heartbeat.run_observability_lost",
+      entityType: "issue",
+      entityId: evaluation.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        classification: "observability_lost",
+        sourceIssueId: input.sourceIssue?.id ?? null,
+        severedAt: input.run.severedAt?.toISOString() ?? null,
+        severedReason: input.run.severedReason ?? null,
+        transcriptStatus: transcript.status,
+        transcriptPath: transcript.path || null,
+        lastOutputAt: input.run.lastOutputAt?.toISOString() ?? null,
+      },
+    });
+    if (ownerAgentId) {
+      await deps.enqueueWakeup(ownerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: withRecoveryModelProfileHint({
+          issueId: evaluation.id,
+          staleRunId: input.run.id,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+        }, "status_only"),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: evaluation.id,
+          taskId: evaluation.id,
+          wakeReason: "issue_assigned",
+          source: STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND,
+          staleRunId: input.run.id,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+        }, "status_only"),
+      });
+    }
+    return { kind: "observability_lost" as const, evaluationIssueId: evaluation.id };
+  }
+
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     const now = opts?.now ?? new Date();
     const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
@@ -1912,6 +2141,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       folded: 0,
       snoozed: 0,
       skipped: 0,
+      // NFM-4784: severed-channel classifications and transcript-growth
+      // withholds are tracked separately from suspicious-silence outcomes.
+      observabilityLost: 0,
+      withheldTranscriptGrowing: 0,
       evaluationIssueIds: [] as string[],
     };
 
@@ -1920,11 +2153,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.snoozed += 1;
         continue;
       }
+      // NFM-4784 contract #3: stat the run's session transcript before
+      // alerting on any silent run. A growing transcript means the work is
+      // alive but unobservable through the output channel — withhold the
+      // suspicious-silence alert for this cycle. Severed runs skip the
+      // withhold: their alert is observability_lost (already the downgrade)
+      // and the transcript probe feeds its verify-via-transcript checklist.
+      if (run.outputChannelState !== "severed") {
+        const transcript = await probeRunTranscriptLiveness({
+          transcriptPath: run.transcriptPath ?? null,
+          silenceStartedAt: silenceStartedAtForRun(run),
+          now,
+        });
+        if (transcript.status === "growing") {
+          result.withheldTranscriptGrowing += 1;
+          await maybeLogTranscriptGrowingWithheld(run, transcript, now);
+          continue;
+        }
+      }
       const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
       if (outcome.kind === "created") result.created += 1;
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
       else if (outcome.kind === "folded") result.folded += 1;
+      else if (outcome.kind === "observability_lost") result.observabilityLost += 1;
       else result.skipped += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);

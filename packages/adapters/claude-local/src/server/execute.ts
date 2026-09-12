@@ -103,6 +103,30 @@ export function claudeSessionCwdMatchesExecutionTarget(input: {
   return path.resolve(input.runtimeSessionCwd) === path.resolve(input.effectiveExecutionCwd);
 }
 
+// NFM-4784: resolve the on-disk session transcript location the way Claude
+// Code does (project dir = config dir + projects/<encoded cwd>), mirroring the
+// poisoned-session cleanup path below. When the session id is already known
+// (resumed session) this is the exact JSONL file; otherwise the project
+// directory, whose newest *.jsonl is the live session transcript. Persisted on
+// the run record at adapter start so liveness probes never infer paths later.
+export function resolveClaudeSessionTranscriptPaths(input: {
+  env: NodeJS.ProcessEnv;
+  executionCwd: string;
+  sessionId: string | null;
+}): { transcriptPath: string; scope: "session_file" | "project_dir" } {
+  const configDir = resolveSharedClaudeConfigDir(input.env);
+  // Mirrors Claude Code's project-dir encoding: non-alphanumeric chars become "-"; existing hyphens pass through.
+  const encodedCwd = input.executionCwd.replace(/[^a-zA-Z0-9-]/g, "-");
+  const projectDir = path.join(configDir, "projects", encodedCwd);
+  if (input.sessionId) {
+    return {
+      transcriptPath: path.join(projectDir, `${input.sessionId}.jsonl`),
+      scope: "session_file",
+    };
+  }
+  return { transcriptPath: projectDir, scope: "project_dir" };
+}
+
 function buildLoginResult(input: {
   proc: RunProcessResult;
   loginUrl: string | null;
@@ -785,13 +809,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
+    // NFM-4784: report the transcript location at spawn so the harness can
+    // persist it on the run record before any output arrives. Remote/sandbox
+    // transcripts are not host-local, so no path is reported there.
+    const attemptTranscript = resolveClaudeSessionTranscriptPaths({
+      env: effectiveEnv,
+      executionCwd: effectiveExecutionCwd,
+      sessionId: resumeSessionId,
+    });
+    const attemptOnSpawn = onSpawn && !executionTargetIsRemote
+      ? async (meta: { pid: number; processGroupId: number | null; startedAt: string }) => {
+          await onSpawn({ ...meta, transcriptPath: attemptTranscript.transcriptPath });
+        }
+      : onSpawn;
+
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
       env,
       stdin: prompt,
       timeoutSec,
       graceSec,
-      onSpawn,
+      onSpawn: attemptOnSpawn,
+      onChannelSevered: ctx.onChannelSevered,
       onRuntimeProgress: ctx.onRuntimeProgress,
       onLog,
       terminalResultCleanup: {

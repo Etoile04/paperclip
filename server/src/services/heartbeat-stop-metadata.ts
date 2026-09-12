@@ -1,4 +1,10 @@
-export type HeartbeatRunOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
+export type HeartbeatRunOutcome =
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "timed_out"
+  // NFM-4784: severed channel — outcome unknown, verify via transcript.
+  | "observability_lost";
 
 export type HeartbeatRunStopReason =
   | "completed"
@@ -8,6 +14,7 @@ export type HeartbeatRunStopReason =
   | "paused"
   | "max_turns_exhausted"
   | "process_lost"
+  | "observability_lost"
   | "adapter_failed";
 
 export interface HeartbeatRunTimeoutPolicy {
@@ -87,6 +94,7 @@ export function inferHeartbeatRunStopReason(input: {
   if (maxTurnStopReason) return maxTurnStopReason;
   if (input.outcome === "timed_out") return "timeout";
   if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
+  if (input.outcome === "observability_lost") return "observability_lost";
   if (input.outcome === "cancelled") {
     const message = (input.errorMessage ?? "").toLowerCase();
     if (message.includes("budget")) return "budget_paused";

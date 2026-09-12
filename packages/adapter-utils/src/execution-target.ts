@@ -89,6 +89,15 @@ export interface AdapterExecutionTargetProcessOptions {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  /**
+   * NFM-4784: reader-stream-death notification while the child may still be
+   * alive. Local execution only — sandbox streams are transport-managed.
+   */
+  onChannelSevered?: (meta: {
+    stream: "stdout" | "stderr";
+    childPid: number | null;
+    reason: string;
+  }) => Promise<void>;
   terminalResultCleanup?: TerminalResultCleanupOptions;
 }
 
@@ -443,6 +452,7 @@ export async function runAdapterExecutionTargetProcess(
     graceSec: options.graceSec,
     onLog: options.onLog,
     onSpawn: options.onSpawn,
+    onChannelSevered: options.onChannelSevered,
     terminalResultCleanup: options.terminalResultCleanup,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
   });

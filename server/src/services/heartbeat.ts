@@ -58,6 +58,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
+import { statTranscript } from "./run-transcript-liveness.js";
 import { readBurnBudgetForAgent } from "./agent-burn-budget.js";
 import {
   decideFleetPressure,
@@ -254,8 +255,23 @@ const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const HEARTBEAT_RUN_TERMINAL_STATUSES = [
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+  // NFM-4784: severed-channel terminal — outcome unknown, verify via transcript.
+  "observability_lost",
+] as const;
+const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
+  "failed",
+  "cancelled",
+  "timed_out",
+  "observability_lost",
+] as const;
+// NFM-4784: a transcript written within this window of the reap scan counts
+// as alive on first observation (no prior baseline to compare against).
+const REAP_TRANSCRIPT_RECENT_WRITE_MS = 5 * 60 * 1000;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
@@ -1576,6 +1592,7 @@ const heartbeatRunIssueSummaryColumns = {
   lastOutputSeq: heartbeatRuns.lastOutputSeq,
   lastOutputStream: heartbeatRuns.lastOutputStream,
   lastOutputBytes: heartbeatRuns.lastOutputBytes,
+  outputChannelState: heartbeatRuns.outputChannelState,
   issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
 } as const;
 
@@ -3358,7 +3375,11 @@ export function normalizeSessionParams(params: Record<string, unknown> | null | 
   return Object.keys(params).length > 0 ? params : null;
 }
 
-type RunSessionOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
+// NFM-4784: observability_lost is terminal — the reap loop can finalize a
+// severed run while the adapter promise is still pending; when the adapter
+// call then returns, it observes the terminal status here. Non-succeeded
+// session handling applies (outcome unknown — do not persist resume state).
+type RunSessionOutcome = "succeeded" | "failed" | "cancelled" | "timed_out" | "observability_lost";
 
 const HERMES_ADAPTER_TYPE = "hermes_local";
 const HERMES_SESSION_ID_REGEX = /^(?:\d{8}_\d{6}_[A-Za-z0-9_-]{4,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
@@ -5737,9 +5758,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(row?.maxSeq ?? 0) + 1;
   }
 
+  // NFM-4784 remedy (b): persist the channel_severed marker on the run record
+  // and emit the channel_severed run event. Idempotent per severance — the
+  // guarded update only returns a row on the healthy→severed transition, so a
+  // repeated detection (handle still lost on the next reap cycle) never
+  // duplicates the marker or the event. Only live runs can be severed.
+  async function markRunChannelSevered(input: {
+    runId: string;
+    childPid: number | null;
+    reason: string;
+    now?: Date;
+  }) {
+    const now = input.now ?? new Date();
+    const updated = await db
+      .update(heartbeatRuns)
+      .set({
+        outputChannelState: "severed",
+        severedAt: now,
+        severedReason: input.reason,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, input.runId),
+          sql`coalesce(${heartbeatRuns.outputChannelState}, 'healthy') <> 'severed'`,
+          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+        ),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!updated) return null;
+    await appendRunEvent(updated, await nextRunEventSeq(updated.id), {
+      eventType: "channel_severed",
+      stream: "system",
+      level: "warn",
+      message: `Output channel severed: ${input.reason}`,
+      payload: {
+        ts: now.toISOString(),
+        childPid: input.childPid,
+        reason: input.reason,
+      },
+    });
+    return updated;
+  }
+
   async function persistRunProcessMetadata(
     runId: string,
-    meta: { pid: number; processGroupId: number | null; startedAt: string },
+    meta: {
+      pid: number;
+      processGroupId: number | null;
+      startedAt: string;
+      transcriptPath?: string | null;
+    },
   ) {
     const startedAt = new Date(meta.startedAt);
     return db
@@ -5748,6 +5818,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processPid: meta.pid,
         processGroupId: meta.processGroupId,
         processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
+        // NFM-4784: transcript location is persisted at adapter start; only
+        // adapters that report a path overwrite it (never cleared by others).
+        ...(typeof meta.transcriptPath === "string" && meta.transcriptPath.length > 0
+          ? { transcriptPath: meta.transcriptPath }
+          : {}),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, runId))
@@ -5761,6 +5836,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         error: null,
         errorCode: null,
+        // NFM-4784: activity proves the output channel carries data again —
+        // restore it to healthy so a future severance can be recorded.
+        outputChannelState: "healthy",
+        severedAt: null,
+        severedReason: null,
         updatedAt: new Date(),
       })
       .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.errorCode, DETACHED_PROCESS_ERROR_CODE)))
@@ -5775,6 +5855,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: "Detached child process reported activity; cleared detached warning",
     });
     return updated;
+  }
+
+  // NFM-4784 remedy (c) for the reaper: before force-failing a run whose child
+  // is gone, require the recorded transcript to be static too. A growing
+  // transcript means work continued past the last observable output — the run
+  // is not provably dead, so defer the destructive branch for a later cycle.
+  // The observation is persisted WITHOUT bumping updatedAt: the reap scan
+  // selects on updatedAt staleness, and resetting that window each defer cycle
+  // would keep the run reaped-but-deferred forever.
+  async function shouldDeferRunTerminationForTranscriptGrowth(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "transcriptPath" | "transcriptStatJson">,
+    now: Date,
+  ): Promise<boolean> {
+    const transcriptPath = run.transcriptPath?.trim() ?? "";
+    if (transcriptPath.length === 0) return false;
+    const stat = await statTranscript(transcriptPath);
+    if (!stat) return false;
+
+    const prev = parseObject(run.transcriptStatJson);
+    const prevSizeBytes = typeof prev.sizeBytes === "number" ? prev.sizeBytes : null;
+    const prevMtimeMs = typeof prev.mtimeMs === "number" ? prev.mtimeMs : null;
+
+    let deferred = false;
+    if (prevSizeBytes !== null && prevMtimeMs !== null) {
+      // Growth must be strictly greater: the defer test pins mtimes backward
+      // (a stale observation must never look like growth), so inequality would
+      // falsely defer forever.
+      deferred = stat.sizeBytes > prevSizeBytes || stat.mtimeMs > prevMtimeMs;
+    } else {
+      // First observation: a recently-written transcript is alive by itself.
+      deferred = stat.mtimeMs > now.getTime() - REAP_TRANSCRIPT_RECENT_WRITE_MS;
+    }
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        transcriptStatJson: {
+          sizeBytes: stat.sizeBytes,
+          mtimeMs: stat.mtimeMs,
+          observedAt: now.toISOString(),
+          deferred,
+        },
+      })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    return deferred;
   }
 
   async function patchRunIssueCommentStatus(
@@ -7865,7 +7991,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function finalizeAgentStatus(
     agentId: string,
-    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    outcome: "succeeded" | "failed" | "cancelled" | "timed_out" | "observability_lost",
     failureReason?: string | null,
   ) {
     const existing = await getAgent(agentId);
@@ -7923,7 +8049,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   function mergeRunStopMetadataForAgent(
     agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
-    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    outcome: "succeeded" | "failed" | "cancelled" | "timed_out" | "observability_lost",
     options?: {
       resultJson?: Record<string, unknown> | null;
       errorCode?: string | null;
@@ -8168,6 +8294,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
+        // NFM-4784 remedy (b): the in-memory process handle is gone but the
+        // child is alive — the output channel is severed, not the work. The
+        // marker is idempotent per severance; recovery (activity) resets it.
+        await markRunChannelSevered({
+          runId: run.id,
+          childPid: run.processPid ?? null,
+          reason: `process_handle_lost: in-memory handle missing, child pid ${run.processPid} still alive`,
+        });
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
           const detachedRun = await setRunStatus(run.id, "running", {
@@ -8185,6 +8319,74 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             });
           }
+        }
+        continue;
+      }
+
+      // NFM-4784 safety invariant: absence of telemetry is never sufficient
+      // evidence for a destructive action. The destructive branches below
+      // require positive death evidence — process gone AND transcript static.
+      // While the recorded transcript is still advancing, defer this cycle.
+      if (await shouldDeferRunTerminationForTranscriptGrowth(run, now)) {
+        continue;
+      }
+      const channelSevered = run.outputChannelState === "severed";
+
+      if (channelSevered) {
+        // NFM-4784 contract #5 (terminal honesty): a severed run never ends in
+        // a synthetic success/failure — the channel died before the outcome
+        // was observed. End outcome-unknown; handoff/heartbeat recovery must
+        // verify via the session transcript. No auto-retry: the work may have
+        // completed, and re-running it could duplicate side effects.
+        const severedMessage =
+          `Output channel severed (${run.severedReason ?? "unknown"}) and child process is gone; ` +
+          `observability_lost — outcome unknown, verify via session transcript`;
+        let finalizedSeveredRun = await setRunStatus(run.id, "observability_lost", {
+          error: severedMessage,
+          errorCode: "observability_lost",
+          finishedAt: now,
+          resultJson: mergeRunStopMetadataForAgent(
+            { adapterType, adapterConfig },
+            "observability_lost",
+            {
+              resultJson: parseObject(run.resultJson),
+              errorCode: "observability_lost",
+              errorMessage: severedMessage,
+            },
+          ),
+        });
+        await setWakeupStatus(run.wakeupRequestId, "failed", {
+          finishedAt: now,
+          error: `observability_lost: outcome unknown for run ${run.id}; output channel severed before completion`,
+        });
+        if (!finalizedSeveredRun) finalizedSeveredRun = await getRun(run.id);
+        if (finalizedSeveredRun) {
+          finalizedSeveredRun =
+            (await classifyAndPersistRunLiveness(finalizedSeveredRun, parseObject(finalizedSeveredRun.resultJson))) ??
+            finalizedSeveredRun;
+          await releaseEnvironmentLeasesForRun({
+            runId: finalizedSeveredRun.id,
+            companyId: finalizedSeveredRun.companyId,
+            agentId: finalizedSeveredRun.agentId,
+            status: finalizedSeveredRun.status,
+            failureReason: finalizedSeveredRun.error ?? undefined,
+          });
+          await releaseIssueExecutionAndPromote(finalizedSeveredRun);
+          await appendRunEvent(finalizedSeveredRun, await nextRunEventSeq(finalizedSeveredRun.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: `Run ended observability_lost: ${severedMessage}`,
+            payload: {
+              outputChannelState: "severed",
+              severedAt: run.severedAt ? new Date(run.severedAt).toISOString() : null,
+              severedReason: run.severedReason ?? null,
+              ...(run.processPid ? { processPid: run.processPid } : {}),
+            },
+          });
+          await finalizeAgentStatus(run.agentId, "observability_lost", severedMessage);
+          await startNextQueuedRunForAgent(run.agentId);
+          reaped.push(run.id);
         }
         continue;
       }
@@ -8319,7 +8521,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function buildRunOutputSilence(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
+      "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt" | "outputChannelState"
     >,
     now = new Date(),
   ) {
@@ -9807,6 +10009,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   ? meta.processGroupId
                   : null,
               startedAt: meta.startedAt,
+              // NFM-4784 contract #4: transcript path persisted at adapter
+              // start so liveness probes never infer paths at alert time.
+              transcriptPath:
+                "transcriptPath" in meta && typeof meta.transcriptPath === "string"
+                  ? meta.transcriptPath
+                  : null,
+            });
+          },
+          // NFM-4784 remedy (b): reader-stream death with the child possibly
+          // alive. Records the channel_severed marker; never death evidence.
+          onChannelSevered: async (meta) => {
+            await markRunChannelSevered({
+              runId: run.id,
+              childPid: meta.childPid,
+              reason: meta.reason,
             });
           },
           authToken: authToken ?? undefined,
