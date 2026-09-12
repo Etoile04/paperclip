@@ -287,6 +287,15 @@ export interface AdapterExecutionTargetProcessOptions {
   /** Trusted invocation observation, not a turn completion callback. Called only
    * after local child close or a remotely observed exit, including nonzero exits. */
   onProcessStopped?: () => void;
+  /**
+   * NFM-4784: reader-stream-death notification while the child may still be
+   * alive. Local execution only — sandbox streams are transport-managed.
+   */
+  onChannelSevered?: (meta: {
+    stream: "stdout" | "stderr";
+    childPid: number | null;
+    reason: string;
+  }) => Promise<void>;
   terminalResultCleanup?: TerminalResultCleanupOptions;
   /**
    * Sandbox-only: factory from the Paperclip bridge handle that streams the
@@ -928,6 +937,7 @@ export async function runAdapterExecutionTargetProcess(
     graceSec: options.graceSec,
     onLog: options.onLog,
     onSpawn: options.onSpawn,
+    onChannelSevered: options.onChannelSevered,
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
@@ -4881,25 +4891,15 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       client,
       queueDir,
       maxBodyBytes,
-<<<<<<< HEAD
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
       // The worker encodes binary bodies only at the queue boundary.
-      handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
-        reservation: options?.reservation,
-      }),
-=======
-      handleRequest: async (request) => {
-        // NFM-3858 defense-in-depth: precompletion merge guard
+      handleRequest: async (request, options) => {
+        // NFM-3858 defense-in-depth: precompletion merge guard intercepts
+        // done-transition PATCHes before they reach the API server.
         if (precompletionGuard) {
           const guardResult = await precompletionGuard.intercept(request);
           if (guardResult) {
-            if (bridgeDebugEnabled) {
-              await onLog(
-                "stdout",
-                `[paperclip] Bridge precompletion guard blocked ${request.method} ${request.path}\n`,
-              );
-            }
             return {
               status: guardResult.status,
               headers: guardResult.headers,
@@ -4907,39 +4907,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             };
           }
         }
-        const method = request.method.trim().toUpperCase() || "GET";
-        if (bridgeDebugEnabled) {
-          await onLog(
-            "stdout",
-            `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
-          );
-        }
-        const headers = new Headers();
-        for (const [key, value] of Object.entries(request.headers)) {
-          if (value.trim().length === 0) continue;
-          headers.set(key, value);
-        }
-        headers.set("authorization", `Bearer ${hostApiToken}`);
-        headers.set("x-paperclip-run-id", input.runId);
-        const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), {
-          method,
-          headers,
-          ...(method === "GET" || method === "HEAD" ? {} : { body: request.body }),
-          signal: AbortSignal.timeout(30_000),
+        return forwardBridgeRequest(request, options?.signal, {
+          reservation: options?.reservation,
         });
-        if (bridgeDebugEnabled) {
-          await onLog(
-            "stdout",
-            `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
-          );
-        }
-        return {
-          status: response.status,
-          headers: buildBridgeResponseHeaders(response),
-          body: await readBridgeForwardResponseBody(response, maxBodyBytes),
-        };
       },
->>>>>>> 6bcee4c3e (feat(adr-009 44): ADK runtime PreCompletionMerge bridge guard (NFM-3858))
     });
     server = await startSandboxCallbackBridgeServer({
       runner,
