@@ -19639,6 +19639,11 @@ export function heartbeatService(
       ) {
         continue;
       }
+      // NFM-4785 integration with NFM-4784: a reclaim termination performed by
+      // this cycle is deliberate (bound exceeded, transcript static) and is
+      // positive death evidence by construction — it finalizes process_lost
+      // with the retry-once contract instead of observability_lost.
+      let deliberatelyTerminated = false;
       if (processPidAlive || processGroupAlive) {
         // NFM-4784 remedy (b): the in-memory process handle is gone but the
         // child (pid/group) is still alive — the output channel is severed,
@@ -19706,6 +19711,7 @@ export function heartbeatService(
             detachedAgeMs,
           },
         });
+        deliberatelyTerminated = true;
       }
 
       const runContext = parseObject(run.contextSnapshot);
@@ -19729,10 +19735,11 @@ export function heartbeatService(
       // evidence for a destructive action. The destructive branches below
       // require positive death evidence — process gone AND transcript static.
       // While the recorded transcript is still advancing, defer this cycle.
-      if (await shouldDeferRunTerminationForTranscriptGrowth(run, now)) {
+      // A deliberate reclaim termination above already carries that evidence.
+      if (!deliberatelyTerminated && (await shouldDeferRunTerminationForTranscriptGrowth(run, now))) {
         continue;
       }
-      const channelSevered = run.outputChannelState === "severed";
+      const channelSevered = !deliberatelyTerminated && run.outputChannelState === "severed";
 
       if (channelSevered) {
         // NFM-4784 contract #5 (terminal honesty): a severed run never ends in
