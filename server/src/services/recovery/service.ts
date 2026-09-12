@@ -194,6 +194,17 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
 
+// NFM-4798 (B): when a harness-liveness escalation was closed `done` while the
+// detected invariant still holds, the next scan re-arms that SAME issue instead
+// of minting a new one — but no sooner than this cooldown, so a close/re-open
+// loop cannot burn agent wakes at scan cadence (the NFM-4570 storm fired 10
+// escalations in ~40 minutes this way). Floor at 60s so misconfiguration
+// cannot effectively disable the bound.
+export const LIVENESS_ESCALATION_REARM_COOLDOWN_MS = Math.max(
+  60_000,
+  Number(process.env.LIVENESS_ESCALATION_REARM_COOLDOWN_MS) || 60 * 60 * 1000,
+);
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -5899,6 +5910,615 @@ export function recoveryService(
         },
         "issue graph liveness backstop healed resolved blocked dependency wakes",
       );
+    }
+
+    return result;
+  }
+
+
+  function normalizeIssueGraphLivenessAutoRecoveryLookbackHours(raw: unknown) {
+    const numeric = Math.floor(asNumber(raw, DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS));
+    return Math.min(
+      MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+      Math.max(MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS, numeric),
+    );
+  }
+
+  function livenessDependencyIssueKey(companyId: string, issueId: string) {
+    return `${companyId}:${issueId}`;
+  }
+
+  async function loadLivenessDependencyUpdatedAtByIssue(findings: IssueLivenessFinding[]) {
+    const issueIds = [
+      ...new Set(
+        findings.flatMap((finding) => finding.dependencyPath.map((entry) => entry.issueId)),
+      ),
+    ];
+    if (issueIds.length === 0) return new Map<string, Date>();
+    const rows = await db
+      .select({ id: issues.id, companyId: issues.companyId, updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(inArray(issues.id, issueIds));
+    return new Map(rows.map((row) => [
+      livenessDependencyIssueKey(row.companyId, row.id),
+      row.updatedAt,
+    ]));
+  }
+
+  function latestDependencyUpdatedAtForLivenessFinding(
+    finding: IssueLivenessFinding,
+    updatedAtByIssueKey: Map<string, Date>,
+  ) {
+    const dependencyIssueIds = [...new Set(finding.dependencyPath.map((entry) => entry.issueId))];
+    if (dependencyIssueIds.length === 0) return null;
+    const timestamps = dependencyIssueIds.map((issueId) =>
+      updatedAtByIssueKey.get(livenessDependencyIssueKey(finding.companyId, issueId)) ?? null
+    );
+    if (timestamps.some((timestamp) => !timestamp)) return null;
+    const [firstTimestamp, ...remainingTimestamps] = timestamps as Date[];
+    return remainingTimestamps.reduce((latest, updatedAt) =>
+      updatedAt > latest ? updatedAt : latest,
+    firstTimestamp!);
+  }
+
+  function isLivenessFindingInsideAutoRecoveryLookback(
+    finding: IssueLivenessFinding,
+    cutoff: Date,
+    updatedAtByIssueKey: Map<string, Date>,
+  ) {
+    const latestUpdatedAt = latestDependencyUpdatedAtForLivenessFinding(finding, updatedAtByIssueKey);
+    return Boolean(latestUpdatedAt && latestUpdatedAt >= cutoff);
+  }
+
+  async function buildIssueGraphLivenessAutoRecoveryPreview(
+    opts?: { lookbackHours?: number; now?: Date },
+  ): Promise<IssueGraphLivenessAutoRecoveryPreview> {
+    const now = opts?.now ?? new Date();
+    const lookbackHours = normalizeIssueGraphLivenessAutoRecoveryLookbackHours(opts?.lookbackHours);
+    const cutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+    const findings = await collectIssueGraphLivenessFindings();
+    const updatedAtByIssueKey = await loadLivenessDependencyUpdatedAtByIssue(findings);
+    const issueIds = [...new Set(findings.map((finding) => finding.recoveryIssueId))];
+    const recoveryRows = issueIds.length > 0
+      ? await db
+        .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+        .from(issues)
+        .where(inArray(issues.id, issueIds))
+      : [];
+    const recoveryById = new Map(recoveryRows.map((row) => [row.id, row]));
+    const items: IssueGraphLivenessAutoRecoveryPreviewItem[] = [];
+    let skippedOutsideLookback = 0;
+
+    for (const finding of findings) {
+      const latestDependencyUpdatedAt = latestDependencyUpdatedAtForLivenessFinding(
+        finding,
+        updatedAtByIssueKey,
+      );
+      if (!latestDependencyUpdatedAt || latestDependencyUpdatedAt < cutoff) {
+        skippedOutsideLookback += 1;
+        continue;
+      }
+      const recoveryIssue = recoveryById.get(finding.recoveryIssueId);
+      items.push({
+        issueId: finding.issueId,
+        identifier: finding.identifier,
+        title: finding.dependencyPath[0]?.title ?? finding.identifier ?? finding.issueId,
+        state: finding.state,
+        severity: finding.severity,
+        reason: finding.reason,
+        recoveryIssueId: finding.recoveryIssueId,
+        recoveryIdentifier: recoveryIssue?.identifier ?? null,
+        recoveryTitle: recoveryIssue?.title ?? null,
+        recommendedOwnerAgentId: finding.recommendedOwnerAgentId,
+        incidentKey: finding.incidentKey,
+        latestDependencyUpdatedAt: latestDependencyUpdatedAt.toISOString(),
+        dependencyPath: finding.dependencyPath,
+      });
+    }
+
+    return {
+      lookbackHours,
+      cutoff: cutoff.toISOString(),
+      generatedAt: now.toISOString(),
+      findings: findings.length,
+      recoverableFindings: items.length,
+      skippedOutsideLookback,
+      items,
+    };
+  }
+
+  async function resolveEscalationOwnerAgentId(
+    finding: IssueLivenessFinding,
+    issue: typeof issues.$inferSelect,
+  ) {
+    const detailedCandidates = finding.recommendedOwnerCandidates.length > 0
+      ? finding.recommendedOwnerCandidates
+      : finding.recommendedOwnerCandidateAgentIds.map((agentId) => ({
+        agentId,
+        reason: "ordered_invokable_fallback" as const,
+        sourceIssueId: finding.recoveryIssueId,
+      }));
+    const seenCandidates = new Set<string>();
+    const candidates = detailedCandidates.filter((candidate) => {
+      if (seenCandidates.has(candidate.agentId)) return false;
+      seenCandidates.add(candidate.agentId);
+      return true;
+    });
+    const budgetBlockedCandidateAgentIds: string[] = [];
+
+    for (const candidate of candidates) {
+      const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.agentId, {
+        issueId: issue.id,
+        projectId: issue.projectId,
+      });
+      if (!budgetBlock) {
+        return {
+          agentId: candidate.agentId,
+          reason: candidate.reason,
+          sourceIssueId: candidate.sourceIssueId,
+          candidateAgentIds: candidates.map((entry) => entry.agentId),
+          candidateReasons: candidates.map((entry) => ({
+            agentId: entry.agentId,
+            reason: entry.reason,
+            sourceIssueId: entry.sourceIssueId,
+          })),
+          budgetBlockedCandidateAgentIds,
+        };
+      }
+      budgetBlockedCandidateAgentIds.push(candidate.agentId);
+    }
+
+    return null;
+  }
+
+  function shouldReuseRecoveryExecutionWorkspace(input: {
+    finding: IssueLivenessFinding;
+    recoveryIssue: typeof issues.$inferSelect;
+    ownerAgentId: string;
+  }) {
+    if (input.finding.recoveryIssueId === input.finding.issueId) return false;
+    return input.recoveryIssue.assigneeAgentId === input.ownerAgentId;
+  }
+
+  async function ensureIssueBlockedByEscalation(input: {
+    issue: typeof issues.$inferSelect;
+    escalationIssueId: string;
+    finding: IssueLivenessFinding;
+    runId?: string | null;
+  }) {
+    const blockerIds = await existingBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const nextBlockerIds = [...new Set([...blockerIds, input.escalationIssueId])];
+    const isAlreadyBlockedByEscalation = blockerIds.includes(input.escalationIssueId);
+    const isAlreadyBlocked = input.issue.status === "blocked";
+    if (isAlreadyBlockedByEscalation && isAlreadyBlocked) {
+      return input.issue;
+    }
+
+    const update: Partial<typeof issues.$inferInsert> & { blockedByIssueIds: string[] } = {
+      blockedByIssueIds: nextBlockerIds,
+    };
+    if (!isAlreadyBlocked) {
+      update.status = "blocked";
+    }
+
+    const updated = await issuesSvc.update(input.issue.id, update);
+    if (!updated) return null;
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: input.runId ?? null,
+      action: "issue.blockers.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        source: "recovery.reconcile_issue_graph_liveness",
+        incidentKey: input.finding.incidentKey,
+        findingState: input.finding.state,
+        blockerIssueIds: nextBlockerIds,
+        escalationIssueId: input.escalationIssueId,
+        status: update.status ?? input.issue.status,
+        previousStatus: input.issue.status,
+      },
+    });
+
+    return updated;
+  }
+
+  type IssueGraphLivenessEscalationOutcome =
+    | { kind: "skipped"; reason?: "pause_hold" | "paused_source_assignee" | "rearm_cooldown" }
+    | { kind: "existing"; escalationIssueId: string }
+    | { kind: "created"; escalationIssueId: string }
+    | { kind: "reopened"; escalationIssueId: string };
+
+  // NFM-4798 (B): mirror of the open-escalation lookups restricted to `done`.
+  // Only `done` (an owner's explicit closure) is re-armable — `cancelled` is
+  // what the retire sweeper uses for obsolete recoveries, and re-opening those
+  // would fight it.
+  async function findClosedLivenessEscalationForRearm(
+    companyId: string,
+    incidentKey: string,
+    finding: IssueLivenessFinding,
+  ) {
+    const byIncidentKey = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          eq(issues.originId, incidentKey),
+          eq(issues.status, "done"),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (byIncidentKey) return byIncidentKey;
+
+    return db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
+          eq(issues.status, "done"),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function createIssueGraphLivenessEscalation(input: {
+    finding: IssueLivenessFinding;
+    runId?: string | null;
+  }): Promise<IssueGraphLivenessEscalationOutcome> {
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, input.finding.issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issue || issue.companyId !== input.finding.companyId) return { kind: "skipped" as const };
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+      return { kind: "skipped" as const, reason: "pause_hold" as const };
+    }
+
+    const recoveryIssue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.id, input.finding.recoveryIssueId), eq(issues.companyId, issue.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!recoveryIssue) return { kind: "skipped" as const };
+
+    const existing =
+      await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
+      await findOpenLivenessRecoveryIssueForLeaf(input.finding);
+    if (existing) {
+      await ensureIssueBlockedByEscalation({
+        issue,
+        escalationIssueId: existing.id,
+        finding: input.finding,
+        runId: input.runId ?? null,
+      });
+      return { kind: "existing" as const, escalationIssueId: existing.id };
+    }
+
+    // NFM-4798 (A): a paused source-issue owner cannot clear the invariant, and
+    // the agent auth boundary means no other agent can patch the source issue
+    // either. Arming here would only mint wake-and-discharge cycles; the next
+    // scan re-arms once the owner unpauses (their resumed activity refreshes
+    // the dependency updatedAt values the lookback gate reads).
+    const sourceAssignee = issue.assigneeAgentId ? await getAgent(issue.assigneeAgentId) : null;
+    if (sourceAssignee?.status === "paused") {
+      logger.info(
+        {
+          incidentKey: input.finding.incidentKey,
+          findingState: input.finding.state,
+          sourceIssueId: issue.id,
+          sourceAssigneeAgentId: issue.assigneeAgentId,
+        },
+        "liveness escalation suppressed: source issue assignee is paused",
+      );
+      return { kind: "skipped", reason: "paused_source_assignee" };
+    }
+
+    // NFM-4798 (B): bound same-invariant re-fires to a single escalation issue.
+    // If the invariant still holds after an owner closed the previous
+    // escalation `done`, stay quiet for the cooldown window, then re-arm that
+    // same issue instead of minting a new one.
+    const closedEscalation = await findClosedLivenessEscalationForRearm(
+      issue.companyId,
+      input.finding.incidentKey,
+      input.finding,
+    );
+    if (closedEscalation) {
+      const closedForMs = Date.now() - closedEscalation.updatedAt.getTime();
+      if (closedForMs < LIVENESS_ESCALATION_REARM_COOLDOWN_MS) {
+        return { kind: "skipped", reason: "rearm_cooldown" };
+      }
+
+      let reopened: typeof issues.$inferSelect | null;
+      try {
+        reopened = await issuesSvc.update(closedEscalation.id, { status: "todo" });
+      } catch (error) {
+        if (!isUniqueLivenessRecoveryConflict(error)) throw error;
+        const raced =
+          await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
+          await findOpenLivenessRecoveryIssueForLeaf(input.finding);
+        if (!raced) throw error;
+        return { kind: "existing", escalationIssueId: raced.id };
+      }
+      if (reopened) {
+        await ensureIssueBlockedByEscalation({
+          issue,
+          escalationIssueId: reopened.id,
+          finding: input.finding,
+          runId: input.runId ?? null,
+        });
+
+        await issuesSvc.addComment(
+          reopened.id,
+          [
+            "Paperclip re-armed this liveness escalation because the detected invariant is still present after this issue was closed as `done`.",
+            "",
+            `- Incident key: \`${input.finding.incidentKey}\``,
+            `- Finding: \`${input.finding.state}\``,
+            `- Reason: ${input.finding.reason}`,
+            "",
+            "No new escalation issue was created (NFM-4798). The previous closure did not clear the invariant: remove the offending blocker from the source issue's blocker list, or record an intentional manual resolution and keep this issue open until the graph is clean.",
+          ].join("\n"),
+          { runId: input.runId ?? null },
+        );
+
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: reopened.assigneeAgentId,
+          runId: input.runId ?? null,
+          action: "issue.harness_liveness_escalation_rearmed",
+          entityType: "issue",
+          entityId: reopened.id,
+          details: {
+            source: "recovery.reconcile_issue_graph_liveness",
+            incidentKey: input.finding.incidentKey,
+            findingState: input.finding.state,
+            sourceIssueId: issue.id,
+            escalationIssueId: reopened.id,
+            closedForMs,
+          },
+        });
+
+        logger.warn({
+          incidentKey: input.finding.incidentKey,
+          findingState: input.finding.state,
+          sourceIssueId: issue.id,
+          escalationIssueId: reopened.id,
+          closedForMs,
+        }, "re-armed closed liveness escalation instead of creating a new issue");
+
+        // Deliberately no enqueueWakeup here: the reopened issue is `todo` with
+        // an assignee, so the stranded-issue reconcile dispatch owns waking its
+        // owner (with its budget/invokability guards) instead of this scan.
+        return { kind: "reopened", escalationIssueId: reopened.id };
+      }
+      // The closed escalation changed underneath us (concurrent status flip);
+      // fall through to the normal create path.
+    }
+
+    const ownerSelection = await resolveEscalationOwnerAgentId(input.finding, recoveryIssue);
+    if (!ownerSelection) return { kind: "skipped" as const };
+    const reuseRecoveryExecutionWorkspace = shouldReuseRecoveryExecutionWorkspace({
+      finding: input.finding,
+      recoveryIssue,
+      ownerAgentId: ownerSelection.agentId,
+    });
+
+    let escalation: Awaited<ReturnType<typeof issuesSvc.create>>;
+    try {
+      escalation = await issuesSvc.create(issue.companyId, {
+        title: `Unblock liveness incident for ${issue.identifier ?? issue.id}`,
+        description: buildLivenessEscalationDescription(input.finding),
+        status: "todo",
+        priority: "high",
+        parentId: recoveryIssue.id,
+        projectId: recoveryIssue.projectId,
+        goalId: recoveryIssue.goalId,
+        assigneeAgentId: ownerSelection.agentId,
+        assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+        originKind: RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation,
+        originId: input.finding.incidentKey,
+        originFingerprint: livenessRecoveryLeafFingerprint(input.finding),
+        billingCode: recoveryIssue.billingCode,
+        ...(reuseRecoveryExecutionWorkspace
+          ? { inheritExecutionWorkspaceFromIssueId: recoveryIssue.id }
+          : {
+            executionWorkspaceId: null,
+            executionWorkspacePreference: null,
+            executionWorkspaceSettings: null,
+          }),
+      });
+    } catch (error) {
+      if (!isUniqueLivenessRecoveryConflict(error)) throw error;
+      const raced =
+        await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
+        await findOpenLivenessRecoveryIssueForLeaf(input.finding);
+      if (!raced) throw error;
+      await ensureIssueBlockedByEscalation({
+        issue,
+        escalationIssueId: raced.id,
+        finding: input.finding,
+        runId: input.runId ?? null,
+      });
+      return { kind: "existing" as const, escalationIssueId: raced.id };
+    }
+
+    await ensureIssueBlockedByEscalation({
+      issue,
+      escalationIssueId: escalation.id,
+      finding: input.finding,
+      runId: input.runId ?? null,
+    });
+
+    await issuesSvc.addComment(
+      issue.id,
+      buildLivenessOriginalIssueComment(input.finding, escalation),
+      { runId: input.runId ?? null },
+    );
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: ownerSelection.agentId,
+      runId: input.runId ?? null,
+      action: "issue.harness_liveness_escalation_created",
+      entityType: "issue",
+      entityId: escalation.id,
+      details: {
+        source: "recovery.reconcile_issue_graph_liveness",
+        incidentKey: input.finding.incidentKey,
+        findingState: input.finding.state,
+        sourceIssueId: issue.id,
+        sourceIdentifier: issue.identifier,
+        recoveryIssueId: recoveryIssue.id,
+        recoveryIdentifier: recoveryIssue.identifier,
+        escalationIssueId: escalation.id,
+        escalationIdentifier: escalation.identifier,
+        dependencyPath: input.finding.dependencyPath,
+        ownerSelection: {
+          selectedAgentId: ownerSelection.agentId,
+          selectedReason: ownerSelection.reason,
+          selectedSourceIssueId: ownerSelection.sourceIssueId,
+          candidateAgentIds: ownerSelection.candidateAgentIds,
+          candidateReasons: ownerSelection.candidateReasons,
+          budgetBlockedCandidateAgentIds: ownerSelection.budgetBlockedCandidateAgentIds,
+        },
+        workspaceSelection: {
+          reuseRecoveryExecutionWorkspace,
+          inheritedExecutionWorkspaceFromIssueId: reuseRecoveryExecutionWorkspace ? recoveryIssue.id : null,
+          projectWorkspaceSourceIssueId: recoveryIssue.id,
+        },
+      },
+    });
+
+    const wake = await deps.enqueueWakeup(ownerSelection.agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: withRecoveryModelProfileHint({
+        issueId: escalation.id,
+        sourceIssueId: issue.id,
+        recoveryIssueId: recoveryIssue.id,
+        incidentKey: input.finding.incidentKey,
+      }, "status_only"),
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: withRecoveryModelProfileHint({
+        issueId: escalation.id,
+        taskId: escalation.id,
+        wakeReason: "issue_assigned",
+        source: RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation,
+        sourceIssueId: issue.id,
+        recoveryIssueId: recoveryIssue.id,
+        incidentKey: input.finding.incidentKey,
+      }, "status_only"),
+    });
+
+    logger.warn({
+      incidentKey: input.finding.incidentKey,
+      findingState: input.finding.state,
+      sourceIssueId: issue.id,
+      recoveryIssueId: recoveryIssue.id,
+      escalationIssueId: escalation.id,
+      ownerAgentId: ownerSelection.agentId,
+      ownerSelectionReason: ownerSelection.reason,
+      wakeupRunId: wake?.id ?? null,
+    }, "created issue graph liveness escalation");
+
+    return { kind: "created" as const, escalationIssueId: escalation.id };
+  }
+
+  async function reconcileIssueGraphLiveness(opts?: {
+    runId?: string | null;
+    force?: boolean;
+    lookbackHours?: number;
+  }) {
+    const findings = await collectIssueGraphLivenessFindings();
+    const experimentalSettings = await instanceSettings.getExperimental();
+    const autoRecoveryEnabled = asBoolean(
+      experimentalSettings.enableIssueGraphLivenessAutoRecovery,
+      true,
+    ) || opts?.force === true;
+    const lookbackHours = normalizeIssueGraphLivenessAutoRecoveryLookbackHours(
+      opts?.lookbackHours ?? experimentalSettings.issueGraphLivenessAutoRecoveryLookbackHours,
+    );
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+    const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
+    const doneRecoveryBlockerCleanup = await retireDoneLivenessRecoveryBlockers();
+    const updatedAtByIssueKey = await loadLivenessDependencyUpdatedAtByIssue(findings);
+    const result = {
+      findings: findings.length,
+      autoRecoveryEnabled,
+      lookbackHours,
+      cutoff: cutoff.toISOString(),
+      escalationsCreated: 0,
+      existingEscalations: 0,
+      reopenedEscalations: 0,
+      skipped: 0,
+      skippedAutoRecoveryDisabled: 0,
+      skippedOutsideLookback: 0,
+      skippedPausedSourceOwner: 0,
+      skippedRearmCooldown: 0,
+      obsoleteRecoveriesRetired: obsoleteRecoveryCleanup.retired,
+      obsoleteRecoveriesActiveSkipped: obsoleteRecoveryCleanup.activeSkipped,
+      obsoleteRecoveryBlockerRelationsRemoved: obsoleteRecoveryCleanup.blockerRelationsRemoved,
+      doneRecoveryBlockerRelationsRemoved: doneRecoveryBlockerCleanup.blockerRelationsRemoved,
+      issueIds: [] as string[],
+      escalationIssueIds: [] as string[],
+      retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
+    };
+
+    if (!autoRecoveryEnabled) {
+      result.skippedAutoRecoveryDisabled = findings.length;
+      return result;
+    }
+
+    for (const finding of findings) {
+      if (!isLivenessFindingInsideAutoRecoveryLookback(finding, cutoff, updatedAtByIssueKey)) {
+        result.skippedOutsideLookback += 1;
+        result.skipped += 1;
+        continue;
+      }
+      const escalation = await createIssueGraphLivenessEscalation({
+        finding,
+        runId: opts?.runId ?? null,
+      });
+      if (escalation.kind === "created") {
+        result.escalationsCreated += 1;
+        result.issueIds.push(finding.issueId);
+        result.escalationIssueIds.push(escalation.escalationIssueId);
+      } else if (escalation.kind === "existing") {
+        result.existingEscalations += 1;
+        result.issueIds.push(finding.issueId);
+        result.escalationIssueIds.push(escalation.escalationIssueId);
+      } else if (escalation.kind === "reopened") {
+        result.reopenedEscalations += 1;
+        result.issueIds.push(finding.issueId);
+        result.escalationIssueIds.push(escalation.escalationIssueId);
+      } else {
+        result.skipped += 1;
+        if (escalation.reason === "paused_source_assignee") result.skippedPausedSourceOwner += 1;
+        if (escalation.reason === "rearm_cooldown") result.skippedRearmCooldown += 1;
+      }
     }
 
     return result;
