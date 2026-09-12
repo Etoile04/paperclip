@@ -781,8 +781,15 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
+  // Wired into the SIGTERM/SIGINT shutdown path so in-flight adapter children
+  // are terminated and their runs finalized before the process exits (NFM-4785).
+  let heartbeatForShutdown: {
+    terminateActiveRunsForShutdown: () => Promise<{ terminated: string[] }>;
+  } | null = null;
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    heartbeatForShutdown = heartbeat;
     const routines = routineService(db as any, { pluginWorkerManager });
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
@@ -1115,6 +1122,23 @@ export async function startServer(): Promise<StartedServer> {
   
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      // Drain in-flight heartbeat runs first: terminate tracked adapter
+      // children and finalize their runs as process_lost (with retry) so a
+      // deploy restart cannot orphan a live child against a severed output
+      // channel. Must run before embedded PostgreSQL is stopped below, and a
+      // drain failure must never block process exit (NFM-4785).
+      try {
+        const drain = await heartbeatForShutdown?.terminateActiveRunsForShutdown();
+        if (drain && drain.terminated.length > 0) {
+          logger.warn(
+            { runIds: drain.terminated },
+            "terminated in-flight heartbeat runs on shutdown",
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, "failed to drain in-flight heartbeat runs on shutdown");
+      }
+
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
         telemetryClient.stop();
