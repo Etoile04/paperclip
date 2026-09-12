@@ -14,7 +14,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, costEvents } from "@paperclipai/db";
 import {
@@ -136,7 +136,10 @@ export async function readBurnBudgetForAgent(
       and(
         eq(costEvents.agentId, agentId),
         gte(costEvents.occurredAt, windowStart),
-        sql`${costEvents.occurredAt} <= ${now}`,
+        // NFM-4710: raw sql`` interpolation passes the Date object straight
+        // through to postgres.js, which throws ERR_INVALID_ARG_TYPE at bind
+        // time (gte()/lte() coerce Dates; raw fragments do not).
+        lte(costEvents.occurredAt, now),
       ),
     );
 
