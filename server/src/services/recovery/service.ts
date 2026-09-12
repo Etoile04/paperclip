@@ -99,6 +99,17 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
 
+// NFM-4798 (B): when a harness-liveness escalation was closed `done` while the
+// detected invariant still holds, the next scan re-arms that SAME issue instead
+// of minting a new one — but no sooner than this cooldown, so a close/re-open
+// loop cannot burn agent wakes at scan cadence (the NFM-4570 storm fired 10
+// escalations in ~40 minutes this way). Floor at 60s so misconfiguration
+// cannot effectively disable the bound.
+export const LIVENESS_ESCALATION_REARM_COOLDOWN_MS = Math.max(
+  60_000,
+  Number(process.env.LIVENESS_ESCALATION_REARM_COOLDOWN_MS) || 60 * 60 * 1000,
+);
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -3748,10 +3759,59 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  type IssueGraphLivenessEscalationOutcome =
+    | { kind: "skipped"; reason?: "pause_hold" | "paused_source_assignee" | "rearm_cooldown" }
+    | { kind: "existing"; escalationIssueId: string }
+    | { kind: "created"; escalationIssueId: string }
+    | { kind: "reopened"; escalationIssueId: string };
+
+  // NFM-4798 (B): mirror of the open-escalation lookups restricted to `done`.
+  // Only `done` (an owner's explicit closure) is re-armable — `cancelled` is
+  // what the retire sweeper uses for obsolete recoveries, and re-opening those
+  // would fight it.
+  async function findClosedLivenessEscalationForRearm(
+    companyId: string,
+    incidentKey: string,
+    finding: IssueLivenessFinding,
+  ) {
+    const byIncidentKey = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          eq(issues.originId, incidentKey),
+          eq(issues.status, "done"),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (byIncidentKey) return byIncidentKey;
+
+    return db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
+          eq(issues.status, "done"),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function createIssueGraphLivenessEscalation(input: {
     finding: IssueLivenessFinding;
     runId?: string | null;
-  }) {
+  }): Promise<IssueGraphLivenessEscalationOutcome> {
     const issue = await db
       .select()
       .from(issues)
@@ -3759,7 +3819,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
     if (!issue || issue.companyId !== input.finding.companyId) return { kind: "skipped" as const };
     if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
-      return { kind: "skipped" as const };
+      return { kind: "skipped" as const, reason: "pause_hold" as const };
     }
 
     const recoveryIssue = await db
@@ -3780,6 +3840,109 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         runId: input.runId ?? null,
       });
       return { kind: "existing" as const, escalationIssueId: existing.id };
+    }
+
+    // NFM-4798 (A): a paused source-issue owner cannot clear the invariant, and
+    // the agent auth boundary means no other agent can patch the source issue
+    // either. Arming here would only mint wake-and-discharge cycles; the next
+    // scan re-arms once the owner unpauses (their resumed activity refreshes
+    // the dependency updatedAt values the lookback gate reads).
+    const sourceAssignee = issue.assigneeAgentId ? await getAgent(issue.assigneeAgentId) : null;
+    if (sourceAssignee?.status === "paused") {
+      logger.info(
+        {
+          incidentKey: input.finding.incidentKey,
+          findingState: input.finding.state,
+          sourceIssueId: issue.id,
+          sourceAssigneeAgentId: issue.assigneeAgentId,
+        },
+        "liveness escalation suppressed: source issue assignee is paused",
+      );
+      return { kind: "skipped", reason: "paused_source_assignee" };
+    }
+
+    // NFM-4798 (B): bound same-invariant re-fires to a single escalation issue.
+    // If the invariant still holds after an owner closed the previous
+    // escalation `done`, stay quiet for the cooldown window, then re-arm that
+    // same issue instead of minting a new one.
+    const closedEscalation = await findClosedLivenessEscalationForRearm(
+      issue.companyId,
+      input.finding.incidentKey,
+      input.finding,
+    );
+    if (closedEscalation) {
+      const closedForMs = Date.now() - closedEscalation.updatedAt.getTime();
+      if (closedForMs < LIVENESS_ESCALATION_REARM_COOLDOWN_MS) {
+        return { kind: "skipped", reason: "rearm_cooldown" };
+      }
+
+      let reopened: typeof issues.$inferSelect | null;
+      try {
+        reopened = await issuesSvc.update(closedEscalation.id, { status: "todo" });
+      } catch (error) {
+        if (!isUniqueLivenessRecoveryConflict(error)) throw error;
+        const raced =
+          await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
+          await findOpenLivenessRecoveryIssueForLeaf(input.finding);
+        if (!raced) throw error;
+        return { kind: "existing", escalationIssueId: raced.id };
+      }
+      if (reopened) {
+        await ensureIssueBlockedByEscalation({
+          issue,
+          escalationIssueId: reopened.id,
+          finding: input.finding,
+          runId: input.runId ?? null,
+        });
+
+        await issuesSvc.addComment(
+          reopened.id,
+          [
+            "Paperclip re-armed this liveness escalation because the detected invariant is still present after this issue was closed as `done`.",
+            "",
+            `- Incident key: \`${input.finding.incidentKey}\``,
+            `- Finding: \`${input.finding.state}\``,
+            `- Reason: ${input.finding.reason}`,
+            "",
+            "No new escalation issue was created (NFM-4798). The previous closure did not clear the invariant: remove the offending blocker from the source issue's blocker list, or record an intentional manual resolution and keep this issue open until the graph is clean.",
+          ].join("\n"),
+          { runId: input.runId ?? null },
+        );
+
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: reopened.assigneeAgentId,
+          runId: input.runId ?? null,
+          action: "issue.harness_liveness_escalation_rearmed",
+          entityType: "issue",
+          entityId: reopened.id,
+          details: {
+            source: "recovery.reconcile_issue_graph_liveness",
+            incidentKey: input.finding.incidentKey,
+            findingState: input.finding.state,
+            sourceIssueId: issue.id,
+            escalationIssueId: reopened.id,
+            closedForMs,
+          },
+        });
+
+        logger.warn({
+          incidentKey: input.finding.incidentKey,
+          findingState: input.finding.state,
+          sourceIssueId: issue.id,
+          escalationIssueId: reopened.id,
+          closedForMs,
+        }, "re-armed closed liveness escalation instead of creating a new issue");
+
+        // Deliberately no enqueueWakeup here: the reopened issue is `todo` with
+        // an assignee, so the stranded-issue reconcile dispatch owns waking its
+        // owner (with its budget/invokability guards) instead of this scan.
+        return { kind: "reopened", escalationIssueId: reopened.id };
+      }
+      // The closed escalation changed underneath us (concurrent status flip);
+      // fall through to the normal create path.
     }
 
     const ownerSelection = await resolveEscalationOwnerAgentId(input.finding, recoveryIssue);
@@ -3941,9 +4104,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       cutoff: cutoff.toISOString(),
       escalationsCreated: 0,
       existingEscalations: 0,
+      reopenedEscalations: 0,
       skipped: 0,
       skippedAutoRecoveryDisabled: 0,
       skippedOutsideLookback: 0,
+      skippedPausedSourceOwner: 0,
+      skippedRearmCooldown: 0,
       obsoleteRecoveriesRetired: obsoleteRecoveryCleanup.retired,
       obsoleteRecoveriesActiveSkipped: obsoleteRecoveryCleanup.activeSkipped,
       obsoleteRecoveryBlockerRelationsRemoved: obsoleteRecoveryCleanup.blockerRelationsRemoved,
@@ -3976,8 +4142,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.existingEscalations += 1;
         result.issueIds.push(finding.issueId);
         result.escalationIssueIds.push(escalation.escalationIssueId);
+      } else if (escalation.kind === "reopened") {
+        result.reopenedEscalations += 1;
+        result.issueIds.push(finding.issueId);
+        result.escalationIssueIds.push(escalation.escalationIssueId);
       } else {
         result.skipped += 1;
+        if (escalation.reason === "paused_source_assignee") result.skippedPausedSourceOwner += 1;
+        if (escalation.reason === "rearm_cooldown") result.skippedRearmCooldown += 1;
       }
     }
 
