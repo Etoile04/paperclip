@@ -13,7 +13,7 @@
  * Owners: NFM-4687 (LE, implement).
  */
 
-import { and, gte, sql } from "drizzle-orm";
+import { and, gte, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { costEvents } from "@paperclipai/db";
 import {
@@ -70,7 +70,10 @@ export async function readFleetPressureReading(
     .where(
       and(
         gte(costEvents.occurredAt, windowStart),
-        sql`${costEvents.occurredAt} <= ${now}`,
+        // NFM-4710: raw sql`` interpolation passes the Date object straight
+        // through to postgres.js, which throws ERR_INVALID_ARG_TYPE at bind
+        // time (gte()/lte() coerce Dates; raw fragments do not).
+        lte(costEvents.occurredAt, now),
       ),
     );
   const sums = row[0] ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
