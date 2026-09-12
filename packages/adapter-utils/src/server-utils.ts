@@ -2316,6 +2316,11 @@ export async function runChildProcess(
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onLogError?: (err: unknown, runId: string, message: string) => void;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+    onChannelSevered?: (meta: {
+      stream: "stdout" | "stderr";
+      childPid: number | null;
+      reason: string;
+    }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
@@ -2473,6 +2478,26 @@ export async function runChildProcess(
             stdin.end();
           });
         }
+
+        // NFM-4784: a reader-stream death while the child may still be alive
+        // severs the output channel. Reported at most once per process and
+        // never after the child is provably gone — the callback records the
+        // channel_severed marker but must never be used as death evidence.
+        let channelSeveredReported = false;
+        const reportReaderStreamDeath = (stream: "stdout" | "stderr", err: Error) => {
+          if (channelSeveredReported) return;
+          if (child.exitCode !== null || child.signalCode !== null) return;
+          channelSeveredReported = true;
+          const reason = `reader_stream_death:${stream}:${err.message}`;
+          const notified = opts.onChannelSevered?.({ stream, childPid: child.pid ?? null, reason });
+          if (notified) {
+            void notified.catch((notifyErr) => {
+              onLogError(notifyErr, runId, "failed to record channel severed marker");
+            });
+          }
+        };
+        child.stdout?.on("error", (err: Error) => reportReaderStreamDeath("stdout", err));
+        child.stderr?.on("error", (err: Error) => reportReaderStreamDeath("stderr", err));
 
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);

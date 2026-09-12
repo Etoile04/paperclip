@@ -709,6 +709,10 @@ export const HEARTBEAT_RUN_STATUSES = [
   "failed",
   "cancelled",
   "timed_out",
+  // NFM-4784: terminal state for runs whose output channel was severed — the
+  // outcome is unknown and must be verified via the session transcript, never
+  // reported as a synthetic success/failure.
+  "observability_lost",
 ] as const;
 export type HeartbeatRunStatus = (typeof HEARTBEAT_RUN_STATUSES)[number];
 

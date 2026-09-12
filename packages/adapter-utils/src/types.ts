@@ -138,7 +138,29 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
-  onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  onSpawn?: (meta: {
+    pid: number;
+    processGroupId: number | null;
+    startedAt: string;
+    /**
+     * NFM-4784: session transcript location (file or project directory) the
+     * harness persists on the run record at adapter start so liveness probes
+     * never infer paths at alert time. Optional — adapters without an on-disk
+     * transcript leave it undefined.
+     */
+    transcriptPath?: string | null;
+  }) => Promise<void>;
+  /**
+   * NFM-4784: invoked at most once per process when an output reader stream
+   * dies while the child may still be alive. The harness records the
+   * channel_severed marker; absence of telemetry must not be treated as death
+   * evidence, so this never justifies a destructive action by itself.
+   */
+  onChannelSevered?: (meta: {
+    stream: "stdout" | "stderr";
+    childPid: number | null;
+    reason: string;
+  }) => Promise<void>;
   authToken?: string;
 }
 

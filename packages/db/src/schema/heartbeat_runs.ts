@@ -53,6 +53,19 @@ export const heartbeatRuns = pgTable(
     continuationAttempt: integer("continuation_attempt").notNull().default(0),
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
+    // NFM-4784: output-channel observability. `severed` means the harness lost
+    // its output channel to a possibly-alive child (process handle lost or
+    // reader-stream death); absence of telemetry must never be treated as
+    // death evidence. NULL/`healthy` mean no severance is recorded.
+    outputChannelState: text("output_channel_state"),
+    severedAt: timestamp("severed_at", { withTimezone: true }),
+    severedReason: text("severed_reason"),
+    // Session transcript location persisted at adapter start so the watchdog
+    // never infers paths at alert time (NFM-4784 remedy (c)).
+    transcriptPath: text("transcript_path"),
+    // Last transcript stat observed by the reaper (size/mtime baseline) used
+    // to require "process gone AND transcript static" before destructive actions.
+    transcriptStatJson: jsonb("transcript_stat_json").$type<Record<string, unknown>>(),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
