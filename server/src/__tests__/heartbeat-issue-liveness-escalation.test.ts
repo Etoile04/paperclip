@@ -121,6 +121,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     outsideLookback?: boolean;
     blockerStatus?: string;
     blockerAssigneeAgentId?: "coder" | "manager" | null;
+    sourceAssigneeStatus?: string;
   } = {}) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -153,7 +154,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         companyId,
         name: "Coder",
         role: "engineer",
-        status: "idle",
+        status: opts.sourceAssigneeStatus ?? "idle",
         reportsTo: managerId,
         adapterType: "codex_local",
         adapterConfig: {},
@@ -743,7 +744,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     );
   });
 
-  it("creates a fresh escalation when the previous matching escalation is terminal", async () => {
+  it("creates a fresh escalation when the previous matching escalation is cancelled (NFM-4798: only `done` is re-armable)", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatService(db);
@@ -760,7 +761,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       id: closedEscalationId,
       companyId,
       title: "Closed escalation",
-      status: "done",
+      status: "cancelled",
       priority: "high",
       parentId: blockedIssueId,
       assigneeAgentId: managerId,
@@ -786,7 +787,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         ),
       );
     expect(openEscalations).toHaveLength(2);
-    const freshEscalation = openEscalations.find((issue) => issue.status !== "done");
+    const freshEscalation = openEscalations.find(
+      (issue) => issue.status !== "done" && issue.status !== "cancelled",
+    );
     expect(freshEscalation).toMatchObject({
       parentId: blockerIssueId,
       assigneeAgentId: managerId,
@@ -838,5 +841,110 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
     expect(blockers.some((row) => row.blockerIssueId === escalations[0]!.id)).toBe(false);
+  });
+
+  it("suppresses liveness escalation while the source issue assignee is paused, then re-arms on unpause (NFM-4798 A)", async () => {
+    await enableAutoRecovery();
+    const { companyId, coderId } = await seedBlockedChain({ sourceAssigneeStatus: "paused" });
+    const heartbeat = heartbeatService(db);
+
+    const paused = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(paused.findings).toBe(1);
+    expect(paused.escalationsCreated).toBe(0);
+    expect(paused.skippedPausedSourceOwner).toBe(1);
+
+    const escalationsWhilePaused = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalationsWhilePaused).toHaveLength(0);
+
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, coderId));
+
+    const resumed = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(resumed.escalationsCreated).toBe(1);
+    const escalationsAfterResume = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalationsAfterResume).toHaveLength(1);
+  });
+
+  it("stays quiet within the re-arm cooldown after a done escalation closes while the invariant holds (NFM-4798 B)", async () => {
+    await enableAutoRecovery();
+    const { companyId } = await seedBlockedChain();
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileIssueGraphLiveness();
+    expect(first.escalationsCreated).toBe(1);
+    const [escalation] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalation).toBeTruthy();
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, escalation!.id));
+
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(second.escalationsCreated).toBe(0);
+    expect(second.reopenedEscalations).toBe(0);
+    expect(second.skippedRearmCooldown).toBe(1);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]?.status).toMatch(/^(todo|in_progress|done)$/);
+  });
+
+  it("re-arms the same done escalation past the cooldown instead of minting a new issue (NFM-4798 B)", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId } = await seedBlockedChain();
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileIssueGraphLiveness();
+    expect(first.escalationsCreated).toBe(1);
+    const [escalation] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalation).toBeTruthy();
+
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000) })
+      .where(eq(issues.id, escalation!.id));
+
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(second.escalationsCreated).toBe(0);
+    expect(second.reopenedEscalations).toBe(1);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]?.id).toBe(escalation!.id);
+    expect(escalations[0]?.status).toMatch(/^(todo|in_progress|done)$/);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, escalation!.id));
+    expect(comments.some((comment) => (comment.body ?? "").includes("re-armed"))).toBe(true);
+
+    const blockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(blockers.some((row) => row.blockerIssueId === escalation!.id)).toBe(true);
+
+    const events = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(events.some((event) => event.action === "issue.harness_liveness_escalation_rearmed")).toBe(true);
   });
 });
