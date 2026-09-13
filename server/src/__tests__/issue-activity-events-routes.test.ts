@@ -39,6 +39,10 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
       feedbackDataSharingPreference: "prompt",
     },
   })),
+  getExperimental: vi.fn(async () => ({
+    enableExternalObjects: false,
+    precompletionMergeHookEnabled: false,
+  })),
   listCompanyIds: vi.fn(async () => ["company-1"]),
 }));
 const mockRoutineService = vi.hoisted(() => ({
