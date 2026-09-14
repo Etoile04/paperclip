@@ -5899,7 +5899,7 @@ export function companySkillService(db: Db) {
     let hasSkillFile = false;
     for (const entry of skill.fileInventory) {
       const normalizedPath = normalizePortablePath(entry.path);
-      const detail = await readLoadedSkillFile(skill, normalizedPath);
+      const detail = await readFile(companyId, skill.id, normalizedPath).catch(() => null);
       const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
       if (content === null) continue;
       files.set(normalizedPath, content);
