@@ -375,6 +375,13 @@ export type ProjectSkillScanTarget = {
 type RuntimeSkillEntryOptions = {
   materializeMissing?: boolean;
   versionSelections?: Map<string, string | null>;
+  /**
+   * NFM-4856 F3: restrict which skills may be materialized into the shared
+   * `__runtime__` root. `null`/undefined keeps the legacy behavior (every
+   * registration materializes); an empty set materializes nothing. Keys are
+   * matched against the skill key and its slug segment, case-insensitively.
+   */
+  materializeKeys?: Set<string> | null;
 };
 
 type SkillActor = {
@@ -410,7 +417,40 @@ type PlannedSkillReassignment = {
 
 type RuntimeSkillSourceResolution =
   | { status: "available"; source: string }
+  | { status: "stale"; source: string; detail: string }
   | { status: "missing"; source: string; detail: string };
+
+function skillInMaterializeScope(
+  skill: Pick<CompanySkill, "key">,
+  materializeKeys: Set<string> | null | undefined,
+) {
+  if (!materializeKeys) return true;
+  if (materializeKeys.size === 0) return false;
+  const normalizedKey = skill.key.trim().toLowerCase();
+  if (materializeKeys.has(normalizedKey)) return true;
+  const slugSegment = normalizedKey.split("/").pop() ?? "";
+  return slugSegment ? materializeKeys.has(slugSegment) : false;
+}
+
+/**
+ * NFM-4856 F1: a stored SKILL.md that carries frontmatter but no body is a
+ * descriptor-only stub (legacy auto-stub registrations pointed at
+ * non-SKILL.md artifacts). It must not be materialized as if it were a real
+ * skill.
+ */
+function skillMarkdownHasBody(markdown: string | null | undefined) {
+  if (typeof markdown !== "string" || markdown.trim().length === 0) return false;
+  return parseFrontmatterMarkdown(markdown).body.trim().length > 0;
+}
+
+function buildHollowStoredSkillDetail(skill: Pick<CompanySkill, "name">) {
+  return `Company skill "${skill.name}" only has a descriptor (frontmatter-only) stored copy. `
+    + `Re-register it from a source that contains a full SKILL.md body to use it at runtime.`;
+}
+
+function expectsLocalSourceDir(skill: Pick<CompanySkill, "sourceType" | "sourceLocator">) {
+  return (skill.sourceType === "local_path" || skill.sourceType === "catalog") && Boolean(skill.sourceLocator);
+}
 
 const skillInventoryRefreshPromises = new Map<string, Promise<void>>();
 
@@ -1079,6 +1119,11 @@ function readInlineSkillImports(companyId: string, files: Record<string, string>
     const skillDir = dir === "." ? "" : dir;
     const slugFallback = path.posix.basename(skillDir || path.posix.dirname(skillPath));
     const markdown = normalizedFiles[skillPath]!;
+    if (!skillMarkdownHasBody(markdown)) {
+      throw unprocessable(
+        `Skill file ${skillPath} is frontmatter-only (no body); refusing descriptor-only import (NFM-4856 F1).`,
+      );
+    }
     const parsed = parseFrontmatterMarkdown(markdown);
     const slug = deriveImportedSkillSlug(parsed.frontmatter, slugFallback);
     const source = deriveImportedSkillSource(parsed.frontmatter, slug);
@@ -1420,6 +1465,11 @@ export async function readLocalSkillImportFromDirectory(
   }
   const skillFilePath = path.join(resolvedSkillDir, "SKILL.md");
   const markdown = await fs.readFile(skillFilePath, "utf8");
+  if (!skillMarkdownHasBody(markdown)) {
+    throw unprocessable(
+      `Skill source ${skillFilePath} is frontmatter-only (no body); refusing descriptor-only import (NFM-4856 F1).`,
+    );
+  }
   const parsed = parseFrontmatterMarkdown(markdown);
   const slug = deriveImportedSkillSlug(parsed.frontmatter, path.basename(resolvedSkillDir));
   const parsedMetadata = isPlainRecord(parsed.frontmatter.metadata) ? parsed.frontmatter.metadata : null;
@@ -1547,6 +1597,11 @@ async function readLocalSkillImports(companyId: string, sourcePath: string): Pro
 
   if (stat.isFile()) {
     const markdown = await fs.readFile(resolvedPath, "utf8");
+    if (!skillMarkdownHasBody(markdown)) {
+      throw unprocessable(
+        `Skill source ${resolvedPath} is frontmatter-only (no body); refusing descriptor-only import (NFM-4856 F1).`,
+      );
+    }
     const sourceDir = path.dirname(resolvedPath);
     const parsed = parseFrontmatterMarkdown(markdown);
     const slug = deriveImportedSkillSlug(parsed.frontmatter, path.basename(sourceDir));
@@ -1652,6 +1707,12 @@ async function readUrlSkillImports(
     for (const relativeSkillPath of skillPaths) {
       const repoSkillPath = basePrefix ? `${basePrefix}${relativeSkillPath}` : relativeSkillPath;
       const markdown = await fetchText(resolveRawGitHubUrl(parsed.hostname, parsed.owner, parsed.repo, ref, repoSkillPath));
+      if (!skillMarkdownHasBody(markdown)) {
+        throw unprocessable(
+          `Skill source ${repoSkillPath} in ${parsed.owner}/${parsed.repo} is frontmatter-only (no body); `
+          + `refusing descriptor-only import (NFM-4856 F1).`,
+        );
+      }
       const parsedMarkdown = parseFrontmatterMarkdown(markdown);
       const skillDir = path.posix.dirname(relativeSkillPath);
       const slug = deriveImportedSkillSlug(parsedMarkdown.frontmatter, path.posix.basename(skillDir));
@@ -1714,6 +1775,11 @@ async function readUrlSkillImports(
 
   if (url.startsWith("http://") || url.startsWith("https://")) {
     const markdown = await fetchText(url);
+    if (!skillMarkdownHasBody(markdown)) {
+      throw unprocessable(
+        `Skill source ${url} is frontmatter-only (no body); refusing descriptor-only import (NFM-4856 F1).`,
+      );
+    }
     const parsedMarkdown = parseFrontmatterMarkdown(markdown);
     const urlObj = new URL(url);
     const fileName = path.posix.basename(urlObj.pathname);
@@ -5857,29 +5923,61 @@ export function companySkillService(db: Db) {
     };
   }
 
-  async function materializeRuntimeSkillFiles(companyId: string, skill: CompanySkill) {
-    const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
-    const skillDir = path.resolve(runtimeRoot, buildSkillRuntimeName(skill.key, skill.slug));
-    await fs.rm(skillDir, { recursive: true, force: true });
-    await fs.mkdir(skillDir, { recursive: true });
-
-    let wroteSkillFile = false;
+  async function buildRuntimeSkillFileContents(companyId: string, skill: CompanySkill) {
+    const files = new Map<string, string>();
+    let hasSkillFile = false;
     for (const entry of skill.fileInventory) {
       const normalizedPath = normalizePortablePath(entry.path);
       const detail = await readLoadedSkillFile(skill, normalizedPath);
       const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
-      if (content === null) throw unprocessable("Declared skill file is unavailable");
-      const resolved = resolveVersionSnapshotPath(skillDir, entry.path);
-      if (!resolved) throw unprocessable("Invalid skill file path");
-      const targetPath = resolved.targetPath;
-      await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, content, "utf8");
-      if (normalizedPath === "SKILL.md") wroteSkillFile = true;
+      if (content === null) continue;
+      files.set(normalizedPath, content);
+      if (normalizedPath === "SKILL.md") hasSkillFile = true;
+    }
+    return hasSkillFile ? files : null;
+  }
+
+  async function materializedRuntimeFilesMatch(skillDir: string, files: Map<string, string>) {
+    const existingFiles = await listMaterializedFiles(skillDir);
+    if (!existingFiles || existingFiles.length !== files.size) return false;
+    for (const relativePath of existingFiles) {
+      if (!files.has(relativePath)) return false;
+    }
+    for (const [relativePath, content] of files.entries()) {
+      const existingContent = await fs.readFile(path.resolve(skillDir, relativePath), "utf8").catch(() => null);
+      if (existingContent !== content) return false;
+    }
+    return true;
+  }
+
+  async function materializeRuntimeSkillFiles(companyId: string, skill: CompanySkill) {
+    const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
+    const skillDir = path.resolve(runtimeRoot, buildSkillRuntimeName(skill.key, skill.slug));
+
+    const files = await buildRuntimeSkillFileContents(companyId, skill);
+    if (!files) {
+      throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
     }
 
-    if (!wroteSkillFile) {
-      await fs.rm(skillDir, { recursive: true, force: true });
-      throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
+    // NFM-4856 F2: an already-current materialized copy must not be rewritten —
+    // unconditional rm+rewrite kept mutating the hot runtime dir on every sync.
+    if (await materializedRuntimeFilesMatch(skillDir, files)) {
+      return skillDir;
+    }
+
+    // NFM-4856 F2: stage the new copy and swap atomically so concurrent readers
+    // never observe a half-written or transiently missing skill directory.
+    const replacement = await createDirectoryReplacement(skillDir);
+    try {
+      for (const [relativePath, content] of files.entries()) {
+        const targetPath = path.resolve(replacement.stagingDir, relativePath);
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(targetPath, content, "utf8");
+      }
+      await replacement.commit();
+    } catch (error) {
+      await replacement.cleanup();
+      throw error;
     }
 
     return skillDir;
@@ -6025,26 +6123,23 @@ export function companySkillService(db: Db) {
     const source = await resolveExistingSkillDirectory(normalizeSkillDirectory(skill));
     if (source) return { status: "available", source };
 
-    try {
-      const cache = runtimeSkillCacheSpec(resolveManagedSkillsRoot(companyId), skill);
-      if (cache) {
-        const cachedSource = await resolveRuntimeSkillCache(cache,
-          async (relativePath) => (await readLoadedSkillFile(skill, relativePath)).content,
-          options.materializeMissing !== false,
-          async () => (await getById(companyId, skill.id))?.key === skill.key);
-        return cachedSource
-          ? { status: "available", source: cachedSource }
-          : { status: "missing", source: path.join(cache.entry, "files"), detail: buildMissingRuntimeSourceDetail(skill) };
-      }
-    } catch (error) {
+    const materializedPath = resolveRuntimeSkillMaterializedPath(companyId, skill);
+    const storedCopyIsHollow = !skillMarkdownHasBody(skill.markdown);
+    const hollowDetail = buildHollowStoredSkillDetail(skill);
+
+    if (storedCopyIsHollow) {
+      // NFM-4856 F1: never materialize a descriptor-only stored copy. Surface it
+      // as missing so the gap is visible instead of shipping a hollow skill.
       return {
-        status: "missing", source: resolveRuntimeSkillMaterializedPath(companyId, skill),
-        detail: `Failed to materialize skill files: ${error instanceof Error ? error.message : String(error)}`,
+        status: "missing",
+        source: materializedPath,
+        detail: hollowDetail,
       };
     }
 
-    if (options.materializeMissing === false) {
-      const materializedPath = resolveRuntimeSkillMaterializedPath(companyId, skill);
+    const mayMaterialize = options.materializeMissing !== false
+      && skillInMaterializeScope(skill, options.materializeKeys);
+    if (!mayMaterialize) {
       const materializedSource = await resolveExistingSkillDirectory(materializedPath);
       if (materializedSource) return { status: "available", source: materializedSource };
       return {
@@ -6054,24 +6149,27 @@ export function companySkillService(db: Db) {
       };
     }
 
-    // Same contract as above: a materialization failure becomes a structured
-    // "missing" resolution carrying the underlying error, so snapshots and the
-    // UI can show the skill as broken instead of pretending it does not exist.
-    try {
-      const materializedSource = await materializeRuntimeSkillFiles(companyId, skill);
-      if (materializedSource) return { status: "available", source: materializedSource };
+    const materializedSource = await materializeRuntimeSkillFiles(companyId, skill).catch(() => null);
+    if (!materializedSource) return null;
+
+    // NFM-4856 F4: for registrations whose local source directory is gone,
+    // materializing the stored copy is a degraded fallback, not a healthy
+    // sync — flag it instead of silently tolerating the dead source.
+    if (expectsLocalSourceDir(skill)) {
+      const deadSourcePath = normalizeSourceLocatorDirectory(skill.sourceLocator);
+      console.warn(
+        `[paperclip] Company skill "${skill.name}" local source is missing at ${deadSourcePath}; `
+        + `materialized the last stored copy (NFM-4856 F4).`,
+      );
       return {
-        status: "missing",
-        source: resolveRuntimeSkillMaterializedPath(companyId, skill),
-        detail: buildMissingRuntimeSourceDetail(skill),
-      };
-    } catch (error) {
-      return {
-        status: "missing",
-        source: resolveRuntimeSkillMaterializedPath(companyId, skill),
-        detail: `Failed to materialize skill files: ${error instanceof Error ? error.message : String(error)}`,
+        status: "stale",
+        source: materializedSource,
+        detail: `Company skill "${skill.name}" local source is missing at ${deadSourcePath}; `
+          + `the last stored copy was materialized instead.`,
       };
     }
+
+    return { status: "available", source: materializedSource };
   }
 
   async function listRuntimeSkillEntries(
@@ -6079,10 +6177,20 @@ export function companySkillService(db: Db) {
     options: RuntimeSkillEntryOptions = {},
   ): Promise<PaperclipSkillEntry[]> {
     const skills = await listFull(companyId);
+    const materializeKeys = options.materializeKeys
+      ? new Set(
+        [...options.materializeKeys]
+          .map((reference) => reference.trim().toLowerCase())
+          .filter(Boolean),
+      )
+      : null;
+    const resolutionOptions: RuntimeSkillEntryOptions = materializeKeys
+      ? { ...options, materializeKeys }
+      : options;
 
     const out: PaperclipSkillEntry[] = [];
     for (const skill of skills) {
-      const sourceResolution = await resolveRuntimeSkillSource(companyId, skill, options);
+      const sourceResolution = await resolveRuntimeSkillSource(companyId, skill, resolutionOptions);
       if (!sourceResolution) continue;
 
       out.push({
@@ -6092,12 +6200,32 @@ export function companySkillService(db: Db) {
         versionId: options.versionSelections?.get(skill.key) ?? (skill.metadata?.skillSourceId && skill.metadata?.snapshotHash ? skill.currentVersionId : null),
         currentVersionId: skill.currentVersionId,
         sourceStatus: sourceResolution.status,
-        missingDetail: sourceResolution.status === "missing" ? sourceResolution.detail : null,
+        missingDetail: sourceResolution.status === "available" ? null : sourceResolution.detail,
       });
     }
 
     out.sort((left, right) => left.key.localeCompare(right.key));
+    // NFM-4856 F2: GC against the full registry (never the scoped subset) so
+    // concurrent differently-scoped syncs cannot collect each other's dirs.
+    await gcRuntimeSkillDirectories(
+      companyId,
+      new Set(skills.map((skill) => buildSkillRuntimeName(skill.key, skill.slug))),
+    );
     return out;
+  }
+
+  async function gcRuntimeSkillDirectories(companyId: string, allowedRuntimeNames: Set<string>) {
+    const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
+    const entries = await fs.readdir(runtimeRoot, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (allowedRuntimeNames.has(entry.name)) continue;
+      await fs.rm(path.resolve(runtimeRoot, entry.name), { recursive: true, force: true });
+      // NFM-4856 F2: every GC must be observable in server logs.
+      console.info(
+        `[paperclip] skills runtime GC: removed stale materialized dir "${entry.name}" (no matching skill registration).`,
+      );
+    }
   }
 
   async function importPackageFiles(
