@@ -9398,8 +9398,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runScopedMentionedSkillKeys,
     );
     const runtimeSkillPreference = readPaperclipSkillSyncPreference(effectiveResolvedConfig);
+    // NFM-4856 F3: materialize only what this run is actually assigned (explicit
+    // desiredSkills, which include run-scoped mentioned keys). Agents without an
+    // explicit preference consume no Paperclip-managed skills, so they must not
+    // trigger a full-catalog rewrite of the shared runtime root either.
+    const runtimeSkillMaterializeKeys = new Set(
+      (runtimeSkillPreference.explicit ? runtimeSkillPreference.desiredSkills : [])
+        .map((key) => key.trim().toLowerCase())
+        .filter(Boolean),
+    );
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
       versionSelections: skillVersionSelectionMap(runtimeSkillPreference.desiredSkillEntries),
+      materializeKeys: runtimeSkillMaterializeKeys,
     });
     let runtimeConfig = {
       ...effectiveResolvedConfig,
