@@ -193,7 +193,12 @@ export interface PaperclipSkillEntry {
   source: string;
   versionId?: string | null;
   currentVersionId?: string | null;
-  sourceStatus?: "available" | "missing";
+  /**
+   * "stale" (NFM-4856 F4) marks a skill materialized from the stored copy
+   * because its registered local source directory is gone. Consumers treat it
+   * like "available" for execution but can surface the degradation.
+   */
+  sourceStatus?: "available" | "missing" | "stale";
   missingDetail?: string | null;
 }
 

@@ -240,4 +240,113 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     });
     expect((await fs.stat(firstSkillFile)).mtime.toISOString()).toBe(oldMtime.toISOString());
   });
+
+  it("scopes runtime skill materialization to explicit desiredSkills (NFM-4856 F3)", async () => {
+    const companyId = randomUUID();
+    const scopedSkillId = randomUUID();
+    const unscopedSkillId = randomUUID();
+    const agentWithPreferenceId = randomUUID();
+    const agentWithoutPreferenceId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const scopedKey = `company/${companyId}/scoped-coach`;
+    const unscopedKey = `company/${companyId}/unscoped-coach`;
+    const runtimeRoot = path.join(paperclipHome!, "instances", "default", "skills", companyId, "__runtime__");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    // Dead-source registrations with full bodies: only the materialization
+    // scope decides whether the shared __runtime__ root gets a directory.
+    await db.insert(companySkills).values([
+      {
+        id: scopedSkillId,
+        companyId,
+        key: scopedKey,
+        slug: "scoped-coach",
+        name: "Scoped Coach",
+        description: null,
+        markdown: "# Scoped Coach\n\nBody.\n",
+        sourceType: "catalog",
+        sourceLocator: path.join(os.tmpdir(), `dead-scoped-${randomUUID()}`),
+        trustLevel: "markdown_only",
+        compatibility: "compatible",
+        fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+        metadata: { sourceKind: "catalog" },
+      },
+      {
+        id: unscopedSkillId,
+        companyId,
+        key: unscopedKey,
+        slug: "unscoped-coach",
+        name: "Unscoped Coach",
+        description: null,
+        markdown: "# Unscoped Coach\n\nBody.\n",
+        sourceType: "catalog",
+        sourceLocator: path.join(os.tmpdir(), `dead-unscoped-${randomUUID()}`),
+        trustLevel: "markdown_only",
+        compatibility: "compatible",
+        fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+        metadata: { sourceKind: "catalog" },
+      },
+    ]);
+    await db.insert(agents).values([
+      {
+        id: agentWithPreferenceId,
+        companyId,
+        name: "Scoped Preference",
+        role: "engineer",
+        status: "idle",
+        adapterType: TEST_ADAPTER_TYPE,
+        adapterConfig: {
+          paperclipSkillSync: {
+            desiredSkills: [{ key: scopedKey, versionId: null }],
+          },
+        },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: agentWithoutPreferenceId,
+        companyId,
+        name: "No Preference",
+        role: "engineer",
+        status: "idle",
+        adapterType: TEST_ADAPTER_TYPE,
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+
+    const noPreferenceRun = await heartbeat.invoke(agentWithoutPreferenceId, "on_demand", {}, "manual");
+    expect(noPreferenceRun).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, noPreferenceRun!.id))?.status).toBe("succeeded");
+
+    let runtimeDirs = await fs.readdir(runtimeRoot).catch(() => [] as string[]);
+    expect(runtimeDirs.some((dir) => dir.startsWith("scoped-coach"))).toBe(false);
+    expect(runtimeDirs.some((dir) => dir.startsWith("unscoped-coach"))).toBe(false);
+    const noPreferenceEntries = capturedRuns
+      .find((run) => run.agentId === agentWithoutPreferenceId)?.skills ?? [];
+    expect(noPreferenceEntries.find((entry) => entry.key === scopedKey)?.sourceStatus).toBe("missing");
+
+    const scopedRun = await heartbeat.invoke(agentWithPreferenceId, "on_demand", {}, "manual");
+    expect(scopedRun).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, scopedRun!.id))?.status).toBe("succeeded");
+
+    runtimeDirs = await fs.readdir(runtimeRoot).catch(() => [] as string[]);
+    expect(runtimeDirs.some((dir) => dir.startsWith("scoped-coach"))).toBe(true);
+    expect(runtimeDirs.some((dir) => dir.startsWith("unscoped-coach"))).toBe(false);
+    const scopedEntries = capturedRuns
+      .filter((run) => run.agentId === agentWithPreferenceId)
+      .at(-1)?.skills ?? [];
+    const scopedEntry = scopedEntries.find((entry) => entry.key === scopedKey);
+    expect(scopedEntry?.sourceStatus).toBe("stale");
+    await expect(fs.readFile(path.join(scopedEntry!.source, "SKILL.md"), "utf8"))
+      .resolves.toContain("Scoped Coach");
+  });
 });

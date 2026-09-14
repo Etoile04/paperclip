@@ -914,7 +914,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     await expect(fs.stat(entry!.source)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("materializes source-missing company skills from the stored markdown during runtime listing", async () => {
+  it("materializes source-missing company skills from the stored markdown, flagged stale (NFM-4856 F4)", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();
     const skillKey = `company/${companyId}/runtime-coach`;
@@ -961,7 +961,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
 
     expect(entry).toMatchObject({
       key: skillKey,
-      sourceStatus: "available",
+      sourceStatus: "stale",
     });
     await expect(fs.readFile(path.join(entry!.source, "SKILL.md"), "utf8")).resolves.toBe(
       "# Runtime Coach\n\nRecovered from DB.\n",
