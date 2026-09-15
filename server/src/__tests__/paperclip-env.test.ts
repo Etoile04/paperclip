@@ -3,6 +3,7 @@ import { buildPaperclipEnv } from "../adapters/utils.js";
 
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
+const ORIGINAL_PAPERCLIP_LOCAL_API_URL = process.env.PAPERCLIP_LOCAL_API_URL;
 const ORIGINAL_PAPERCLIP_LISTEN_HOST = process.env.PAPERCLIP_LISTEN_HOST;
 const ORIGINAL_PAPERCLIP_LISTEN_PORT = process.env.PAPERCLIP_LISTEN_PORT;
 const ORIGINAL_HOST = process.env.HOST;
@@ -14,6 +15,9 @@ afterEach(() => {
 
   if (ORIGINAL_PAPERCLIP_API_URL === undefined) delete process.env.PAPERCLIP_API_URL;
   else process.env.PAPERCLIP_API_URL = ORIGINAL_PAPERCLIP_API_URL;
+
+  if (ORIGINAL_PAPERCLIP_LOCAL_API_URL === undefined) delete process.env.PAPERCLIP_LOCAL_API_URL;
+  else process.env.PAPERCLIP_LOCAL_API_URL = ORIGINAL_PAPERCLIP_LOCAL_API_URL;
 
   if (ORIGINAL_PAPERCLIP_LISTEN_HOST === undefined) delete process.env.PAPERCLIP_LISTEN_HOST;
   else process.env.PAPERCLIP_LISTEN_HOST = ORIGINAL_PAPERCLIP_LISTEN_HOST;
@@ -72,5 +76,33 @@ describe("buildPaperclipEnv", () => {
     const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
 
     expect(env.PAPERCLIP_API_URL).toBe("http://[::1]:3101");
+  });
+
+  it("prefers PAPERCLIP_LOCAL_API_URL for local-transport spawns", () => {
+    process.env.PAPERCLIP_LOCAL_API_URL = "http://127.0.0.1:3101";
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://100.65.135.2:3101";
+    process.env.PAPERCLIP_API_URL = "http://100.65.135.2:3101";
+
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" }, { preferLocalTransport: true });
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3101");
+  });
+
+  it("ignores PAPERCLIP_LOCAL_API_URL when local transport is not preferred", () => {
+    process.env.PAPERCLIP_LOCAL_API_URL = "http://127.0.0.1:3101";
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://100.65.135.2:3101";
+
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://100.65.135.2:3101");
+  });
+
+  it("falls through to the runtime URL when PAPERCLIP_LOCAL_API_URL is unset", () => {
+    delete process.env.PAPERCLIP_LOCAL_API_URL;
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://100.65.135.2:3101";
+
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" }, { preferLocalTransport: true });
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://100.65.135.2:3101");
   });
 });

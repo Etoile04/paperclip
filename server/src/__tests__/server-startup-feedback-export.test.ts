@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
+const ORIGINAL_PAPERCLIP_LOCAL_API_URL = process.env.PAPERCLIP_LOCAL_API_URL;
 const ORIGINAL_PAPERCLIP_LISTEN_HOST = process.env.PAPERCLIP_LISTEN_HOST;
 const ORIGINAL_PAPERCLIP_LISTEN_PORT = process.env.PAPERCLIP_LISTEN_PORT;
 
@@ -330,6 +331,9 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
       process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = ORIGINAL_PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
     }
 
+    if (ORIGINAL_PAPERCLIP_LOCAL_API_URL === undefined) delete process.env.PAPERCLIP_LOCAL_API_URL;
+    else process.env.PAPERCLIP_LOCAL_API_URL = ORIGINAL_PAPERCLIP_LOCAL_API_URL;
+
     if (ORIGINAL_PAPERCLIP_LISTEN_HOST === undefined) delete process.env.PAPERCLIP_LISTEN_HOST;
     else process.env.PAPERCLIP_LISTEN_HOST = ORIGINAL_PAPERCLIP_LISTEN_HOST;
 
@@ -400,5 +404,51 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("https://paperclip.example");
     expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
+  });
+
+  it("exports a loopback PAPERCLIP_LOCAL_API_URL when binding all interfaces with a VPN public URL", async () => {
+    loadConfigMock.mockReturnValueOnce(buildTestConfig({
+      host: "0.0.0.0",
+      authBaseUrlMode: "explicit",
+      authPublicBaseUrl: "http://100.65.135.2:3210",
+    }));
+
+    const started = await startServer();
+
+    expect(started.apiUrl).toBe("http://100.65.135.2:3210");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://100.65.135.2:3210");
+    expect(started.localApiUrl).toBe("http://127.0.0.1:3210");
+    expect(process.env.PAPERCLIP_LOCAL_API_URL).toBe("http://127.0.0.1:3210");
+  });
+
+  it("exports PAPERCLIP_LOCAL_API_URL equal to the runtime URL for loopback binds", async () => {
+    const started = await startServer();
+
+    expect(started.apiUrl).toBe("http://127.0.0.1:3210");
+    expect(started.localApiUrl).toBe("http://127.0.0.1:3210");
+    expect(process.env.PAPERCLIP_LOCAL_API_URL).toBe("http://127.0.0.1:3210");
+  });
+
+  it("does not export PAPERCLIP_LOCAL_API_URL when bound to a specific non-loopback host", async () => {
+    loadConfigMock.mockReturnValueOnce(buildTestConfig({
+      host: "100.65.135.2",
+    }));
+
+    const started = await startServer();
+
+    expect(started.localApiUrl).toBeNull();
+    expect(process.env.PAPERCLIP_LOCAL_API_URL).toBeUndefined();
+  });
+
+  it("honors an explicit PAPERCLIP_LOCAL_API_URL operator override", async () => {
+    process.env.PAPERCLIP_LOCAL_API_URL = "http://host.docker.internal:3210";
+    loadConfigMock.mockReturnValueOnce(buildTestConfig({
+      host: "100.65.135.2",
+    }));
+
+    const started = await startServer();
+
+    expect(started.localApiUrl).toBe("http://host.docker.internal:3210");
+    expect(process.env.PAPERCLIP_LOCAL_API_URL).toBe("http://host.docker.internal:3210");
   });
 });
