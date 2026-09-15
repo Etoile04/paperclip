@@ -80,6 +80,44 @@ export function choosePrimaryRuntimeApiUrl(input: {
   return formatOrigin("http:", "localhost", input.port);
 }
 
+/**
+ * Transport URL for agents spawned on the same host as the server.
+ *
+ * The primary runtime API URL can be pinned to a VPN address (e.g. an explicit
+ * auth publicBaseUrl pointing at a Tailscale IP). When that address churns —
+ * a tailnet node re-registers with a new IP — locally spawned agents inherit
+ * an unroutable URL even though the server answers on loopback. This derives
+ * a loopback origin for those agents, decoupling local transport from the
+ * advertised public URL.
+ *
+ * Returns null when loopback reachability cannot be guaranteed (server bound
+ * to a single non-loopback interface); an explicit operator override always
+ * wins (e.g. http://host.docker.internal:<port> for containerized agents).
+ */
+export function computeLocalAgentApiUrl(input: {
+  explicitOverride?: string | null;
+  bindHost: string;
+  port: number;
+}): string | null {
+  const explicitOverride = input.explicitOverride?.trim();
+  if (explicitOverride) {
+    try {
+      return new URL(explicitOverride).origin;
+    } catch {
+      // Ignore malformed overrides and fall through to derivation.
+    }
+  }
+
+  const bindHost = normalizeHost(input.bindHost);
+  if (bindHost && isLoopbackHost(bindHost)) {
+    return formatOrigin("http:", bindHost, input.port);
+  }
+  if (!bindHost || isWildcardHost(bindHost)) {
+    return formatOrigin("http:", "127.0.0.1", input.port);
+  }
+  return null;
+}
+
 export function collectReachableInterfaceHosts(input: {
   networkInterfacesMap?: NodeJS.Dict<os.NetworkInterfaceInfo[]>;
 } = {}): string[] {
