@@ -3198,10 +3198,13 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
-export function buildPaperclipEnv(agent: {
-  id: string;
-  companyId: string;
-}): Record<string, string> {
+export function buildPaperclipEnv(
+  agent: {
+    id: string;
+    companyId: string;
+  },
+  opts?: { preferLocalTransport?: boolean },
+): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
@@ -3222,6 +3225,8 @@ export function buildPaperclipEnv(agent: {
   // authPublicBaseUrl: the derived URL can be unreachable from inside the
   // runtime container (e.g. when the public base URL is VPN/tailnet-only).
   const apiUrl =
+    (opts?.preferLocalTransport ? process.env.PAPERCLIP_LOCAL_API_URL : undefined) ??
+    process.env.PAPERCLIP_RUNTIME_API_URL ??
     process.env.PAPERCLIP_API_URL ??
     process.env.PAPERCLIP_RUNTIME_API_URL ??
     `http://${runtimeHost}:${runtimePort}`;
