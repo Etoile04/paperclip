@@ -113,6 +113,7 @@ import {
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import { computeLocalAgentApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -175,6 +176,7 @@ export interface StartedServer {
   host: string;
   listenPort: number;
   apiUrl: string;
+  localApiUrl: string | null;
   databaseUrl: string;
   shutdown: (signal?: "SIGINT" | "SIGTERM") => Promise<void>;
 }
@@ -969,6 +971,19 @@ async function startServerWithDatabaseTeardown(
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,
   });
+  // Loopback transport for locally spawned agents — decoupled from the
+  // advertised public/auth URL so VPN address churn cannot orphan agent runs.
+  const localAgentApiUrl = computeLocalAgentApiUrl({
+    explicitOverride: process.env.PAPERCLIP_LOCAL_API_URL,
+    bindHost: runtimeListenHost,
+    port: listenPort,
+  });
+  if (localAgentApiUrl) {
+    process.env.PAPERCLIP_LOCAL_API_URL = localAgentApiUrl;
+  } else {
+    delete process.env.PAPERCLIP_LOCAL_API_URL;
+  }
+
   setupLiveEventsWebSocketServer(server, db as any, {
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,
@@ -2142,6 +2157,7 @@ async function startServerWithDatabaseTeardown(
     host: config.host,
     listenPort,
     apiUrl: configuredApiUrl,
+    localApiUrl: localAgentApiUrl,
     databaseUrl: activeDatabaseConnectionString,
     shutdown: (signal = "SIGTERM") => shutdown(signal, false),
   };

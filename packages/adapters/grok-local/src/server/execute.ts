@@ -310,7 +310,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
   const executeTurn = async (): Promise<AdapterExecutionResult> => {
     const envConfig = parseObject(config.env);
     const env: Record<string, string> = {
-      ...buildPaperclipEnv(agent),
+      ...buildPaperclipEnv(agent, { preferLocalTransport: true }),
       ...buildRuntimeToolsEnv(ctx.runtimeTools),
     };
     env.PAPERCLIP_RUN_ID = runId;

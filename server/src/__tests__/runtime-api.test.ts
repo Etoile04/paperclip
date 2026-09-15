@@ -3,6 +3,7 @@ import {
   buildRuntimeApiCandidateUrls,
   choosePrimaryRuntimeApiUrl,
   collectReachableInterfaceHosts,
+  computeLocalAgentApiUrl,
 } from "../runtime-api.js";
 
 describe("runtime API discovery", () => {
@@ -154,5 +155,63 @@ describe("runtime API discovery", () => {
       "192.168.6.178",
       "fd7a:115c:a1e0::8a3a:a11d",
     ]);
+  });
+});
+
+describe("local agent transport URL", () => {
+  it("derives an IPv4 loopback origin when the server binds all interfaces", () => {
+    expect(
+      computeLocalAgentApiUrl({
+        bindHost: "0.0.0.0",
+        port: 3101,
+      }),
+    ).toBe("http://127.0.0.1:3101");
+  });
+
+  it("keeps the loopback bind host when the server binds loopback explicitly", () => {
+    expect(
+      computeLocalAgentApiUrl({
+        bindHost: "127.0.0.1",
+        port: 3210,
+      }),
+    ).toBe("http://127.0.0.1:3210");
+  });
+
+  it("formats IPv6 loopback binds safely", () => {
+    expect(
+      computeLocalAgentApiUrl({
+        bindHost: "::1",
+        port: 3101,
+      }),
+    ).toBe("http://[::1]:3101");
+  });
+
+  it("returns null for a specific non-loopback bind where loopback is not guaranteed", () => {
+    expect(
+      computeLocalAgentApiUrl({
+        bindHost: "100.65.135.2",
+        port: 3101,
+      }),
+    ).toBeNull();
+  });
+
+  it("honors an explicit operator override regardless of bind host", () => {
+    expect(
+      computeLocalAgentApiUrl({
+        explicitOverride: "http://host.docker.internal:3101",
+        bindHost: "100.65.135.2",
+        port: 3101,
+      }),
+    ).toBe("http://host.docker.internal:3101");
+  });
+
+  it("falls back to derivation when the explicit override is malformed", () => {
+    expect(
+      computeLocalAgentApiUrl({
+        explicitOverride: "not a url",
+        bindHost: "0.0.0.0",
+        port: 3101,
+      }),
+    ).toBe("http://127.0.0.1:3101");
   });
 });
