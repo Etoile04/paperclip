@@ -66,7 +66,22 @@ import {
   loadFleetPressureState,
   persistFleetPressureState,
 } from "./fleet-pressure-runtime.js";
-import { annotateContextSnapshot, evaluateDispatch } from "./fleet-dispatch-guard.js";
+import {
+  annotateContextSnapshot,
+  evaluateDispatch,
+  evaluateWakeupDispatch,
+  extractEstimatedTokens,
+} from "./fleet-dispatch-guard.js";
+import {
+  DEMOTE_POLICY,
+  DISPATCH_VERDICT_ALLOW_DEMOTED,
+  DISPATCH_VERDICT_BLOCK,
+} from "./fleet-throttle-constants.js";
+import {
+  FleetDispatchBlockedReason,
+  recordAgentBurnBudgetDemote,
+  recordFleetDispatchBlocked,
+} from "../metrics/fleet-throttle.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
@@ -1706,6 +1721,12 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  /**
+   * NFM-4946 (ADR-014 L5): caller-supplied token-estimate hint for heavy
+   * classification. Wins over payload/contextSnapshot estimates; a present
+   * but malformed value poisons the read (see extractEstimatedTokens).
+   */
+  estimatedTokens?: number | null;
 }
 
 type UsageTotals = {
@@ -11474,6 +11495,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
+    // ADR-014 L5 heavy classification (NFM-4946): wakes that carry a
+    // caller-supplied token estimate flow through the fleet-dispatch guard.
+    // The estimate rides on payload.estimatedTokens — forwarded verbatim by
+    // both wakeup routes — so agents/board callers can classify their own
+    // wakes heavy today. Estimate-less wakes keep the pre-NFM-4946 behavior
+    // (not classifiable as heavy → allowed), so timer ticks and legacy
+    // callers are unaffected. Continuations of a RUNNING run get in-flight
+    // semantics (demote to read-only preamble); everything else gets
+    // new-dispatch semantics (block).
+    const estimatedTokens = extractEstimatedTokens({
+      estimatedTokens: opts.estimatedTokens ?? null,
+      payload,
+      contextSnapshot: opts.contextSnapshot ?? null,
+    });
+    if (estimatedTokens !== null) {
+      const burnBudget = await readBurnBudgetForAgent(db, agentId);
+      const inflightRunIdRaw = payload?.runId ?? enrichedContextSnapshot.resumeFromRunId;
+      const inflightRunId =
+        typeof inflightRunIdRaw === "string" && isUuidLike(inflightRunIdRaw) ? inflightRunIdRaw : null;
+      const inflightRun = inflightRunId ? await getRun(inflightRunId) : null;
+      const guardResult = evaluateWakeupDispatch({
+        estimatedTokens,
+        burnBudget,
+        inflight: inflightRun?.agentId === agentId && inflightRun.status === "running",
+      });
+      if (guardResult.verdict === DISPATCH_VERDICT_BLOCK) {
+        recordFleetDispatchBlocked(FleetDispatchBlockedReason.FleetCapTripped);
+        await writeSkippedRequest("fleet.blocked", {
+          payload: {
+            ...(payload ?? {}),
+            fleetGuard: {
+              verdict: guardResult.verdict,
+              reason: guardResult.reason,
+              estimatedTokens,
+              remainingPctOfCeiling: burnBudget.remainingPctOfCeiling,
+            },
+          },
+        });
+        throw conflict("Fleet dispatch blocked: agent burn budget tripped (ADR-014 L5)", {
+          guardReason: guardResult.reason,
+          estimatedTokens,
+          remainingPctOfCeiling: burnBudget.remainingPctOfCeiling,
+        });
+      }
+      if (guardResult.verdict === DISPATCH_VERDICT_ALLOW_DEMOTED) {
+        recordAgentBurnBudgetDemote(DEMOTE_POLICY);
+        Object.assign(
+          enrichedContextSnapshot,
+          annotateContextSnapshot(enrichedContextSnapshot, guardResult, burnBudget),
+        );
+      }
+    }
+
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
       if (opts.requestedByActorType !== "user") {
@@ -12872,18 +12946,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Heavy + tripped → block (dispatch.blocked:true, wake not enqueued).
         const burnBudget = await readBurnBudgetForAgent(db, agent.id, now);
         const guard = evaluateDispatch({
-          // No caller estimate on timer ticks — treat timer wake as not heavy
-          // unless the agent role flag (TODO post-ship) marks it heavy.
+          // Timer ticks carry no caller estimate — treat timer wake as not
+          // heavy unless a role-based heavy flag (still TODO) marks it heavy.
+          // Heavy classification for estimate-carrying wakes lives in
+          // enqueueWakeup (NFM-4946); this timer path stays estimate-less.
           forceHeavy: false,
           burnBudget,
         });
         if (guard.blocked) {
           blockedByGuard += 1;
+          recordFleetDispatchBlocked(FleetDispatchBlockedReason.FleetCapTripped);
           logger.warn(
             { agentId: agent.id, remainingPctOfCeiling: burnBudget.remainingPctOfCeiling },
             "fleet_dispatch_blocked",
           );
           continue;
+        }
+        if (guard.verdict === DISPATCH_VERDICT_ALLOW_DEMOTED) {
+          // Defensive: unreachable while timer ticks are estimate-less, but
+          // the verdict must meter if the role-based heavy flag ever lands.
+          recordAgentBurnBudgetDemote(DEMOTE_POLICY);
         }
 
         const annotatedSnapshot = guard.verdict === "allow_demoted"
