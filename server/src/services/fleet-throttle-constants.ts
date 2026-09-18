@@ -6,6 +6,8 @@
  * and the body AC / E2E demo can reference named symbols rather than literals.
  *
  * Owners: NFM-4687 (LE, implement) — approved per ADR-014 §3 L3/L4/L5 and §4 AC.
+ * Thresholds made empirical by NFM-4716 (ADR-014 §4 pass, 2026-09-18):
+ * see BURN_BUDGET_CEILING_TOKENS / FLEET_PRESSURE_CEILING_TOKENS below.
  */
 
 export const FLEET_THROTTLE_NAMESPACE = "fleet_token_burn_throttle";
@@ -51,9 +53,32 @@ export const BURN_BUDGET_HYSTERESIS_TICKS = 3;
 export const DEMOTE_POLICY = "read_only_review" as const;
 export type DemotePolicy = typeof DEMOTE_POLICY;
 
-// Bootstrap multiplier on observed baseline before sufficient post-ship
-// telemetry exists. ADR-014 §4 allows this; replace only with empirical data.
-export const BURN_BUDGET_BOOTSTRAP_FACTOR = 1.1;
+// L4 per-agent 5h token ceiling — empirical value from the NFM-4716 ADR-014 §4
+// pass (replaces the retired 1.1× bootstrap, BURN_BUDGET_BOOTSTRAP_FACTOR).
+//
+// Derivation (window 2026-09-11T10:05Z → 2026-09-18T10:05Z, post-NFM-4687
+// prod cost_events, consumed = input + cached_input + output, trailing-5h
+// replay at 5-min samples matching agent-burn-budget.ts slicing):
+//   per-agent active-sample 5h totals: p50 4.08M / p75 8.78M / p95 37.36M
+//   / p99 71.36M / max 128.87M tokens.
+// ceiling = p99 / 0.70 ≈ 101.9M, rounded to 100M → trip point 70M ≈ observed
+// p99. Simulated effect vs the 1.1M bootstrap: tripped samples 33.9% → 1.18%
+// of active samples, tripping only the three observed outlier agents and
+// covering 15/23 genuine claude_usage_cap_exhausted moments (incl. both
+// light-agent starvations on 2026-09-12). Full methodology:
+// docs/specs/adr-014-empirical-threshold-pass.md (NFM-4716).
+export const BURN_BUDGET_CEILING_TOKENS = 100_000_000;
+
+// L3 fleet-aggregate 5h token ceiling — empirical value from the same pass.
+// The anthropic OAuth fleet 5h total at genuine usage-cap-exhaustion moments
+// ranged 107M–211M (median ~175M) while normal operation sat at p50 61M /
+// p75 110M. Ceiling 200M → fleet trip at 140M (remaining < 0.30), above
+// normal p75 and inside observed denial territory. Consequence of the L3
+// incident state is a mild throttle (dispatch limit 50→25, staleClaim
+// 5→10min), so a p75+ anchor is appropriate — unlike the harsher per-agent
+// L5 block, which anchors at p99. The pre-empirical value (1.1M × 8 = 8.8M)
+// left L3 permanently in incident state since NFM-4687 shipped.
+export const FLEET_PRESSURE_CEILING_TOKENS = 200_000_000;
 
 // Test-only env flag that, when set, makes readBurnBudgetForAgent return a
 // synthetic BurnBudgetState whose remainingPctOfCeiling matches the parsed

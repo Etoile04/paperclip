@@ -18,7 +18,7 @@ import { and, eq, gte, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, costEvents } from "@paperclipai/db";
 import {
-  BURN_BUDGET_BOOTSTRAP_FACTOR,
+  BURN_BUDGET_CEILING_TOKENS,
   BURN_BUDGET_HYSTERESIS_TICKS,
   REMAINING_PCT_ABOVE_RECOVER,
   REMAINING_PCT_BELOW_TRIP,
@@ -42,10 +42,10 @@ export interface CostWindowSlice {
 }
 
 /**
- * Default 5h ceiling for one agent. The real ceiling per fleet/account
- * (Claude OAuth 5h cap) is set externally; we multiply the configured
- * baseline by BURN_BUDGET_BOOTSTRAP_FACTOR until empirical post-ship data
- * replaces it (ADR-014 §4 forbids hand-tuning).
+ * Default 5h ceiling for one agent — empirical value from the NFM-4716
+ * ADR-014 §4 pass (replaced the 1.1× bootstrap that ADR-014 §4 permitted
+ * only until 7 days of post-ship telemetry existed). Derivation and
+ * methodology: docs/specs/adr-014-empirical-threshold-pass.md.
  */
 export interface BurnBudgetConfig {
   /** Per-agent 5h input+output token ceiling before trip. */
@@ -53,7 +53,7 @@ export interface BurnBudgetConfig {
 }
 
 export const DEFAULT_BURN_BUDGET_CONFIG: BurnBudgetConfig = {
-  ceilingTokens: Math.round(1_000_000 * BURN_BUDGET_BOOTSTRAP_FACTOR),
+  ceilingTokens: BURN_BUDGET_CEILING_TOKENS,
 };
 
 export interface BurnBudgetState {
