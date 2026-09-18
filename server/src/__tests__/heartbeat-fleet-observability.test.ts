@@ -23,6 +23,7 @@ import {
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
+  toolRuntimeMetricCounters,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -30,6 +31,10 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { persistFleetPressureState } from "../services/fleet-pressure-runtime.js";
+import {
+  __resetFleetThrottleCounterSinkForTests,
+  flushFleetThrottleCounters,
+} from "../services/fleet-throttle-counter-sink.js";
 import { HttpError } from "../errors.js";
 import {
   FleetDispatchBlockedReason,
@@ -71,8 +76,10 @@ describeEmbeddedPostgres("NFM-4946 — fleet observability wiring via enqueueWak
   afterEach(async () => {
     setBurnOverride(null);
     __resetFleetThrottleMetricsForTests();
+    __resetFleetThrottleCounterSinkForTests();
     // Delete children before parents — heartbeat_runs FK-reference
     // agent_wakeup_requests, so the wakeup rows must go last.
+    await db.delete(toolRuntimeMetricCounters);
     await db.delete(heartbeatRunEvents);
     await db.delete(environmentLeases);
     await db.delete(heartbeatRuns);
@@ -115,7 +122,14 @@ describeEmbeddedPostgres("NFM-4946 — fleet observability wiring via enqueueWak
     });
   }
 
-  it("AC-2 block — heavy wake under a simulated 25%-remaining trip is refused and counted", async () => {
+  async function counterRows() {
+    return db
+      .select()
+      .from(toolRuntimeMetricCounters)
+      .where(eq(toolRuntimeMetricCounters.companyId, companyId));
+  }
+
+  it("AC-1/AC-2 block — heavy wake under a simulated 25%-remaining trip is refused, counted, and persisted", async () => {
     await seedAgent();
     setBurnOverride(0.25);
     __resetFleetThrottleMetricsForTests();
@@ -140,6 +154,15 @@ describeEmbeddedPostgres("NFM-4946 — fleet observability wiring via enqueueWak
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(skipRow?.status).toBe("skipped");
     expect(skipRow?.reason).toBe("fleet.blocked");
+
+    // AC-1 — the trip lands as a real row in tool_runtime_metric_counters
+    // (additive hourly bucket, Prometheus-style metric rendering).
+    const rows = await counterRows();
+    const blockedRow = rows.find(
+      (row) => row.metric === 'fleet_dispatch_blocked_total{reason="fleet_cap_tripped"}',
+    );
+    expect(blockedRow?.count).toBe(1);
+    expect(rows.filter((row) => row.metric.startsWith("agent_burn_budget_demote_total"))).toHaveLength(0);
   });
 
   it("AC-2 demote — heavy continuation of a running run under a trip is demoted, not blocked", async () => {
@@ -168,6 +191,13 @@ describeEmbeddedPostgres("NFM-4946 — fleet observability wiring via enqueueWak
     const snapshot = await snapshotFleetThrottleMetrics();
     expect(snapshot.burnDemote["read_only_review"]).toBe(1);
     expect(snapshot.dispatchBlocked[FleetDispatchBlockedReason.FleetCapTripped]).toBe(0);
+
+    // AC-1 — the demote lands as a counter row too.
+    const rows = await counterRows();
+    const demoteRow = rows.find(
+      (row) => row.metric === 'agent_burn_budget_demote_total{policy="read_only_review"}',
+    );
+    expect(demoteRow?.count).toBe(1);
   });
 
   it("heavy wake above budget is allowed and records no counter", async () => {
@@ -195,6 +225,7 @@ describeEmbeddedPostgres("NFM-4946 — fleet observability wiring via enqueueWak
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(request?.status).toBe("skipped");
     expect(request?.reason).not.toBe("fleet.blocked");
+    expect(await counterRows()).toHaveLength(0);
   });
 
   it("estimate-less wakes keep the pre-NFM-4946 behavior (guard inert, no block)", async () => {
@@ -219,12 +250,55 @@ describeEmbeddedPostgres("NFM-4946 — fleet observability wiring via enqueueWak
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(request?.reason).not.toBe("fleet.blocked");
+    expect(await counterRows()).toHaveLength(0);
+  });
+
+  it("AC-1 transition — L3 fleet-global transitions persist per company on flush", async () => {
+    await seedAgent();
+    __resetFleetThrottleCounterSinkForTests();
+    // Simulate the tick path: persistFleetPressureState records the
+    // fleet-global pending trip; the tick-end flush attributes it to the
+    // active companies.
+    await persistFleetPressureState(
+      { state: "incident", transitioned: true, limit: 25, staleClaimThresholdMs: 600_000 },
+      { remainingPctOfCeiling: 0.2, tripped: true },
+      { state: "normal", consecutiveNormalTicks: 0, updatedAt: new Date(0) },
+    );
+    const written = await flushFleetThrottleCounters(db, [companyId]);
+    expect(written).toBe(1);
+
+    const rows = await counterRows();
+    const transitionRow = rows.find(
+      (row) => row.metric === 'fleet_pressure_state_transition_total{from="normal",to="incident"}',
+    );
+    expect(transitionRow?.count).toBe(1);
+
+    // Additive upsert: a second transition in the same hourly bucket
+    // accumulates instead of overwriting.
+    await persistFleetPressureState(
+      { state: "normal", transitioned: true, limit: 50, staleClaimThresholdMs: 300_000 },
+      { remainingPctOfCeiling: 0.9, tripped: false },
+      { state: "incident", consecutiveNormalTicks: 0, updatedAt: new Date(0) },
+    );
+    await flushFleetThrottleCounters(db, [companyId]);
+    const rowsAfter = await counterRows();
+    expect(
+      rowsAfter.find(
+        (row) => row.metric === 'fleet_pressure_state_transition_total{from="normal",to="incident"}',
+      )?.count,
+    ).toBe(1);
+    expect(
+      rowsAfter.find(
+        (row) => row.metric === 'fleet_pressure_state_transition_total{from="incident",to="normal"}',
+      )?.count,
+    ).toBe(1);
   });
 });
 
 describe("NFM-4946 — fleet pressure state transitions are metered", () => {
   it("AC-1 transition — persistFleetPressureState records a normal→incident transition", async () => {
     __resetFleetThrottleMetricsForTests();
+    __resetFleetThrottleCounterSinkForTests();
     await persistFleetPressureState(
       { state: "incident", transitioned: true, limit: 25, staleClaimThresholdMs: 600_000 },
       { remainingPctOfCeiling: 0.2, tripped: true },
@@ -233,10 +307,12 @@ describe("NFM-4946 — fleet pressure state transitions are metered", () => {
     const snapshot = await snapshotFleetThrottleMetrics();
     expect(snapshot.pressureTransitions["normal->incident"]).toBe(1);
     __resetFleetThrottleMetricsForTests();
+    __resetFleetThrottleCounterSinkForTests();
   });
 
   it("no counter row when the tick does not transition state", async () => {
     __resetFleetThrottleMetricsForTests();
+    __resetFleetThrottleCounterSinkForTests();
     await persistFleetPressureState(
       { state: "incident", transitioned: false, limit: 25, staleClaimThresholdMs: 600_000 },
       { remainingPctOfCeiling: 0.2, tripped: true },
@@ -246,5 +322,6 @@ describe("NFM-4946 — fleet pressure state transitions are metered", () => {
     expect(snapshot.pressureTransitions["normal->incident"]).toBe(0);
     expect(snapshot.pressureTransitions["incident->normal"]).toBe(0);
     __resetFleetThrottleMetricsForTests();
+    __resetFleetThrottleCounterSinkForTests();
   });
 });
