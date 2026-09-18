@@ -24,3 +24,19 @@ export type {
   PrecompletionRejectionReason as PrecompletionRejectionReasonType,
   PrecompletionSnapshot,
 } from "./precompletion.js";
+export {
+  FleetDispatchBlockedReason,
+  __resetFleetThrottleMetricsForTests,
+  createFleetThrottleMetrics,
+  getFleetThrottleMetrics,
+  recordAgentBurnBudgetDemote,
+  recordFleetDispatchBlocked,
+  recordFleetPressureStateTransition,
+  renderFleetThrottleMetrics,
+  snapshotFleetThrottleMetrics,
+} from "./fleet-throttle.js";
+export type {
+  FleetDispatchBlockedReason as FleetDispatchBlockedReasonType,
+  FleetThrottleMetrics,
+  FleetThrottleSnapshot,
+} from "./fleet-throttle.js";
