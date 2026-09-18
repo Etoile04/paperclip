@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS "tool_runtime_metric_counters" (
 DO $$ BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint WHERE conname = 'tool_runtime_metric_counters_bucket_uq'
+    UNION ALL
+    SELECT 1 FROM pg_class WHERE relname = 'tool_runtime_metric_counters_bucket_uq' AND relkind = 'i'
   ) THEN
     ALTER TABLE "tool_runtime_metric_counters"
       ADD CONSTRAINT "tool_runtime_metric_counters_bucket_uq"
