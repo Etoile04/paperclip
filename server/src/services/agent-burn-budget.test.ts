@@ -8,6 +8,7 @@ import {
   type CostWindowSlice,
 } from "./agent-burn-budget.js";
 import {
+  BURN_BUDGET_CEILING_TOKENS,
   BURN_BUDGET_HYSTERESIS_TICKS,
   JITTER_CEIL_MINUTES,
   REMAINING_PCT_ABOVE_RECOVER,
@@ -60,6 +61,21 @@ describe("L1 — per-agent wake jitter", () => {
 });
 
 describe("L4 — per-agent token-burn budget", () => {
+  it("pins the NFM-4716 empirical ceiling (ADR-014 §4 pass)", () => {
+    // Empirical derivation (2026-09-11T10:05Z → 2026-09-18T10:05Z prod
+    // cost_events): per-agent active-sample trailing-5h p99 = 71.36M;
+    // ceiling = p99 / 0.70 ≈ 101.9M rounded to 100M. Trip point 70M.
+    // If this assertion fails, the ceiling drifted without an ADR-014 §4
+    // empirical basis — see docs/specs/adr-014-empirical-threshold-pass.md.
+    expect(BURN_BUDGET_CEILING_TOKENS).toBe(100_000_000);
+    const s = computeBurnBudgetFromSlice(slice({}));
+    expect(s.ceilingTokens).toBe(BURN_BUDGET_CEILING_TOKENS);
+    // At exactly 70M consumed (remaining = 0.30) the trip is strict → not
+    // tripped; one token above trips.
+    expect(computeBurnBudgetFromSlice(slice({ inputTokens: 70_000_000 })).tripped).toBe(false);
+    expect(computeBurnBudgetFromSlice(slice({ inputTokens: 70_000_001 })).tripped).toBe(true);
+  });
+
   it("returns not-tripped when nothing consumed", () => {
     const s = computeBurnBudgetFromSlice(slice({}));
     expect(s.consumedTokens).toBe(0);
@@ -68,7 +84,7 @@ describe("L4 — per-agent token-burn budget", () => {
   });
 
   it("trips exactly when remaining fraction drops below REMAINING_PCT_BELOW_TRIP", () => {
-    // ceiling = 1_100_000 by default (1_000_000 * 1.1 bootstrap)
+    // ceiling = BURN_BUDGET_CEILING_TOKENS by default (NFM-4716 empirical)
     const ceiling = s_defaultCeiling();
     const atTrip = computeBurnBudgetFromSlice(
       slice({ inputTokens: ceiling, cachedInputTokens: 0, outputTokens: 0 }),
