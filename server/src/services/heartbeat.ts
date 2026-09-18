@@ -76,12 +76,18 @@ import {
   DEMOTE_POLICY,
   DISPATCH_VERDICT_ALLOW_DEMOTED,
   DISPATCH_VERDICT_BLOCK,
+  METRIC_AGENT_BURN_DEMOTE,
+  METRIC_FLEET_DISPATCH_BLOCKED,
 } from "./fleet-throttle-constants.js";
 import {
   FleetDispatchBlockedReason,
   recordAgentBurnBudgetDemote,
   recordFleetDispatchBlocked,
 } from "../metrics/fleet-throttle.js";
+import {
+  flushFleetThrottleCounters,
+  recordFleetThrottleCounterTrip,
+} from "./fleet-throttle-counter-sink.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
@@ -11522,6 +11528,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       if (guardResult.verdict === DISPATCH_VERDICT_BLOCK) {
         recordFleetDispatchBlocked(FleetDispatchBlockedReason.FleetCapTripped);
+        recordFleetThrottleCounterTrip(agent.companyId, METRIC_FLEET_DISPATCH_BLOCKED, {
+          reason: FleetDispatchBlockedReason.FleetCapTripped,
+        });
+        // Trips are rare — flush inline so the counter row is durable even
+        // if the process dies before the next timer tick. A sink failure
+        // must never mask the guard's 409.
+        try {
+          await flushFleetThrottleCounters(db, [agent.companyId]);
+        } catch (error) {
+          logger.warn({ err: error, agentId }, "fleet_throttle_counter_flush_failed");
+        }
         await writeSkippedRequest("fleet.blocked", {
           payload: {
             ...(payload ?? {}),
@@ -11541,6 +11558,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (guardResult.verdict === DISPATCH_VERDICT_ALLOW_DEMOTED) {
         recordAgentBurnBudgetDemote(DEMOTE_POLICY);
+        recordFleetThrottleCounterTrip(agent.companyId, METRIC_AGENT_BURN_DEMOTE, {
+          policy: DEMOTE_POLICY,
+        });
+        try {
+          await flushFleetThrottleCounters(db, [agent.companyId]);
+        } catch (error) {
+          logger.warn({ err: error, agentId }, "fleet_throttle_counter_flush_failed");
+        }
         Object.assign(
           enrichedContextSnapshot,
           annotateContextSnapshot(enrichedContextSnapshot, guardResult, burnBudget),
@@ -12956,6 +12981,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (guard.blocked) {
           blockedByGuard += 1;
           recordFleetDispatchBlocked(FleetDispatchBlockedReason.FleetCapTripped);
+          recordFleetThrottleCounterTrip(agent.companyId, METRIC_FLEET_DISPATCH_BLOCKED, {
+            reason: FleetDispatchBlockedReason.FleetCapTripped,
+          });
           logger.warn(
             { agentId: agent.id, remainingPctOfCeiling: burnBudget.remainingPctOfCeiling },
             "fleet_dispatch_blocked",
@@ -12966,6 +12994,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Defensive: unreachable while timer ticks are estimate-less, but
           // the verdict must meter if the role-based heavy flag ever lands.
           recordAgentBurnBudgetDemote(DEMOTE_POLICY);
+          recordFleetThrottleCounterTrip(agent.companyId, METRIC_AGENT_BURN_DEMOTE, {
+            policy: DEMOTE_POLICY,
+          });
         }
 
         const annotatedSnapshot = guard.verdict === "allow_demoted"
@@ -12997,6 +13028,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+
+      // NFM-4946: drain fleet-throttle counter trips recorded during this
+      // tick (timer-guard blocks/demotes + the L3 pressure transition inside
+      // tickDueIssueMonitors) into tool_runtime_metric_counters. Fleet-global
+      // trips are replicated per active company present this tick. Telemetry
+      // only — never fail the tick over the sink.
+      try {
+        const activeCompanyIds = [...new Set(allAgents.map((agent) => agent.companyId))];
+        await flushFleetThrottleCounters(db, activeCompanyIds);
+      } catch (error) {
+        logger.warn({ err: error }, "fleet_throttle_counter_flush_failed");
+      }
 
       return {
         checked: checked + issueMonitors.checked,
