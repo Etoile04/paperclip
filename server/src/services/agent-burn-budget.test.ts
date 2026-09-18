@@ -68,7 +68,7 @@ describe("L4 — per-agent token-burn budget", () => {
   });
 
   it("trips exactly when remaining fraction drops below REMAINING_PCT_BELOW_TRIP", () => {
-    // ceiling = 1_100_000 by default (1_000_000 * 1.1 bootstrap)
+    // ceiling = 84_177_659 by default (1M × 84.177659, NFM-4716 empirical p95)
     const ceiling = s_defaultCeiling();
     const atTrip = computeBurnBudgetFromSlice(
       slice({ inputTokens: ceiling, cachedInputTokens: 0, outputTokens: 0 }),

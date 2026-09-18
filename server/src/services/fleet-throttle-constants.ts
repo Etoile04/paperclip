@@ -51,9 +51,34 @@ export const BURN_BUDGET_HYSTERESIS_TICKS = 3;
 export const DEMOTE_POLICY = "read_only_review" as const;
 export type DemotePolicy = typeof DEMOTE_POLICY;
 
-// Bootstrap multiplier on observed baseline before sufficient post-ship
-// telemetry exists. ADR-014 §4 allows this; replace only with empirical data.
-export const BURN_BUDGET_BOOTSTRAP_FACTOR = 1.1;
+// Multiplier on the 1M-token baseline that yields the per-agent 5h ceiling
+// (`DEFAULT_BURN_BUDGET_CONFIG.ceilingTokens`).
+//
+// NFM-4716 empirical pass (ADR-014 §4) replaced the 1.1 bootstrap with the
+// p95 of per-agent MAX trailing-5h totals observed over the fixed 7-day
+// window 2026-09-11T10:05Z → 2026-09-18T10:05Z (23 agents, 2,124 costEvents,
+// replay of the exact readBurnBudgetForAgent slicing at 5-min ticks):
+//   per-agent max 5h totals: p50=12.47M p75=27.86M p90=72.31M p95=84.18M
+// At 1.1× the trip predicate fired on 33.9% of agent-ticks (5 agents
+// continuously tripped for the full window) with zero real cap-exhaustion
+// incidents in-window; at 84.178M it fires on 0.83% (top-3 burners at true
+// peaks only). Derivation and methodology: docs/adr/ADR-014-NFM-4682-fleet-token-burn-throttle.md §4.
+// Do not adjust without a new empirical window (ADR-014 §4: no hand-tuning).
+export const BURN_BUDGET_BOOTSTRAP_FACTOR = 84.177659;
+
+// L3 fleet-pressure ceiling: fleet-wide (all agents summed) trailing-5h
+// consumed-token total at which the incident state machine trips
+// (remaining < REMAINING_PCT_BELOW_TRIP, i.e. consumed >= 70% of this value).
+//
+// NFM-4716 empirical pass: p95 of the fleet-aggregate trailing-5h samples
+// over the same fixed 7-day window (fleet aggregate distribution:
+// p50=61.3M p90=168.2M p95=185.9M max=248.0M). Replaces the pre-empirical
+// hardcoded `1_100_000 * 8` (8.8M) which held the fleet in permanent
+// incident state for the entire observation window (fleet p50 was ~7× its
+// trip level). At 185.9M the incident state covers ~20% of ticks — real
+// heavy windows. Supersedes the ×8 parallel-agent heuristic; derive any
+// future change from a new empirical window, not from agent-count guesses.
+export const FLEET_PRESSURE_CEILING_TOKENS = 185_913_738;
 
 // Test-only env flag that, when set, makes readBurnBudgetForAgent return a
 // synthetic BurnBudgetState whose remainingPctOfCeiling matches the parsed

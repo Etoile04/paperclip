@@ -21,7 +21,10 @@ import {
   type FleetPressureReading,
   type FleetPressureState,
 } from "./fleet-pressure.js";
-import { REMAINING_PCT_BELOW_TRIP } from "./fleet-throttle-constants.js";
+import {
+  FLEET_PRESSURE_CEILING_TOKENS,
+  REMAINING_PCT_BELOW_TRIP,
+} from "./fleet-throttle-constants.js";
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
@@ -81,12 +84,13 @@ export async function readFleetPressureReading(
     Number(sums.inputTokens ?? 0) +
     Number(sums.cachedInputTokens ?? 0) +
     Number(sums.outputTokens ?? 0);
-  // Cap at the same 1.1M-token-equivalent baseline as L4. Fleet ceiling is
-  // shared across all agents on the OAuth account; for fleet-level signal
-  // we treat the per-agent ceiling × parallel-agent-count as the ceiling.
-  // ADR-014 §3 L3 leaves the exact ceiling config to telemetry; the bootstrap
-  // factor matches L4.
-  const fleetCeiling = 1_100_000 * 8; // ~8 parallel agents in heavy window
+  // Fleet ceiling is derived from empirical telemetry (NFM-4716, ADR-014 §4):
+  // p95 of fleet-aggregate trailing-5h samples over the fixed 7-day window
+  // 2026-09-11T10:05Z → 2026-09-18T10:05Z. Replaces the pre-empirical
+  // `1_100_000 * 8` heuristic (which also silently ignored
+  // BURN_BUDGET_BOOTSTRAP_FACTOR — a latent drift bug). See
+  // docs/adr/ADR-014-NFM-4682-fleet-token-burn-throttle.md §4.
+  const fleetCeiling = FLEET_PRESSURE_CEILING_TOKENS;
   const remainingPct = Math.max(0, (fleetCeiling - consumed) / fleetCeiling);
   return {
     remainingPctOfCeiling: remainingPct,
