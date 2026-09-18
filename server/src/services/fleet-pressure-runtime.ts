@@ -25,6 +25,7 @@ import {
   FLEET_PRESSURE_CEILING_TOKENS,
   REMAINING_PCT_BELOW_TRIP,
 } from "./fleet-throttle-constants.js";
+import { recordFleetPressureStateTransition } from "../metrics/fleet-throttle.js";
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
@@ -120,6 +121,13 @@ export async function persistFleetPressureState(
     lastReading: reading,
     updatedAt: new Date(),
   });
+  // NFM-4946: meter state transitions so the next empirical review reads
+  // real L3 incident/recovery counts instead of simulating them from
+  // cost_events (the NFM-4716 pass had no incident-state runtime telemetry —
+  // see docs/specs/adr-014-empirical-threshold-pass.md §5).
+  if (decision.transitioned) {
+    recordFleetPressureStateTransition(prev.state, decision.state);
+  }
 }
 
 export { decideFleetPressure };
