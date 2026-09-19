@@ -60,6 +60,7 @@ export {
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
   findLastRunIssueUpdatedActivity,
+  isCorrectiveRunDischargeActivity,
   isStatusPreservingInProgressReassertionActivity,
   isSuccessfulRunHandoffRequiredNoticeBody,
   findLastRunIssueUpdatedActivity,
