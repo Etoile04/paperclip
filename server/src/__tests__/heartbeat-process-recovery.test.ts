@@ -2113,6 +2113,328 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments.some((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY)).toBe(false);
   });
 
+  it("does not queue a finish-handoff corrective wake when the run's last issue write is a status-preserving in_progress reassertion (NFM-4958 Point A)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Verified the soak state is correct; reasserting in_progress.",
+      });
+      // Mirrors the activity row the issue PATCH route writes for a no-op
+      // {status: "in_progress"} write: details.status present, no _previous.
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        runId: ctx.runId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        details: { identifier: `${issueId}`, status: "in_progress" },
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Verified the soak state is correct; reasserting in_progress.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    // The run finished successfully while still in_progress, but its last issue
+    // write was a status-preserving reassertion — a liveness assertion, not
+    // missing state: no corrective wake, no handoff notice, no handoff activity.
+    const handoffWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "finish_successful_run_handoff")));
+    expect(handoffWakeups).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY)).toBe(false);
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(false);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  it("skips exhausted successful-run handoff escalation when the corrective run reasserted in_progress (NFM-4958 Point B)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // The corrective run's last issue write was a no-op in_progress PATCH.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { identifier: `${issueId}`, status: "in_progress" },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(result.issueIds).toEqual([]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY)).toBe(false);
+  });
+
+  it("does not re-arm stranded recovery inside the rate-limit window without new evidence (NFM-4958)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    const handoffContext = {
+      issueId,
+      taskId: issueId,
+      wakeReason: "finish_successful_run_handoff",
+      sourceRunId,
+      resumeFromRunId: sourceRunId,
+      handoffRequired: true,
+      handoffReason: "successful_run_missing_state",
+      missingDisposition: "clear_next_step",
+      handoffAttempt: 1,
+      maxHandoffAttempts: 1,
+    };
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: handoffContext })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    // First arm: genuine missing state (no liveness assertion) still escalates.
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.successfulRunHandoffEscalated).toBe(1);
+    const blockedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(blockedIssue?.status).toBe("blocked");
+
+    // The arm dispatched a live recovery-owner wake run. Conclude it as this
+    // cycle's corrective handoff run: terminal, succeeded, no issue write (so
+    // no liveness assertion), and no live execution path left behind.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date(), contextSnapshot: handoffContext })
+      .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"])));
+
+    // Return the issue to in_progress without a route-written transition
+    // activity row and without any new run verdict: no new evidence.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.successfulRunHandoffEscalated).toBe(0);
+    expect(second.issueIds).toEqual([]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]?.attemptCount).toBe(1);
+  });
+
+  it("re-arms stranded recovery inside the rate-limit window when a new failed run provides evidence (NFM-4958)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.successfulRunHandoffEscalated).toBe(1);
+
+    // The arm dispatched a live recovery-owner wake run. Conclude it as this
+    // cycle's corrective handoff run: terminal with a failure verdict — new
+    // evidence inside the rate-limit window.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+        errorCode: "adapter_failed",
+        error: "corrective run failed",
+      })
+      .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"])));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.successfulRunHandoffEscalated).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]?.attemptCount).toBe(2);
+  });
+
+  it("re-arms stranded recovery inside the rate-limit window when an issue status transition provides evidence (NFM-4958)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.successfulRunHandoffEscalated).toBe(1);
+
+    // The arm dispatched a live recovery-owner wake run. Conclude it as this
+    // cycle's corrective handoff run: terminal and succeeded with no failure
+    // verdict, so only the transition below can count as new evidence.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"])));
+
+    // New evidence: a route-written status transition (blocked -> in_progress)
+    // with _previous.status present, after the first arm attempt.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { identifier: `${issueId}`, status: "in_progress", _previous: { status: "blocked" } },
+    });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.successfulRunHandoffEscalated).toBe(1);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]?.attemptCount).toBe(2);
+  });
+
   it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
