@@ -336,6 +336,27 @@ export async function runEndedWithStatusPreservingInProgressReassertion(
   return isStatusPreservingInProgressReassertionActivity(await findLastRunIssueUpdatedActivity(db, input));
 }
 
+// NFM-4965: a corrective/recovery run whose last issue write recorded a
+// discharge — either the NFM-4958 status-preserving in_progress reassertion
+// or a comment-sourced write that did not transition status (the live
+// NFM-4954 residual shape: the discharge comment applied no issue fields) —
+// asserted liveness, not missing state.
+export function isCorrectiveRunDischargeActivity(activity: RunIssueUpdatedActivityRow): boolean {
+  if (!activity) return false;
+  if (activity.action !== "issue.updated") return false;
+  const details = readRecord(activity.details);
+  if (readRecord(details._previous).status !== undefined) return false;
+  if (details.status === "in_progress") return true;
+  return details.source === "comment" && details.status === undefined;
+}
+
+export async function runEndedWithCorrectiveRunDischarge(
+  db: Db,
+  input: { companyId: string; issueId: string; runId: string },
+) {
+  return isCorrectiveRunDischargeActivity(await findLastRunIssueUpdatedActivity(db, input));
+}
+
 function readString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }

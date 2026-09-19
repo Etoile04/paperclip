@@ -48,7 +48,7 @@ import {
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
   noticeMetadataReferencesRecoveryAction,
-  runEndedWithStatusPreservingInProgressReassertion,
+  runEndedWithCorrectiveRunDischarge,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import {
@@ -3060,10 +3060,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // flight — escalating here re-creates the escalate/unblock loop.
         // NFM-4958 Point B: a corrective run that ended by reasserting
         // in_progress recorded a liveness assertion — skip escalation.
+        // NFM-4965: the discharge shape is broader on this corrective-run
+        // finish path — a comment-sourced write that did not transition
+        // status (e.g. a discharge comment whose field PATCH applied nothing)
+        // is also a liveness assertion, not missing state.
         const disposition = decideExhaustedHandoffDisposition({
           hasOpenExecutingChildren: await hasOpenExecutingChildIssues(issue.companyId, issue.id),
           correctiveRunAssertedLiveness: latestRun
-            ? await runEndedWithStatusPreservingInProgressReassertion(db, {
+            ? await runEndedWithCorrectiveRunDischarge(db, {
               companyId: issue.companyId,
               issueId: issue.id,
               runId: latestRun.id,
