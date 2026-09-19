@@ -10,6 +10,7 @@ import {
   type ChildIssueExecutionProbe,
   type OpenChildIssueRow,
 } from "./service.js";
+import { STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON } from "./successful-run-handoff.js";
 
 const child = (overrides: Partial<OpenChildIssueRow> = {}): OpenChildIssueRow => ({
   id: "child-1",
@@ -98,15 +99,41 @@ describe("open children query filter (NFM-4279)", () => {
 
 describe("exhausted handoff disposition (NFM-4279 Layer 2)", () => {
   it("T2: exhausted corrective handoff run with open executing children skips escalation", () => {
-    expect(decideExhaustedHandoffDisposition({ hasOpenExecutingChildren: true })).toEqual({
+    expect(decideExhaustedHandoffDisposition({
+      hasOpenExecutingChildren: true,
+      correctiveRunAssertedLiveness: false,
+    })).toEqual({
       kind: "skip",
       reason: OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON,
     });
   });
 
   it("T2: exhausted corrective handoff run without open executing children still escalates", () => {
-    expect(decideExhaustedHandoffDisposition({ hasOpenExecutingChildren: false })).toEqual({
+    expect(decideExhaustedHandoffDisposition({
+      hasOpenExecutingChildren: false,
+      correctiveRunAssertedLiveness: false,
+    })).toEqual({
       kind: "escalate",
+    });
+  });
+
+  it("NFM-4958 Point B: exhausted corrective run that reasserted in_progress skips escalation", () => {
+    expect(decideExhaustedHandoffDisposition({
+      hasOpenExecutingChildren: false,
+      correctiveRunAssertedLiveness: true,
+    })).toEqual({
+      kind: "skip",
+      reason: STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON,
+    });
+  });
+
+  it("NFM-4958 Point B: open executing children keep precedence over the liveness assertion", () => {
+    expect(decideExhaustedHandoffDisposition({
+      hasOpenExecutingChildren: true,
+      correctiveRunAssertedLiveness: true,
+    })).toEqual({
+      kind: "skip",
+      reason: OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON,
     });
   });
 });

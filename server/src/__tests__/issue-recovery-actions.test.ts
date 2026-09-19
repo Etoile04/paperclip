@@ -536,20 +536,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       livenessState: "needs_followup",
     } as const;
 
-    await Promise.all([
-      recovery.escalateStrandedAssignedIssue({
-        issue: sourceIssue,
-        previousStatus: "in_progress",
-        latestRun,
-        comment: "Automatic continuation recovery failed.",
-      }),
-      recovery.escalateStrandedAssignedIssue({
-        issue: sourceIssue,
-        previousStatus: "in_progress",
-        latestRun,
-        comment: "Automatic continuation recovery failed.",
-      }),
-    ]);
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+    // NFM-4958: a repeat arm inside the rate-limit window needs either new
+    // evidence or an explicit escalation; these direct calls carry in-memory
+    // run literals, so mark them explicit.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+      explicitEscalation: true,
+    });
 
     const actionRows = await db
       .select()
@@ -1463,6 +1465,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       previousStatus: "in_progress",
       latestRun: secondLatestRun,
       comment: "Automatic continuation recovery failed.",
+      explicitEscalation: true,
     });
 
     const actionRows = await db
@@ -1634,6 +1637,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       previousStatus: "in_progress",
       latestRun: secondLatestRun,
       comment: "Automatic continuation recovery failed.",
+      explicitEscalation: true,
     });
 
     const actionRows = await db
