@@ -63,8 +63,10 @@ export {
   isStatusPreservingInProgressReassertionActivity,
   isSuccessfulRunHandoffRequiredNoticeBody,
   findLastRunIssueUpdatedActivity,
+  isCorrectiveRunDischargeActivity,
   isStatusPreservingInProgressReassertionActivity,
   isSuccessfulRunHandoffRequiredNoticeBody,
+  runEndedWithCorrectiveRunDischarge,
   runEndedWithStatusPreservingInProgressReassertion,
 } from "./successful-run-handoff.js";
 export type {
