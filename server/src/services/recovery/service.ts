@@ -863,6 +863,28 @@ export function decideStrandedArmRateLimit(input: {
   return { kind: "skip", reason: STRANDED_ARM_RATE_LIMIT_SKIP_REASON };
 }
 
+// NFM-4958 3: cap source-scoped stranded arms at one per window. A second arm
+// inside the window is skipped unless new evidence exists — a new failed run
+// verdict, a route-written issue status transition, or an explicit escalation.
+export const STRANDED_ARM_RATE_LIMIT_MS = 6 * 60 * 60 * 1000;
+export const STRANDED_ARM_RATE_LIMIT_SKIP_REASON =
+  "recent arm attempt inside rate-limit window without new evidence";
+
+export type StrandedArmRateLimitDecision = { kind: "skip"; reason: string } | { kind: "proceed" };
+
+export function decideStrandedArmRateLimit(input: {
+  now: Date;
+  lastAttemptAt: Date | null;
+  hasNewEvidence: boolean;
+}): StrandedArmRateLimitDecision {
+  if (!input.lastAttemptAt) return { kind: "proceed" };
+  if (input.now.getTime() - input.lastAttemptAt.getTime() >= STRANDED_ARM_RATE_LIMIT_MS) {
+    return { kind: "proceed" };
+  }
+  if (input.hasNewEvidence) return { kind: "proceed" };
+  return { kind: "skip", reason: STRANDED_ARM_RATE_LIMIT_SKIP_REASON };
+}
+
 function successfulRunHandoffRecoveryEvidence(
   latestRun: LatestIssueRun,
 ): SuccessfulRunHandoffRecoveryEvidence | null {
