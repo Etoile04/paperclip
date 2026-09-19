@@ -9,6 +9,7 @@ import {
   buildSuccessfulRunHandoffExhaustedNotice,
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
+  isCorrectiveRunDischargeActivity,
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
   isStatusPreservingInProgressReassertionActivity,
   isSuccessfulRunHandoffRequiredNoticeBody,
@@ -443,5 +444,71 @@ describe("isStatusPreservingInProgressReassertionActivity (NFM-4958 1a)", () => 
 
   it("does not match when no activity row exists", () => {
     expect(isStatusPreservingInProgressReassertionActivity(null)).toBe(false);
+  });
+});
+
+describe("isCorrectiveRunDischargeActivity (NFM-4965)", () => {
+  const baseRow = {
+    action: "issue.updated",
+    entityType: "issue",
+    entityId: "issue-1",
+    runId: "run-1",
+  };
+
+  it("matches the live residual shape: comment-sourced write that applied no status field (NFM-4954 run e3033e63)", () => {
+    expect(isCorrectiveRunDischargeActivity({
+      ...baseRow,
+      details: { source: "comment", identifier: "PAP-1" },
+    })).toBe(true);
+  });
+
+  it("matches a comment-sourced write whose _previous carries non-status fields only", () => {
+    expect(isCorrectiveRunDischargeActivity({
+      ...baseRow,
+      details: {
+        source: "comment",
+        identifier: "PAP-1",
+        livenessFanoutOptOut: true,
+        _previous: { livenessFanoutOptOut: false },
+      },
+    })).toBe(true);
+  });
+
+  it("still matches the NFM-4958 shape: no-op in_progress reassertion", () => {
+    expect(isCorrectiveRunDischargeActivity({
+      ...baseRow,
+      details: { identifier: "PAP-1", status: "in_progress" },
+    })).toBe(true);
+  });
+
+  it("does not match a status transition (_previous.status present), even comment-sourced", () => {
+    expect(isCorrectiveRunDischargeActivity({
+      ...baseRow,
+      details: {
+        source: "comment",
+        identifier: "PAP-1",
+        status: "in_progress",
+        _previous: { status: "blocked" },
+      },
+    })).toBe(false);
+  });
+
+  it("does not match a non-comment write without a status field (assignee-only flip)", () => {
+    expect(isCorrectiveRunDischargeActivity({
+      ...baseRow,
+      details: { identifier: "PAP-1", assigneeAgentId: "agent-2" },
+    })).toBe(false);
+  });
+
+  it("does not match a non issue.updated activity action", () => {
+    expect(isCorrectiveRunDischargeActivity({
+      ...baseRow,
+      action: "issue.comment_added",
+      details: { source: "comment" },
+    })).toBe(false);
+  });
+
+  it("does not match when no activity row exists", () => {
+    expect(isCorrectiveRunDischargeActivity(null)).toBe(false);
   });
 });
