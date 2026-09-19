@@ -26,6 +26,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -124,10 +125,12 @@ import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON,
+  STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
   isPluginManagedIssueLifecycle,
   noticeMetadataReferencesRecoveryAction,
+  runEndedWithStatusPreservingInProgressReassertion,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import {
@@ -819,13 +822,42 @@ export type ExhaustedHandoffDisposition = { kind: "escalate" } | { kind: "skip";
 
 // Layer 2 (defensive): before escalating an exhausted corrective handoff run,
 // re-check the issue for a now-valid disposition. Open executing children mean
-// delegation is still in flight and escalation would loop (NFM-4277).
+// delegation is still in flight and escalation would loop (NFM-4277). A
+// corrective run that ended by reasserting in_progress recorded a liveness
+// assertion — escalating it re-creates the arm/flip loop (NFM-4958 Point B).
 export function decideExhaustedHandoffDisposition(input: {
   hasOpenExecutingChildren: boolean;
+  correctiveRunAssertedLiveness: boolean;
 }): ExhaustedHandoffDisposition {
-  return input.hasOpenExecutingChildren
-    ? { kind: "skip", reason: OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON }
-    : { kind: "escalate" };
+  if (input.hasOpenExecutingChildren) {
+    return { kind: "skip", reason: OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON };
+  }
+  if (input.correctiveRunAssertedLiveness) {
+    return { kind: "skip", reason: STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON };
+  }
+  return { kind: "escalate" };
+}
+
+// NFM-4958 3: cap source-scoped stranded arms at one per window. A second arm
+// inside the window is skipped unless new evidence exists — a new failed run
+// verdict, a route-written issue status transition, or an explicit escalation.
+export const STRANDED_ARM_RATE_LIMIT_MS = 6 * 60 * 60 * 1000;
+export const STRANDED_ARM_RATE_LIMIT_SKIP_REASON =
+  "recent arm attempt inside rate-limit window without new evidence";
+
+export type StrandedArmRateLimitDecision = { kind: "skip"; reason: string } | { kind: "proceed" };
+
+export function decideStrandedArmRateLimit(input: {
+  now: Date;
+  lastAttemptAt: Date | null;
+  hasNewEvidence: boolean;
+}): StrandedArmRateLimitDecision {
+  if (!input.lastAttemptAt) return { kind: "proceed" };
+  if (input.now.getTime() - input.lastAttemptAt.getTime() >= STRANDED_ARM_RATE_LIMIT_MS) {
+    return { kind: "proceed" };
+  }
+  if (input.hasNewEvidence) return { kind: "proceed" };
+  return { kind: "skip", reason: STRANDED_ARM_RATE_LIMIT_SKIP_REASON };
 }
 
 function successfulRunHandoffRecoveryEvidence(
@@ -4557,6 +4589,17 @@ export function recoveryService(
     action: typeof issueRecoveryActions.$inferSelect,
   ) {
     const [run, wake] = await Promise.all([
+  // NFM-4958 3: "new evidence" since the last arm attempt is (a) a run verdict
+  // that did not cleanly succeed (non-succeeded status or non-null errorCode)
+  // concluded after the attempt, or (b) a route-written issue status transition
+  // (activity `issue.updated` with `_previous.status`) after the attempt.
+  // Explicit escalation (c) is handled by the caller-side bypass flag.
+  async function hasStrandedArmEvidenceSince(
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId">,
+    lastAttemptAt: Date | null,
+  ): Promise<boolean> {
+    if (!lastAttemptAt) return true;
+    const [failedRun, statusTransition] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -4568,6 +4611,13 @@ export function recoveryService(
             ]),
             sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${action.sourceIssueId}`,
             sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId', '') <> ${action.id}`,
+            eq(heartbeatRuns.companyId, issue.companyId),
+            or(
+              ne(heartbeatRuns.status, "succeeded"),
+              isNotNull(heartbeatRuns.errorCode),
+            ),
+            gt(heartbeatRuns.finishedAt, lastAttemptAt),
+            sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id} or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issue.id})`,
           ),
         )
         .limit(1)
@@ -4585,6 +4635,16 @@ export function recoveryService(
             ]),
             sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} ->> 'taskId') = ${action.sourceIssueId}`,
             sql`coalesce(${agentWakeupRequests.payload} ->> 'recoveryActionId', '') <> ${action.id}`,
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, issue.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issue.id),
+            eq(activityLog.action, "issue.updated"),
+            gt(activityLog.createdAt, lastAttemptAt),
+            sql`${activityLog.details} -> '_previous' ->> 'status' is not null`,
           ),
         )
         .limit(1)
@@ -5105,6 +5165,7 @@ export function recoveryService(
       });
     }
     return scheduled ? "queued" : "skipped";
+    return Boolean(failedRun || statusTransition);
   }
 
   async function escalateStrandedAssignedIssue(input: {
@@ -5115,6 +5176,8 @@ export function recoveryService(
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    // NFM-4958 3 (c): explicit escalations bypass the arm rate limit.
+    explicitEscalation?: boolean;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -5128,6 +5191,33 @@ export function recoveryService(
       input.latestRun,
       input.recoveryCause,
     );
+    // NFM-4958 3: rate-limit repeated arms. Inside the window, only new
+    // evidence — a new failed run verdict, a route-written issue status
+    // transition, or an explicit escalation — may arm again.
+    if (!input.explicitEscalation) {
+      const lastAction = await recoveryActionsSvc.getMostRecentForIssue(input.issue.companyId, input.issue.id);
+      const lastAttemptAt = lastAction?.lastAttemptAt == null ? null : new Date(lastAction.lastAttemptAt);
+      const armDecision = decideStrandedArmRateLimit({
+        now: new Date(),
+        lastAttemptAt,
+        hasNewEvidence: await hasStrandedArmEvidenceSince(input.issue, lastAttemptAt),
+      });
+      if (armDecision.kind === "skip") {
+        logger.info(
+          {
+            issueId: input.issue.id,
+            identifier: input.issue.identifier,
+            recoveryActionId: lastAction?.id ?? null,
+            lastAttemptAt,
+            reason: armDecision.reason,
+          },
+          "stranded recovery arm skipped: rate-limit window active without new evidence",
+        );
+        return null;
+      }
+    }
+
+    const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,
@@ -6485,8 +6575,17 @@ export function recoveryService(
         // NFM-4279 Layer 2: re-check for a now-valid disposition before
         // escalating. Open executing children mean delegation is still in
         // flight — escalating here re-creates the escalate/unblock loop.
+        // NFM-4958 Point B: a corrective run that ended by reasserting
+        // in_progress recorded a liveness assertion — skip escalation.
         const disposition = decideExhaustedHandoffDisposition({
           hasOpenExecutingChildren: await hasOpenExecutingChildIssues(issue.companyId, issue.id),
+          correctiveRunAssertedLiveness: latestRun
+            ? await runEndedWithStatusPreservingInProgressReassertion(db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              runId: latestRun.id,
+            })
+            : false,
         });
         if (disposition.kind === "skip") {
           logger.info(
@@ -6496,7 +6595,7 @@ export function recoveryService(
               runId: latestRun?.id ?? null,
               reason: disposition.reason,
             },
-            "exhausted successful-run handoff escalation skipped: valid delegation disposition",
+            "exhausted successful-run handoff escalation skipped: valid disposition or liveness assertion",
           );
           result.skipped += 1;
           continue;

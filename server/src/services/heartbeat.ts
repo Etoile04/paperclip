@@ -541,6 +541,7 @@ import {
   findExistingFinishSuccessfulRunHandoffWake,
   findExistingRunLivenessContinuationWake,
   isSuccessfulRunHandoffValidPathSkip,
+  runEndedWithStatusPreservingInProgressReassertion,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
 } from "./recovery/index.js";
@@ -13513,6 +13514,7 @@ export function heartbeatService(
       pauseHold,
       activeRoutineContinuation,
       openExecutingChildren,
+      sourceRunEndedWithInProgressReassertion,
     ] = await Promise.all([
       issue
         ? db
@@ -13663,6 +13665,16 @@ export function heartbeatService(
       issue
         ? recovery.hasOpenExecutingChildIssues(issue.companyId, issue.id)
         : Promise.resolve(false),
+      // NFM-4958 Point A: a run whose last issue write reasserted in_progress
+      // without a status transition recorded a liveness assertion, not missing
+      // state — no corrective wake.
+      issue
+        ? runEndedWithStatusPreservingInProgressReassertion(db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          runId: run.id,
+        })
+        : Promise.resolve(false),
     ]);
 
     const decision = decideSuccessfulRunHandoff({
@@ -13687,6 +13699,7 @@ export function heartbeatService(
       hasActiveRoutineContinuation: Boolean(activeRoutineContinuation),
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
+      sourceRunEndedWithInProgressReassertion: sourceRunEndedWithInProgressReassertion === true,
     });
 
     if (isSuccessfulRunHandoffValidPathSkip(decision) && issue) {
