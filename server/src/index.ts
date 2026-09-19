@@ -58,7 +58,7 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
-import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl, computeLocalAgentApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -105,6 +105,7 @@ export interface StartedServer {
   host: string;
   listenPort: number;
   apiUrl: string;
+  localApiUrl: string | null;
   databaseUrl: string;
 }
 
@@ -706,6 +707,18 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
+  // Loopback transport for locally spawned agents — decoupled from the
+  // advertised public/auth URL so VPN address churn cannot orphan agent runs.
+  const localAgentApiUrl = computeLocalAgentApiUrl({
+    explicitOverride: process.env.PAPERCLIP_LOCAL_API_URL,
+    bindHost: runtimeListenHost,
+    port: listenPort,
+  });
+  if (localAgentApiUrl) {
+    process.env.PAPERCLIP_LOCAL_API_URL = localAgentApiUrl;
+  } else {
+    delete process.env.PAPERCLIP_LOCAL_API_URL;
+  }
   
   setupLiveEventsWebSocketServer(server, db as any, {
     deploymentMode: config.deploymentMode,
@@ -1177,6 +1190,7 @@ export async function startServer(): Promise<StartedServer> {
     host: config.host,
     listenPort,
     apiUrl: configuredApiUrl,
+    localApiUrl: localAgentApiUrl,
     databaseUrl: activeDatabaseConnectionString,
   };
 }

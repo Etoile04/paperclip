@@ -1,12 +1,14 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
 export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state";
 export const OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON = "open child issues own the next action (delegation)";
+export const STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON =
+  "status-preserving in_progress reassertion is a liveness assertion";
 export const DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS = 1;
 export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
   "Paperclip needs a disposition before this issue can continue.";
@@ -279,6 +281,61 @@ function readRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+// NFM-4958 1a: a run whose last issue write reasserts `in_progress` without a
+// status transition recorded a liveness assertion, not missing state. Activity
+// `details._previous` is only populated for fields that actually changed, so a
+// no-op {status: "in_progress"} PATCH carries `details.status` with no
+// `_previous.status`. Transition PATCHes and assignee-only flips do not count.
+export type RunIssueUpdatedActivityRow = {
+  action: string;
+  entityType: string;
+  entityId: string;
+  runId: string | null;
+  details: Record<string, unknown> | null;
+} | null;
+
+export function isStatusPreservingInProgressReassertionActivity(activity: RunIssueUpdatedActivityRow): boolean {
+  if (!activity) return false;
+  if (activity.action !== "issue.updated") return false;
+  const details = readRecord(activity.details);
+  if (details.status !== "in_progress") return false;
+  return readRecord(details._previous).status === undefined;
+}
+
+export async function findLastRunIssueUpdatedActivity(
+  db: Db,
+  input: { companyId: string; issueId: string; runId: string },
+) {
+  const [row] = await db
+    .select({
+      action: activityLog.action,
+      entityType: activityLog.entityType,
+      entityId: activityLog.entityId,
+      runId: activityLog.runId,
+      details: activityLog.details,
+    })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        eq(activityLog.runId, input.runId),
+        eq(activityLog.action, "issue.updated"),
+      ),
+    )
+    .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function runEndedWithStatusPreservingInProgressReassertion(
+  db: Db,
+  input: { companyId: string; issueId: string; runId: string },
+) {
+  return isStatusPreservingInProgressReassertionActivity(await findLastRunIssueUpdatedActivity(db, input));
+}
+
 function readString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
@@ -355,6 +412,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasActiveRoutineContinuation: boolean;
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
+  sourceRunEndedWithInProgressReassertion: boolean;
 }): SuccessfulRunHandoffDecision {
   const { run, issue, agent } = input;
 
@@ -384,6 +442,11 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (!isProductiveSuccessfulRun(input)) {
     return { kind: "skip", reason: "successful run did not produce handoff-relevant progress" };
+  }
+  if (input.sourceRunEndedWithInProgressReassertion) {
+    // NFM-4958 Point A: the run's last issue write reasserted in_progress
+    // without a status transition — a liveness assertion, not missing state.
+    return { kind: "skip", reason: STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON };
   }
   if (input.hasActiveExecutionPath) return { kind: "skip", reason: "issue already has an active execution path" };
   if (input.hasQueuedWake) return { kind: "skip", reason: "issue already has a queued or deferred wake" };
