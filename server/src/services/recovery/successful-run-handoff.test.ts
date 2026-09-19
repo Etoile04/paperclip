@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+  STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -9,6 +10,7 @@ import {
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
+  isStatusPreservingInProgressReassertionActivity,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
 } from "./successful-run-handoff.js";
@@ -56,6 +58,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     hasActiveRoutineContinuation: false,
     budgetBlocked: false,
     idempotentWakeExists: false,
+    sourceRunEndedWithInProgressReassertion: false,
     ...overrides,
   });
 }
@@ -141,6 +144,31 @@ describe("successful run handoff decision", () => {
 
   it("T3 (NFM-4279): parents without open executing children keep the current enqueue behavior", () => {
     const decision = decide({ hasOpenExecutingChildren: false });
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.idempotencyKey).toBe("finish_successful_run_handoff:issue-1:run-1:1");
+  });
+
+  it("NFM-4958 Point A: does not queue a corrective wake when the source run ended with a status-preserving in_progress reassertion", () => {
+    expect(decide({ sourceRunEndedWithInProgressReassertion: true })).toEqual({
+      kind: "skip",
+      reason: STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON,
+    });
+  });
+
+  it("NFM-4958 Point A: the reassertion skip wins even when the run was otherwise productive", () => {
+    expect(decide({
+      sourceRunEndedWithInProgressReassertion: true,
+      livenessState: "advanced",
+      detectedProgressSummary: "Run produced concrete action evidence: 3 issue comment(s)",
+    })).toEqual({
+      kind: "skip",
+      reason: STATUS_PRESERVING_IN_PROGRESS_REASSERTION_SKIP_REASON,
+    });
+  });
+
+  it("NFM-4958 regression: runs without a reassertion keep the current enqueue behavior (genuine missing state still arms)", () => {
+    const decision = decide({ sourceRunEndedWithInProgressReassertion: false });
     expect(decision.kind).toBe("enqueue");
     if (decision.kind !== "enqueue") return;
     expect(decision.idempotencyKey).toBe("finish_successful_run_handoff:issue-1:run-1:1");
@@ -359,5 +387,61 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+});
+
+describe("isStatusPreservingInProgressReassertionActivity (NFM-4958 1a)", () => {
+  const baseRow = {
+    action: "issue.updated",
+    entityType: "issue",
+    entityId: "issue-1",
+    runId: "run-1",
+  };
+
+  it("matches a no-op in_progress reassertion: status written, no _previous.status", () => {
+    expect(isStatusPreservingInProgressReassertionActivity({
+      ...baseRow,
+      details: { identifier: "PAP-1", status: "in_progress" },
+    })).toBe(true);
+  });
+
+  it("matches when _previous is present for other fields but carries no status", () => {
+    expect(isStatusPreservingInProgressReassertionActivity({
+      ...baseRow,
+      details: { identifier: "PAP-1", status: "in_progress", _previous: { priority: "medium" } },
+    })).toBe(true);
+  });
+
+  it("does not match a status transition (_previous.status present)", () => {
+    expect(isStatusPreservingInProgressReassertionActivity({
+      ...baseRow,
+      details: { identifier: "PAP-1", status: "in_progress", _previous: { status: "todo" } },
+    })).toBe(false);
+  });
+
+  it("does not match a write to a non-in_progress status", () => {
+    expect(isStatusPreservingInProgressReassertionActivity({
+      ...baseRow,
+      details: { identifier: "PAP-1", status: "blocked", _previous: { status: "in_progress" } },
+    })).toBe(false);
+  });
+
+  it("does not match an assignee-only flip without a status write", () => {
+    expect(isStatusPreservingInProgressReassertionActivity({
+      ...baseRow,
+      details: { identifier: "PAP-1", assigneeAgentId: "agent-2" },
+    })).toBe(false);
+  });
+
+  it("does not match a non issue.updated activity action", () => {
+    expect(isStatusPreservingInProgressReassertionActivity({
+      ...baseRow,
+      action: "issue.commented",
+      details: { status: "in_progress" },
+    })).toBe(false);
+  });
+
+  it("does not match when no activity row exists", () => {
+    expect(isStatusPreservingInProgressReassertionActivity(null)).toBe(false);
   });
 });
