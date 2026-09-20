@@ -72,6 +72,7 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { isHeartbeatRunForeignKeyViolation, resolveRunIdForWrite } from "./run-attribution.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -6144,6 +6145,22 @@ export function issueService(db: Db) {
 
       return db.transaction(async (tx) => {
         const now = new Date();
+        // NFM-4982: same guard as addComment — a forged/stale run id must not
+        // 500 the tombstone. No FK-catch belt here: the update runs inside
+        // this transaction, so a failed statement poisons it (25P02) and a
+        // retry could not succeed; the probe deterministically catches the
+        // forged-claim path and the teardown race is the residual risk ADR-019
+        // already accepts for in-transaction writers.
+        const deletedByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+          target: "issue_comments.deleted_by_run_id",
+          entityType: "issue_comment",
+          entityId: commentId,
+          actorType: actor.actorType,
+          actorId:
+            actor.actorType === "agent"
+              ? actor.agentId ?? "unknown"
+              : actor.userId ?? "unknown",
+        });
         const [comment] = await tx
           .update(issueComments)
           .set({
@@ -6154,7 +6171,7 @@ export function issueService(db: Db) {
             deletedByType: actor.actorType,
             deletedByAgentId: actor.actorType === "agent" ? actor.agentId ?? null : null,
             deletedByUserId: actor.actorType === "user" ? actor.userId ?? null : null,
-            deletedByRunId: actor.runId ?? null,
+            deletedByRunId,
             updatedAt: now,
           })
           .where(and(eq(issueComments.id, commentId), isNull(issueComments.deletedAt)))
@@ -6206,22 +6223,50 @@ export function issueService(db: Db) {
       const presentation = issueCommentPresentationSchema.nullable().parse(options?.presentation ?? null);
       const metadata = issueCommentMetadataSchema.nullable().parse(options?.metadata ?? null);
       const createdAt = options?.createdAt ? new Date(options.createdAt) : null;
-      const [comment] = await dbOrTx
-        .insert(issueComments)
-        .values({
-          companyId: issue.companyId,
-          issueId,
-          authorAgentId: actor.agentId ?? null,
-          authorUserId: actor.userId ?? null,
-          authorType,
-          createdByRunId: actor.runId ?? null,
-          body: redactedBody,
-          presentation,
-          metadata,
-          sourceTrust: options?.sourceTrust ?? null,
-          ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
-        })
-        .returning();
+      // NFM-4982 / ADR-019 extension: `actor.runId` may reference no
+      // heartbeat_runs row (unvalidated agent JWT `run_id` claim or
+      // `x-paperclip-run-id` header); writing it would violate
+      // issue_comments' created_by_run_id FK and 500 an already-succeeded
+      // comment. Probe once and degrade to null instead.
+      const createdByRunId = await resolveRunIdForWrite(dbOrTx, actor.runId ?? null, {
+        target: "issue_comments.created_by_run_id",
+        entityType: "issue",
+        entityId: issueId,
+        actorType: authorType,
+        actorId: actor.agentId ?? actor.userId ?? "unknown",
+      });
+      const insertValues = {
+        companyId: issue.companyId,
+        issueId,
+        authorAgentId: actor.agentId ?? null,
+        authorUserId: actor.userId ?? null,
+        authorType,
+        body: redactedBody,
+        presentation,
+        metadata,
+        sourceTrust: options?.sourceTrust ?? null,
+        ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
+      };
+      const insertCommentRow = async (runIdValue: string | null) => {
+        const [row] = await dbOrTx
+          .insert(issueComments)
+          .values({ ...insertValues, createdByRunId: runIdValue })
+          .returning();
+        return row;
+      };
+      let comment;
+      try {
+        comment = await insertCommentRow(createdByRunId);
+      } catch (err) {
+        // Belt for the probe→insert race (run row deleted in between, e.g. by a
+        // company/agent teardown cascade): retry once without run attribution.
+        if (createdByRunId === null || !isHeartbeatRunForeignKeyViolation(err)) throw err;
+        logger.warn(
+          { err, runId: createdByRunId, issueId },
+          "issue comment insert hit the run_id foreign key after the existence probe; retrying without run attribution",
+        );
+        comment = await insertCommentRow(null);
+      }
 
       // Update issue's updatedAt so comment activity is reflected in recency sorting
       await dbOrTx
