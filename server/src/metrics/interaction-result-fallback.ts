@@ -1,5 +1,5 @@
 /**
- * Interaction read-path fallback counter (NFM-4974/NFM-4978 D2).
+ * Interaction read-path fallback counter (NFM-4974/NFM-4978 D2, NFM-5017).
  *
  * Out-of-band expiry writers once stored `result` payloads outside the shared
  * result schemas (e.g. `outcome: "auto_expired_healer_…"`), which made
@@ -11,11 +11,12 @@
  * D3 backfill can verify convergence (rate → 0) and future out-of-band writers
  * are caught by a non-zero rate after deploy.
  *
- * Pattern: mirrors `metrics/precompletion.ts` — a prom-client Counter on a
- * dedicated Registry with a closed label set (bounded cardinality), shared
- * process-wide bundle, fresh-registry factory for tests, snapshot + Prometheus
- * render helpers. Label series are pre-created at zero so a scrape before the
- * first fallback still surfaces the series.
+ * Implementation: prom-client Counter on a dedicated Registry with a closed
+ * label set (bounded cardinality), shared process-wide bundle, fresh-registry
+ * factory for tests, snapshot + Prometheus render helpers. Label series are
+ * pre-created at zero so a scrape before the first fallback still surfaces
+ * the series. The scrape surface lives at `GET /api/metrics` (see
+ * `routes/metrics.ts`).
  */
 
 import { Counter, Registry } from "prom-client";

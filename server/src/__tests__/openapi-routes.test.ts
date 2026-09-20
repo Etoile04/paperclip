@@ -89,6 +89,12 @@ const HTTP_METHODS = new Set([
   "head",
   "patch",
   "trace",
+const explicitOpenApiCoverageExclusions = new Set([
+  // Pipeline routes are experimental and not yet represented in the public OpenAPI document.
+  "pipelines.ts",
+  // Prometheus scrape surface — operators hit this directly, not via the
+  // public API. The Prometheus text exposition body is not OpenAPI-shaped.
+  "metrics.ts",
 ]);
 const explicitOpenApiCoverageExclusions = new Set<string>();
 
