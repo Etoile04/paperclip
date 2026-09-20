@@ -98,6 +98,7 @@ import {
   resolveDefaultAgentInstructionsBundleRole,
 } from "../services/default-agent-instructions.js";
 import { getTelemetryClient } from "../telemetry.js";
+import { logger } from "../middleware/logger.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
@@ -3263,6 +3264,36 @@ export function agentRoutes(
     source: HeartbeatSource | undefined;
     skippedResponse: (agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) => unknown | Promise<unknown>;
   };
+  // Activity logging for wakeup-style endpoints is bookkeeping: by the time it
+  // runs, the heartbeat run row already exists and the caller's operation has
+  // succeeded. A failure here must not convert the successful invoke into a
+  // 500 — e.g. an agent actor whose JWT run_id claim does not reference any
+  // heartbeat_runs row violates activity_log's run_id FK (NFM-4972).
+  const logHeartbeatInvokedBestEffort = async (
+    req: Request,
+    agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+    runId: string,
+  ): Promise<void> => {
+    const actor = getActorInfo(req);
+    try {
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "heartbeat.invoked",
+        entityType: "heartbeat_run",
+        entityId: runId,
+        details: { agentId: agent.id },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, agentId: agent.id, runId, actorRunId: actor.runId },
+        "activity log write for heartbeat.invoked failed; keeping successful invoke response",
+      );
+    }
+  };
   const handleWakeupRoute = async (
     req: Request,
     res: Response,
@@ -3311,18 +3342,7 @@ export function agentRoutes(
       return;
     }
 
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: agent.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "heartbeat.invoked",
-      entityType: "heartbeat_run",
-      entityId: run.id,
-      details: { agentId: id },
-    });
+    await logHeartbeatInvokedBestEffort(req, agent, run.id);
 
     res.status(202).json(run);
   };
@@ -3402,18 +3422,7 @@ export function agentRoutes(
       return;
     }
 
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: agent.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "heartbeat.invoked",
-      entityType: "heartbeat_run",
-      entityId: run.id,
-      details: { agentId: id },
-    });
+    await logHeartbeatInvokedBestEffort(req, agent, run.id);
 
     res.status(202).json(run);
   });
