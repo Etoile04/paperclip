@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   acceptIssueThreadInteractionSchema,
   createIssueThreadInteractionSchema,
+  requestCheckboxConfirmationResultSchema,
+  requestConfirmationResultSchema,
 } from "./validators/issue.js";
 
 describe("issue thread interaction schemas", () => {
@@ -266,5 +268,34 @@ describe("issue thread interaction schemas", () => {
     expect(() => acceptIssueThreadInteractionSchema.parse({
       selectedOptionIds: ["item-1", "item-1"],
     })).toThrow("selectedOptionIds must be unique");
+  });
+
+  it("round-trips outcome=auto_expired through confirmation result schemas (NFM-4978 D1)", () => {
+    const parsed = requestConfirmationResultSchema.parse({
+      version: 1,
+      outcome: "auto_expired",
+      reason: "nfmd-pending-healer expired this confirmation out-of-band",
+    });
+
+    expect(parsed).toEqual({
+      version: 1,
+      outcome: "auto_expired",
+      reason: "nfmd-pending-healer expired this confirmation out-of-band",
+    });
+
+    // The checkbox variant inherits the extended enum.
+    const checkboxParsed = requestCheckboxConfirmationResultSchema.parse({
+      version: 1,
+      outcome: "auto_expired",
+    });
+    expect(checkboxParsed.outcome).toBe("auto_expired");
+
+    // The vocabulary stays bounded: per-rule outcome values that caused the
+    // NFM-4974 poisoning must keep failing validation.
+    const legacyPoison = requestConfirmationResultSchema.safeParse({
+      version: 1,
+      outcome: "auto_expired_cr_prohibition_rule_nfm2027_20260805",
+    });
+    expect(legacyPoison.success).toBe(false);
   });
 });
