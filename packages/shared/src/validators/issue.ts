@@ -1709,6 +1709,9 @@ export const requestConfirmationResultSchema = z.object({
     "withdrawn",
     "issue_closed",
     "addressee_deleted",
+    // NFM-4974/NFM-4978 D1: out-of-band auto-expiry (healer cron, watchdogs)
+    // records outcome="auto_expired" with provenance in `reason`.
+    "auto_expired",
   ]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().guid().nullable().optional(),

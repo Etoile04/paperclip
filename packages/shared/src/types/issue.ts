@@ -1456,7 +1456,7 @@ export interface RequestConfirmationResult {
     | "skipped"
     | "withdrawn"
     | "issue_closed"
-    | "addressee_deleted";
+  | "auto_expired";
   reason?: string | null;
   commentId?: string | null;
   supersededByInteractionId?: string | null;

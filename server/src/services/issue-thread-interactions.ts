@@ -18,6 +18,8 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
+import type { ZodType } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -54,6 +56,7 @@ import type {
   IssueThreadInteractionKind,
   IssueThreadInteractionResolverPolicy,
   IssueThreadInteractionResolverPolicyProvenance,
+  IssueThreadInteractionKind,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
@@ -135,6 +138,10 @@ import {
 
 export { extractGitHubPullRequestReferences } from "./github-pull-request-merge.js";
 export type { GitHubPullRequestReference } from "./github-pull-request-merge.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
+import { recordInteractionResultFallback } from "../metrics/interaction-result-fallback.js";
+import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 
 type InteractionActor = {
   identityContextId?: string | null;
@@ -647,6 +654,76 @@ function parseStoredInteractionResult<S extends z.ZodTypeAny>(
 }
 
 function hydrateInteraction(
+ * Cap on the stringified raw result embedded in read-time fallback `reason` /
+ * `cancellationReason` / `rejectionReason` values. The result schemas allow
+ * 4000 chars, but fallback provenance only needs enough to identify the writer;
+ * the full row stays in the database and the warn log.
+ */
+const RESULT_FALLBACK_RAW_SNIPPET_MAX_CHARS = 500;
+
+function describeRawResult(raw: unknown): string {
+  let text: string;
+  try {
+    text = JSON.stringify(raw) ?? String(raw);
+  } catch {
+    text = String(raw);
+  }
+  if (text.length > RESULT_FALLBACK_RAW_SNIPPET_MAX_CHARS) {
+    text = `${text.slice(0, RESULT_FALLBACK_RAW_SNIPPET_MAX_CHARS)}…[truncated]`;
+  }
+  return text;
+}
+
+/**
+ * Parse a stored interaction `result` without ever letting a malformed row
+ * fail the read path (NFM-4974/NFM-4978 D2). Out-of-band expiry writers
+ * historically stored results outside the shared schemas; a throwing parse
+ * here permanently 400-ed `GET /api/issues/:id/interactions`.
+ *
+ * - Expired rows get the kind's read-time fallback result via `buildFallback`
+ *   (provenance: stringified raw result, truncated).
+ * - Non-expired rows serve `result: null` — a pending row's malformed result
+ *   has no honest substitute and the route must not invent one.
+ * - Every fallback bumps `paperclip_interaction_result_fallback_total{kind}`.
+ *
+ * `payload` parsing intentionally stays strict: payloads are only ever written
+ * through the validated create route, so a malformed payload still surfaces as
+ * a hard error instead of being silently rewritten.
+ */
+function parseStoredInteractionResult<T>(
+  kind: IssueThreadInteractionKind,
+  schema: ZodType<T>,
+  row: IssueThreadInteractionRow,
+  buildFallback: (rawDescription: string) => T,
+): T | null {
+  if (row.result == null) return null;
+  const parsed = schema.safeParse(row.result);
+  if (parsed.success) return parsed.data;
+
+  recordInteractionResultFallback(kind);
+  const logContext = {
+    interactionId: row.id,
+    issueId: row.issueId,
+    companyId: row.companyId,
+    kind,
+    status: row.status,
+    rawResult: describeRawResult(row.result),
+  };
+  if (row.status !== "expired") {
+    logger.warn(
+      logContext,
+      "issue thread interaction result failed schema validation on a non-expired row; serving result: null",
+    );
+    return null;
+  }
+  logger.warn(
+    logContext,
+    "issue thread interaction result failed schema validation on an expired row; serving read-time fallback result",
+  );
+  return buildFallback(`read-time fallback (raw=${describeRawResult(row.result)})`);
+}
+
+export function hydrateInteraction(
   row: IssueThreadInteractionRow,
 ): IssueThreadInteraction {
   const storedRequestedResolverPolicy =
@@ -703,6 +780,10 @@ function hydrateInteraction(
           suggestTasksResultSchema,
           row.result,
           row,
+          "suggest_tasks",
+          suggestTasksResultSchema,
+          row,
+          (rawDescription) => ({ version: 1, rejectionReason: rawDescription }),
         ),
       } satisfies SuggestTasksInteraction;
     case "ask_user_questions":
@@ -714,6 +795,15 @@ function hydrateInteraction(
           askUserQuestionsResultSchema,
           row.result,
           row,
+          "ask_user_questions",
+          askUserQuestionsResultSchema,
+          row,
+          (rawDescription) => ({
+            version: 1,
+            answers: [],
+            cancelled: true,
+            cancellationReason: rawDescription,
+          }),
         ),
       } satisfies AskUserQuestionsInteraction;
     case "request_confirmation":
@@ -725,6 +815,10 @@ function hydrateInteraction(
           requestConfirmationResultSchema,
           row.result,
           row,
+          "request_confirmation",
+          requestConfirmationResultSchema,
+          row,
+          (rawDescription) => ({ version: 1, outcome: "auto_expired", reason: rawDescription }),
         ),
       } satisfies RequestConfirmationInteraction;
     case "request_checkbox_confirmation":
@@ -736,6 +830,10 @@ function hydrateInteraction(
           requestCheckboxConfirmationResultSchema,
           row.result,
           row,
+          "request_checkbox_confirmation",
+          requestCheckboxConfirmationResultSchema,
+          row,
+          (rawDescription) => ({ version: 1, outcome: "auto_expired", reason: rawDescription }),
         ),
       } satisfies RequestCheckboxConfirmationInteraction;
     case "request_item_verdicts":
