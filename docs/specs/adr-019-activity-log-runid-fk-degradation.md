@@ -122,3 +122,59 @@ no action needed):
 | routines `created_by_run_id` | `services/routines.ts` ×3 |
 | `heartbeat_run_watchdog_decisions.created_by_run_id` | `routes/agents.ts` via `recovery.recordWatchdogDecision` |
 | `issue_thread_interactions.source_run_id` | `routes/issues.ts` interaction accept path |
+
+## Rollout to the remaining columns (NFM-4983, 2026-09-20)
+
+Every remaining exposed site now probes `actor.runId` via
+`resolveRunIdForWrite` on the same handle as the write and degrades to null.
+**Probe only — no belt** — at all of these sites: each write runs inside the
+caller's transaction (or a `dbOrTx` helper shared with in-transaction
+callers), where a failed statement poisons the transaction (`25P02`) and a
+belt retry could never succeed; the probe deterministically catches the
+forged/stale-claim path and the teardown race stays the ADR-019-accepted
+residual.
+
+Applied:
+
+- `document_revisions.created_by_run_id` — `routes/pipelines.ts` ×4
+  (pipeline/case document upsert + restore; the audit's other two pipelines
+  sites write `pipeline_case_issue_links.created_by_run_id`, which carries
+  **no** heartbeat_runs FK — correction, no action), one entry probe in
+  `documents.upsertIssueDocument` covering its three internal revision
+  inserts (this also backs the `routes/issues.ts` document-create path, which
+  delegates here), `services/routines.ts`
+  `upsertRoutineDescriptionDocument` (covers create + update), and
+  `services/pipelines.ts` case-body document creation.
+- `document_annotation_comments.created_by_run_id` —
+  `services/document-annotations.ts` ×4 (issue + routine variants of
+  `createThread` and `addComment`).
+- `issue_work_products.created_by_run_id` — `routes/issues.ts` promotion
+  insert (in tx).
+- `issue_execution_decisions.created_by_run_id` — `routes/issues.ts` ×2
+  (decision path and auto-approval path; the audit counted the logical
+  site — there are two physical inserts), both in tx.
+- `issue_watchdogs.created_by_run_id` / `updated_by_run_id` —
+  `services/task-watchdogs.ts`: `updateIssueWatchdogRow`, the upsert insert
+  (one probe feeds both columns), and the disable path.
+- `routine_revisions.created_by_run_id` — `services/routines.ts`
+  `appendRoutineRevision` (single choke point behind every public routine
+  mutation) and `services/pipelines.ts`
+  `appendPipelineAutomationRoutineRevision` (audit addendum).
+- `issue_tree_holds.created_by_run_id` — `services/issue-tree-control.ts`
+  `createHold` (audit addendum: same defect class, missed by the table
+  above); one entry probe covers the pause and resume hold inserts.
+
+Audit corrections — rows that needed **no change** because the write already
+validates the run id and rejects with a client error (never a 500):
+
+- `heartbeat_run_watchdog_decisions.created_by_run_id` —
+  `recovery.recordWatchdogDecision` already probes `heartbeat_runs`
+  (existence + company + agent match) and throws `403` on an invalid id.
+- `issue_thread_interactions.source_run_id` —
+  `issueThreadInteractionService.create` already probes existence +
+  same-company and throws `422`.
+
+These two behave as validate-and-reject rather than ADR-019
+degrade-to-null: both columns gate an authorization decision, not just
+telemetry attribution, so rejecting the forged actor is the stronger and
+already-implemented contract.
