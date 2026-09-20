@@ -22,6 +22,7 @@ import {
   type IssueTreePreviewWarning,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { resolveRunIdForWrite } from "./run-attribution.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -719,6 +720,18 @@ export function issueTreeControlService(db: Db) {
       releasePolicy: holdReleasePolicy,
     });
 
+    // NFM-4983 / ADR-019 extension (audit addendum): probe the unvalidated
+    // `actor.runId` before it reaches issue_tree_holds run-id FK; a forged
+    // or stale id degrades to null instead of 500ing the hold. Probe only —
+    // both hold inserts run inside transactions (ADR-019 residual).
+    const createdByRunId = await resolveRunIdForWrite(db, input.actor.runId ?? null, {
+      target: "issue_tree_holds.created_by_run_id",
+      entityType: "issue_tree_hold",
+      entityId: rootIssueId,
+      actorType: input.actor.actorType,
+      actorId: input.actor.agentId ?? input.actor.userId ?? input.actor.actorId ?? "unknown",
+    });
+
     if (input.mode === "resume") {
       const issueIds = [...new Set(holdPreview.issues.map((issue) => issue.id))];
       const activePauseHolds = await activePauseHoldsForIssueIds(companyId, issueIds);
@@ -737,7 +750,7 @@ export function issueTreeControlService(db: Db) {
             createdByActorType: input.actor.actorType,
             createdByAgentId: input.actor.agentId ?? null,
             createdByUserId: input.actor.userId ?? (input.actor.actorType === "user" ? input.actor.actorId : null),
-            createdByRunId: input.actor.runId ?? null,
+            createdByRunId,
           })
           .returning();
 
@@ -815,7 +828,7 @@ export function issueTreeControlService(db: Db) {
           createdByActorType: input.actor.actorType,
           createdByAgentId: input.actor.agentId ?? null,
           createdByUserId: input.actor.userId ?? (input.actor.actorType === "user" ? input.actor.actorId : null),
-          createdByRunId: input.actor.runId ?? null,
+          createdByRunId,
         })
         .returning();
 

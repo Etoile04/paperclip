@@ -22,6 +22,7 @@ import {
   UpdateDocumentAnnotationThread,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { resolveRunIdForWrite } from "./run-attribution.js";
 
 type ActorInput = {
   actorType: "agent" | "user";
@@ -372,6 +373,18 @@ export function documentAnnotationService(db: Db) {
         })
         .returning(threadSelect);
 
+      // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId`
+      // (JWT claim / header) before it reaches the run-id FK; a forged or
+      // stale id degrades to null instead of 500ing the annotation write.
+      // Probe only — this insert runs inside the function transaction, where
+      // a failed statement poisons it (25P02); ADR-019 residual.
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+        target: "document_annotation_comments.created_by_run_id",
+        entityType: "document_annotation_thread",
+        entityId: thread.id,
+        actorType: actor.actorType,
+        actorId: actor.agentId ?? actor.userId ?? "unknown",
+      });
       const [comment] = await tx
         .insert(documentAnnotationComments)
         .values({
@@ -383,7 +396,7 @@ export function documentAnnotationService(db: Db) {
           authorType: actor.actorType,
           authorAgentId: actor.agentId ?? null,
           authorUserId: actor.userId ?? null,
-          createdByRunId: actor.runId ?? null,
+          createdByRunId,
           issueCommentId: linkedIssueComment?.id ?? null,
           createdAt: now,
           updatedAt: now,
@@ -459,6 +472,18 @@ export function documentAnnotationService(db: Db) {
         })
         .returning(threadSelect);
 
+      // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId`
+      // (JWT claim / header) before it reaches the run-id FK; a forged or
+      // stale id degrades to null instead of 500ing the annotation write.
+      // Probe only — this insert runs inside the function transaction, where
+      // a failed statement poisons it (25P02); ADR-019 residual.
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+        target: "document_annotation_comments.created_by_run_id",
+        entityType: "document_annotation_thread",
+        entityId: thread.id,
+        actorType: actor.actorType,
+        actorId: actor.agentId ?? actor.userId ?? "unknown",
+      });
       const [comment] = await tx
         .insert(documentAnnotationComments)
         .values({
@@ -471,7 +496,7 @@ export function documentAnnotationService(db: Db) {
           authorType: actor.actorType,
           authorAgentId: actor.agentId ?? null,
           authorUserId: actor.userId ?? null,
-          createdByRunId: actor.runId ?? null,
+          createdByRunId,
           issueCommentId: null,
           createdAt: now,
           updatedAt: now,
@@ -492,6 +517,18 @@ export function documentAnnotationService(db: Db) {
       if (!thread) throw notFound("Annotation thread not found");
       const now = new Date();
       const linkedIssueComment = await assertLinkedIssueComment(issueId, input.issueCommentId, tx);
+      // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId`
+      // (JWT claim / header) before it reaches the run-id FK; a forged or
+      // stale id degrades to null instead of 500ing the annotation write.
+      // Probe only — this insert runs inside the function transaction, where
+      // a failed statement poisons it (25P02); ADR-019 residual.
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+        target: "document_annotation_comments.created_by_run_id",
+        entityType: "document_annotation_thread",
+        entityId: thread.id,
+        actorType: actor.actorType,
+        actorId: actor.agentId ?? actor.userId ?? "unknown",
+      });
       const [comment] = await tx
         .insert(documentAnnotationComments)
         .values({
@@ -503,7 +540,7 @@ export function documentAnnotationService(db: Db) {
           authorType: actor.actorType,
           authorAgentId: actor.agentId ?? null,
           authorUserId: actor.userId ?? null,
-          createdByRunId: actor.runId ?? null,
+          createdByRunId,
           issueCommentId: linkedIssueComment?.id ?? null,
           createdAt: now,
           updatedAt: now,
@@ -528,6 +565,18 @@ export function documentAnnotationService(db: Db) {
       const thread = await getThreadForRoutine(routineId, key, threadId, doc.companyId, doc.documentId, tx);
       if (!thread) throw notFound("Annotation thread not found");
       const now = new Date();
+      // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId`
+      // (JWT claim / header) before it reaches the run-id FK; a forged or
+      // stale id degrades to null instead of 500ing the annotation write.
+      // Probe only — this insert runs inside the function transaction, where
+      // a failed statement poisons it (25P02); ADR-019 residual.
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+        target: "document_annotation_comments.created_by_run_id",
+        entityType: "document_annotation_thread",
+        entityId: thread.id,
+        actorType: actor.actorType,
+        actorId: actor.agentId ?? actor.userId ?? "unknown",
+      });
       const [comment] = await tx
         .insert(documentAnnotationComments)
         .values({
@@ -540,7 +589,7 @@ export function documentAnnotationService(db: Db) {
           authorType: actor.actorType,
           authorAgentId: actor.agentId ?? null,
           authorUserId: actor.userId ?? null,
-          createdByRunId: actor.runId ?? null,
+          createdByRunId,
           issueCommentId: null,
           createdAt: now,
           updatedAt: now,

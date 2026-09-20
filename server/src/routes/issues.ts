@@ -118,6 +118,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { resolveRunIdForWrite } from "../services/run-attribution.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { feedbackService } from "../services/feedback.js";
@@ -4699,6 +4700,19 @@ export function issueRoutes(
       })();
       if (!updatedSource[0]) return null;
 
+      // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId`
+      // (agent JWT `run_id` claim / `x-paperclip-run-id` header) before it
+      // reaches issue_work_products' run-id FK; a forged or stale id degrades
+      // to null instead of 500ing the already-succeeded promotion. Probe
+      // only — this insert runs inside the promotion transaction, where a
+      // failed statement poisons it (25P02); ADR-019 residual.
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+        target: "issue_work_products.created_by_run_id",
+        entityType: "issue",
+        entityId: issue.id,
+        actorType: actor.actorType,
+        actorId: actor.agentId ?? actor.userId ?? "unknown",
+      });
       return tx
         .insert(issueWorkProducts)
         .values({
@@ -4721,7 +4735,7 @@ export function issueRoutes(
             },
           },
           sourceTrust: promotionTrust,
-          createdByRunId: actor.runId ?? null,
+          createdByRunId,
         })
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -6122,6 +6136,18 @@ export function issueRoutes(
           );
           if (!updated) return null;
 
+          // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId`
+          // before it reaches issue_execution_decisions' run-id FK; a forged
+          // or stale id degrades to null instead of 500ing the status change.
+          // Probe only — inside this transaction a failed statement poisons it
+          // (25P02); ADR-019 residual.
+          const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+            target: "issue_execution_decisions.created_by_run_id",
+            entityType: "issue",
+            entityId: updated.id,
+            actorType: actor.actorType,
+            actorId: actor.agentId ?? actor.userId ?? "unknown",
+          });
           await tx.insert(issueExecutionDecisions).values({
             id: decisionId,
             companyId: updated.companyId,
@@ -6132,7 +6158,7 @@ export function issueRoutes(
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
             outcome: decision.outcome,
             body: decision.body,
-            createdByRunId: actor.runId ?? null,
+            createdByRunId,
           });
 
           return updated;
@@ -7894,6 +7920,17 @@ export function issueRoutes(
           if (!updated) throw new AutoApprovalIssueMissingError();
 
           if (transition.decision && decisionId) {
+            // NFM-4983 / ADR-019 extension: same probe as the decision path —
+            // degrade an unverifiable `actor.runId` to null instead of
+            // 500ing the already-succeeded auto-approval. Probe only (this
+            // transaction cannot survive a failed statement; ADR-019 residual).
+            const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+              target: "issue_execution_decisions.created_by_run_id",
+              entityType: "issue",
+              entityId: updated.id,
+              actorType: actor.actorType,
+              actorId: actor.agentId ?? actor.userId ?? "unknown",
+            });
             await tx.insert(issueExecutionDecisions).values({
               id: decisionId,
               companyId: updated.companyId,
@@ -7904,7 +7941,7 @@ export function issueRoutes(
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
               outcome: transition.decision.outcome,
               body: transition.decision.body,
-              createdByRunId: actor.runId ?? null,
+              createdByRunId,
             });
           }
 
