@@ -269,6 +269,7 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../services/issue-dependency-wakeups.js";
+import { resolveRunIdForWrite } from "../services/run-attribution.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
   executionWorkspaceService as executionWorkspaceServiceDirect,
@@ -18364,6 +18365,7 @@ export function issueRoutes(
         allowSharing: req.body.allowSharing === true,
       });
 
+            const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
