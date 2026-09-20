@@ -26,6 +26,8 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
 export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_REPEATED_PRODUCTIVE_SNOOZE_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_REPEATED_PRODUCTIVE_STREAK = 2;
 export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -49,6 +51,8 @@ type ProductivityReviewThresholds = {
   highChurnHourly: number;
   highChurnSixHours: number;
   resolvedSnoozeMs: number;
+  repeatedProductiveSnoozeMs: number;
+  repeatedProductiveStreak: number;
   refreshIntervalMs: number;
   maxRefreshComments: number;
   creationWindowMs: number;
@@ -159,6 +163,14 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
     resolvedSnoozeMs: readPositiveInteger(
       overrides?.resolvedSnoozeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
       DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
+    ),
+    repeatedProductiveSnoozeMs: readPositiveInteger(
+      overrides?.repeatedProductiveSnoozeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_REPEATED_PRODUCTIVE_SNOOZE_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_REPEATED_PRODUCTIVE_SNOOZE_MS,
+    ),
+    repeatedProductiveStreak: readPositiveInteger(
+      overrides?.repeatedProductiveStreak ?? DEFAULT_PRODUCTIVITY_REVIEW_REPEATED_PRODUCTIVE_STREAK,
+      DEFAULT_PRODUCTIVITY_REVIEW_REPEATED_PRODUCTIVE_STREAK,
     ),
     refreshIntervalMs: readPositiveInteger(
       overrides?.refreshIntervalMs ?? DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
@@ -281,6 +293,54 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .orderBy(desc(issues.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  // Verdict detection for the repeated-productive snooze extension. A closed
+  // review counts as "closed productive" when its latest comment carries a
+  // positive productive verdict. Negations ("not productive", "non-productive",
+  // "never productive", "unproductive") must NOT count — those are findings.
+  const PRODUCTIVE_VERDICT_POSITIVE = /\bproductive\b/i;
+  const PRODUCTIVE_VERDICT_NEGATED = /\b(?:not|non|never)[\s-]*productive\b|\bunproductive\b/i;
+
+  function isProductiveVerdictComment(body: string | null | undefined) {
+    if (!body) return false;
+    return PRODUCTIVE_VERDICT_POSITIVE.test(body) && !PRODUCTIVE_VERDICT_NEGATED.test(body);
+  }
+
+  // Board decision 2026-09-20 (NFM-4975 / NFM-4970 soak-review spam): when the
+  // last N reviews of the same source issue were all closed productive, the
+  // pattern is expected by design — extend the resolved-review snooze window
+  // so calendar-gated soak issues stop re-firing reviews every 6 hours.
+  async function countConsecutiveProductiveResolvedReviews(
+    companyId: string,
+    sourceIssueId: string,
+    requiredStreak: number,
+  ) {
+    if (requiredStreak <= 1) return 0;
+    const resolved = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          eq(issues.status, "done"),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(requiredStreak);
+    if (resolved.length < requiredStreak) return 0;
+    for (const review of resolved) {
+      const [latest] = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, review.id))
+        .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+        .limit(1);
+      if (!isProductiveVerdictComment(latest?.body)) return 0;
+    }
+    return resolved.length;
   }
 
   async function countRecentProductivityReviews(
@@ -807,6 +867,35 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       if (await findRecentResolvedProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
         result.snoozed += 1;
         continue;
+      }
+      // Repeated-productive extension (board decision 2026-09-20): if the last
+      // N resolved reviews of this source issue were all closed productive,
+      // treat the pattern as designed and use the extended snooze window.
+      const productiveStreak = await countConsecutiveProductiveResolvedReviews(
+        candidate.companyId,
+        candidate.id,
+        thresholds.repeatedProductiveStreak,
+      );
+      if (productiveStreak >= thresholds.repeatedProductiveStreak) {
+        const extendedCutoff = new Date(now.getTime() - thresholds.repeatedProductiveSnoozeMs);
+        const [recentlyResolved] = await db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, candidate.companyId),
+              eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+              eq(issues.originId, candidate.id),
+              eq(issues.status, "done"),
+              gt(issues.updatedAt, extendedCutoff),
+            ),
+          )
+          .orderBy(desc(issues.updatedAt))
+          .limit(1);
+        if (recentlyResolved) {
+          result.snoozed += 1;
+          continue;
+        }
       }
       const sourceAgent = await getAgent(candidate.assigneeAgentId);
       if (!sourceAgent || sourceAgent.companyId !== candidate.companyId) {
