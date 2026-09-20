@@ -82,3 +82,43 @@ requirement: an unverifiable run id costs telemetry attribution, never availabil
   not reachable via the forged-JWT path, which the probe deterministically catches.
 - `logHeartbeatInvokedBestEffort` (NFM-4972) stays as is — defense in depth on the highest-
   traffic path; with this guard its catch becomes effectively unreachable for the FK case.
+
+## Extension: other run-id FK columns (NFM-4982, 2026-09-20)
+
+`issue_comments` writes the same unvalidated `actor.runId` into
+`created_by_run_id` / `deleted_by_run_id` (FKs to heartbeat_runs), so
+`addComment` 500'd an already-succeeded `POST /api/issues/:id/comments` when
+the JWT carried a forged/stale `run_id` (NFM-4982; the activity_log choke
+point could not see it — the comment row itself fails the FK first).
+
+The ADR-019 pattern moved into a reusable helper,
+`server/src/services/run-attribution.ts`:
+
+- `resolveRunIdForWrite(db, runId, context)` — probe `heartbeat_runs` on the
+  same handle (base `Db` or transaction) and degrade to null with a warning;
+- `isHeartbeatRunForeignKeyViolation(err)` — accepts any driver error shape
+  and suffix-matches every `<table>_<column>_heartbeat_runs_id_fk` constraint.
+
+Applied at:
+
+- `issueService.addComment` — probe + FK-catch belt. Non-transactional
+  callers (the `POST /comments` route) recover fully from the residual race;
+  in-transaction callers keep the accepted ADR-019 residual risk.
+- `issueService.tombstoneComment` — probe only: the update runs inside this
+  function's own transaction, where a failed statement poisons it (25P02) and
+  a belt retry could never succeed.
+
+Audit of remaining columns written from `actor.runId` (same defect class,
+identical fix recipe; `sourceTrust.sourceRunId` is JSON metadata, not an FK —
+no action needed):
+
+| Column | Sites |
+| --- | --- |
+| `document_revisions.created_by_run_id` | `routes/pipelines.ts` ×6, `routes/issues.ts` document-create path |
+| `document_annotation_comments.created_by_run_id` | `services/document-annotations.ts` ×4 |
+| `issue_work_products.created_by_run_id` | `routes/issues.ts` promotion path (in tx) |
+| `issue_execution_decisions.created_by_run_id` | `routes/issues.ts` decision path (in tx) |
+| `issue_watchdogs.created_by_run_id` / `updated_by_run_id` | `services/task-watchdogs.ts` ×4 |
+| routines `created_by_run_id` | `services/routines.ts` ×3 |
+| `heartbeat_run_watchdog_decisions.created_by_run_id` | `routes/agents.ts` via `recovery.recordWatchdogDecision` |
+| `issue_thread_interactions.source_run_id` | `routes/issues.ts` interaction accept path |
