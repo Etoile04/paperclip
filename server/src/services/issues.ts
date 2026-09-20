@@ -144,6 +144,7 @@ import {
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { isHeartbeatRunForeignKeyViolation, resolveRunIdForWrite } from "./run-attribution.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
@@ -12156,6 +12157,22 @@ export function issueService(db: Db) {
 
       return db.transaction(async (tx) => {
         const now = new Date();
+        // NFM-4982: same guard as addComment — a forged/stale run id must not
+        // 500 the tombstone. No FK-catch belt here: the update runs inside
+        // this transaction, so a failed statement poisons it (25P02) and a
+        // retry could not succeed; the probe deterministically catches the
+        // forged-claim path and the teardown race is the residual risk ADR-019
+        // already accepts for in-transaction writers.
+        const deletedByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+          target: "issue_comments.deleted_by_run_id",
+          entityType: "issue_comment",
+          entityId: commentId,
+          actorType: actor.actorType,
+          actorId:
+            actor.actorType === "agent"
+              ? actor.agentId ?? "unknown"
+              : actor.userId ?? "unknown",
+        });
         const [comment] = await tx
           .update(issueComments)
           .set({
