@@ -45,6 +45,7 @@ import { healthRoutes } from "./routes/health.js";
 import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
 import { cloudControlMiddleware } from "./middleware/cloud-control.js";
 import { cloudRoutes } from "./routes/cloud.js";
+import { metricsRoutes } from "./routes/metrics.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
 import { companySkillPolicyRoutes } from "./routes/company-skill-policy.js";
@@ -652,6 +653,7 @@ export async function createApp(
       databaseBackupHealth: opts.databaseBackupHealth,
     }),
   );
+  api.use("/metrics", metricsRoutes());
   api.use(openApiRoutes());
   api.use("/cloud", cloudRoutes());
   api.use("/companies", companyRoutes(db, opts.storageService));
