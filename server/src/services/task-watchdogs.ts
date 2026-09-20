@@ -19,6 +19,7 @@ import type { IssueWatchdog, IssueWatchdogSummary } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
+import { resolveRunIdForWrite } from "./run-attribution.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
@@ -648,6 +649,16 @@ async function updateIssueWatchdogRow(
   input: IssueWatchdogUpsertInput,
   now: Date,
 ) {
+  // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId` before
+  // it reaches issue_watchdogs' run-id FK; a forged or stale id degrades to
+  // null instead of 500ing the watchdog upsert. Probe only — callers may
+  // hold the transaction open (ADR-019 residual for in-tx writers).
+  const updatedByRunId = await resolveRunIdForWrite(dbOrTx, input.actor?.runId ?? null, {
+    target: "issue_watchdogs.updated_by_run_id",
+    entityType: "issue_watchdog",
+    entityId: existing.id,
+    actorId: input.actor?.agentId ?? input.actor?.userId ?? "unknown",
+  });
   const [updated] = await dbOrTx
     .update(issueWatchdogs)
     .set({
@@ -656,7 +667,7 @@ async function updateIssueWatchdogRow(
       status: "active",
       updatedByAgentId: input.actor?.agentId ?? null,
       updatedByUserId: input.actor?.userId ?? null,
-      updatedByRunId: input.actor?.runId ?? null,
+      updatedByRunId,
       updatedAt: now,
     })
     .where(eq(issueWatchdogs.id, existing.id))
@@ -685,6 +696,14 @@ export async function upsertIssueWatchdogForIssue(
     return { watchdog: toIssueWatchdog(updated), created: false };
   }
 
+  // NFM-4983 / ADR-019 extension: same probe as the update path, applied to
+  // both run-id FK columns of the insert (one probe, same actor.runId).
+  const actorRunIdForWrite = await resolveRunIdForWrite(dbOrTx, input.actor?.runId ?? null, {
+    target: "issue_watchdogs.created_by_run_id",
+    entityType: "issue_watchdog",
+    entityId: issueId,
+    actorId: input.actor?.agentId ?? input.actor?.userId ?? "unknown",
+  });
   const insertResult: { row: IssueWatchdogRow; created: boolean } = await dbOrTx
     .insert(issueWatchdogs)
     .values({
@@ -695,10 +714,10 @@ export async function upsertIssueWatchdogForIssue(
       status: "active",
       createdByAgentId: input.actor?.agentId ?? null,
       createdByUserId: input.actor?.userId ?? null,
-      createdByRunId: input.actor?.runId ?? null,
+      createdByRunId: actorRunIdForWrite,
       updatedByAgentId: input.actor?.agentId ?? null,
       updatedByUserId: input.actor?.userId ?? null,
-      updatedByRunId: input.actor?.runId ?? null,
+      updatedByRunId: actorRunIdForWrite,
       createdAt: now,
       updatedAt: now,
     })
@@ -1489,13 +1508,21 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         .where(and(eq(issueWatchdogs.companyId, companyId), eq(issueWatchdogs.issueId, issueId)))
         .then((rows) => rows[0] ?? null);
       if (!existing || existing.status === "disabled") return null;
+      // NFM-4983 / ADR-019 extension: probe before the run-id FK; degrade a
+      // forged/stale actor.runId to null instead of 500ing the disable.
+      const updatedByRunId = await resolveRunIdForWrite(db, actor.runId ?? null, {
+        target: "issue_watchdogs.updated_by_run_id",
+        entityType: "issue_watchdog",
+        entityId: existing.id,
+        actorId: actor.agentId ?? actor.userId ?? "unknown",
+      });
       const [updated] = await db
         .update(issueWatchdogs)
         .set({
           status: "disabled",
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
-          updatedByRunId: actor.runId ?? null,
+          updatedByRunId,
           updatedAt: new Date(),
         })
         .where(eq(issueWatchdogs.id, existing.id))

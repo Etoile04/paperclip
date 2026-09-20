@@ -70,6 +70,7 @@ import {
   type PipelineHealthStageInput,
 } from "@paperclipai/shared";
 import { documentAnnotationService } from "../services/document-annotations.js";
+import { resolveRunIdForWrite } from "../services/run-attribution.js";
 import { logActivity } from "../services/activity-log.js";
 import {
   formatPipelineConversationBodyDocumentContextMarkdown,
@@ -1340,6 +1341,18 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
           updatedByAgentId: actor.type === "agent" ? actor.agentId : null,
           updatedByUserId: actor.type === "user" ? actor.userId : null,
         }).returning();
+      // NFM-4983 / ADR-019 extension: probe the unvalidated actor.runId (agent
+      // JWT run_id claim / x-paperclip-run-id header) before it reaches
+      // document_revisions' run-id FK; a forged or stale id degrades to null
+      // instead of 500ing the already-succeeded case document write. Probe
+      // only — this insert runs inside the route transaction (ADR-019 residual).
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.type === "agent" ? actor.runId : null, {
+        target: "document_revisions.created_by_run_id",
+        entityType: "pipeline_case",
+        entityId: pipelineId,
+        actorType: actor.type,
+        actorId: actor.type === "agent" ? actor.agentId : actor.type === "user" ? actor.userId : "unknown",
+      });
       const [revision] = await tx.insert(documentRevisions).values({
         companyId,
         documentId: document!.id,
@@ -1348,7 +1361,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         body: req.body.body,
         createdByAgentId: actor.type === "agent" ? actor.agentId : null,
         createdByUserId: actor.type === "user" ? actor.userId : null,
-        createdByRunId: actor.type === "agent" ? actor.runId : null,
+        createdByRunId,
         createdAt: now,
       }).returning();
       await tx.update(documents).set({
@@ -1423,6 +1436,18 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
 
       const now = new Date();
       const nextRevisionNumber = existing.document.latestRevisionNumber + 1;
+      // NFM-4983 / ADR-019 extension: probe the unvalidated actor.runId (agent
+      // JWT run_id claim / x-paperclip-run-id header) before it reaches
+      // document_revisions' run-id FK; a forged or stale id degrades to null
+      // instead of 500ing the already-succeeded case document write. Probe
+      // only — this insert runs inside the route transaction (ADR-019 residual).
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.type === "agent" ? actor.runId : null, {
+        target: "document_revisions.created_by_run_id",
+        entityType: "pipeline_case",
+        entityId: pipelineId,
+        actorType: actor.type,
+        actorId: actor.type === "agent" ? actor.agentId : actor.type === "user" ? actor.userId : "unknown",
+      });
       const [restoredRevision] = await tx.insert(documentRevisions).values({
         companyId,
         documentId: existing.document.id,
@@ -1433,7 +1458,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         changeSummary: `Restored from revision ${sourceRevision.revisionNumber}`,
         createdByAgentId: actor.type === "agent" ? actor.agentId : null,
         createdByUserId: actor.type === "user" ? actor.userId : null,
-        createdByRunId: actor.type === "agent" ? actor.runId : null,
+        createdByRunId,
         createdAt: now,
       }).returning();
 
@@ -1666,6 +1691,18 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
           updatedAt: now,
         }).returning();
       const nextRevisionNumber = existing ? existing.document.latestRevisionNumber + 1 : 1;
+      // NFM-4983 / ADR-019 extension: probe the unvalidated actor.runId (agent
+      // JWT run_id claim / x-paperclip-run-id header) before it reaches
+      // document_revisions' run-id FK; a forged or stale id degrades to null
+      // instead of 500ing the already-succeeded case document write. Probe
+      // only — this insert runs inside the route transaction (ADR-019 residual).
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.type === "agent" ? actor.runId : null, {
+        target: "document_revisions.created_by_run_id",
+        entityType: "pipeline_case",
+        entityId: caseId,
+        actorType: actor.type,
+        actorId: actor.type === "agent" ? actor.agentId : actor.type === "user" ? actor.userId : "unknown",
+      });
       const [revision] = await tx.insert(documentRevisions).values({
         companyId,
         documentId: document!.id,
@@ -1676,7 +1713,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         changeSummary: req.body.changeSummary ?? null,
         createdByAgentId: actor.type === "agent" ? actor.agentId : null,
         createdByUserId: actor.type === "user" ? actor.userId : null,
-        createdByRunId: actor.type === "agent" ? actor.runId : null,
+        createdByRunId,
         createdAt: now,
       }).returning();
       await tx.update(documents).set({
@@ -1813,6 +1850,18 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
 
       const now = new Date();
       const nextRevisionNumber = existing.document.latestRevisionNumber + 1;
+      // NFM-4983 / ADR-019 extension: probe the unvalidated actor.runId (agent
+      // JWT run_id claim / x-paperclip-run-id header) before it reaches
+      // document_revisions' run-id FK; a forged or stale id degrades to null
+      // instead of 500ing the already-succeeded case document write. Probe
+      // only — this insert runs inside the route transaction (ADR-019 residual).
+      const createdByRunId = await resolveRunIdForWrite(tx, actor.type === "agent" ? actor.runId : null, {
+        target: "document_revisions.created_by_run_id",
+        entityType: "pipeline_case",
+        entityId: caseId,
+        actorType: actor.type,
+        actorId: actor.type === "agent" ? actor.agentId : actor.type === "user" ? actor.userId : "unknown",
+      });
       const [restoredRevision] = await tx.insert(documentRevisions).values({
         companyId,
         documentId: existing.document.id,
@@ -1823,7 +1872,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         changeSummary: `Restored from revision ${sourceRevision.revisionNumber}`,
         createdByAgentId: actor.type === "agent" ? actor.agentId : null,
         createdByUserId: actor.type === "user" ? actor.userId : null,
-        createdByRunId: actor.type === "agent" ? actor.runId : null,
+        createdByRunId,
         createdAt: now,
       }).returning();
       const [document] = await tx.update(documents).set({

@@ -46,6 +46,7 @@ import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import { resolveRunIdForWrite } from "./run-attribution.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import {
@@ -281,6 +282,15 @@ export async function ensurePipelineCaseBodyDocumentFromSummary(
 
   const now = nowDate();
   const actorFields = documentActorFields(input.actor);
+  // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId` before
+  // it reaches document_revisions' run-id FK; a forged or stale id degrades
+  // to null instead of 500ing the case mutation. Probe only — callers may
+  // hold the transaction open (ADR-019 residual).
+  const actorRunIdForWrite = await resolveRunIdForWrite(dbOrTx, actorFields.runId ?? null, {
+    target: "document_revisions.created_by_run_id",
+    entityType: "pipeline_case",
+    entityId: input.caseId,
+  });
   const [document] = await dbOrTx.insert(documents).values({
     companyId: input.companyId,
     title: PIPELINE_CASE_BODY_DOCUMENT_TITLE,
@@ -304,7 +314,7 @@ export async function ensurePipelineCaseBodyDocumentFromSummary(
     changeSummary: "Created from pipeline item body",
     createdByAgentId: actorFields.agentId,
     createdByUserId: actorFields.userId,
-    createdByRunId: actorFields.runId,
+    createdByRunId: actorRunIdForWrite,
     createdAt: now,
   }).returning();
   const [updatedDocument] = await dbOrTx.update(documents).set({
@@ -2646,6 +2656,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     changeSummary: string,
   ) {
     const actorPatch = routineActorPatch(actor);
+    // NFM-4983 / ADR-019 extension: probe before routine_revisions' run-id
+    // FK; degrade a forged/stale actor.runId to null instead of 500ing the
+    // stage automation mutation. Probe only (ADR-019 residual in tx).
+    const actorRunIdForWrite = await resolveRunIdForWrite(dbOrTx, actorPatch.runId ?? null, {
+      target: "routine_revisions.created_by_run_id",
+      entityType: "routine",
+      entityId: routine.id,
+    });
     const revisionNumber = routine.latestRevisionId ? routine.latestRevisionNumber + 1 : 1;
     const [revision] = await dbOrTx
       .insert(routineRevisions)
@@ -2663,7 +2681,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         changeSummary,
         createdByAgentId: actorPatch.agentId,
         createdByUserId: actorPatch.userId,
-        createdByRunId: actorPatch.runId,
+        createdByRunId: actorRunIdForWrite,
       })
       .returning();
     const [updated] = await dbOrTx

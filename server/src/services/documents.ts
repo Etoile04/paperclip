@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
 import { isSystemIssueDocumentKey, issueDocumentKeySchema } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { resolveRunIdForWrite } from "./run-attribution.js";
 
 function normalizeDocumentKey(key: string) {
   const normalized = key.trim().toLowerCase();
@@ -216,6 +217,20 @@ export function documentService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!issue) throw notFound("Issue not found");
 
+      // NFM-4983 / ADR-019 extension: `input.createdByRunId` arrives from the
+      // caller's `actor.runId` (unvalidated agent JWT `run_id` claim or
+      // `x-paperclip-run-id` header) and may reference no heartbeat_runs row;
+      // writing it would fail document_revisions' run-id FK and 500 an
+      // already-succeeded document upsert. Probe once and degrade to null.
+      // Probe only: every revision insert below runs inside this function's
+      // transaction, where a failed statement poisons it (25P02) and a belt
+      // retry could never succeed (ADR-019 residual).
+      const createdByRunId = await resolveRunIdForWrite(db, input.createdByRunId ?? null, {
+        target: "document_revisions.created_by_run_id",
+        entityType: "issue_document",
+        entityId: `${input.issueId}:${input.key}`,
+      });
+
       const maxAttempts = input.lockedDocumentStrategy === "create_new_document" ? 3 : 1;
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
@@ -291,7 +306,7 @@ export function documentService(db: Db) {
                     changeSummary: input.changeSummary ?? null,
                     createdByAgentId: input.createdByAgentId ?? null,
                     createdByUserId: input.createdByUserId ?? null,
-                    createdByRunId: input.createdByRunId ?? null,
+                    createdByRunId,
                     createdAt: now,
                   })
                   .returning();
@@ -371,7 +386,7 @@ export function documentService(db: Db) {
                 changeSummary: input.changeSummary ?? null,
                 createdByAgentId: input.createdByAgentId ?? null,
                 createdByUserId: input.createdByUserId ?? null,
-                createdByRunId: input.createdByRunId ?? null,
+                createdByRunId,
                 createdAt: now,
               })
               .returning();
@@ -454,7 +469,7 @@ export function documentService(db: Db) {
               changeSummary: input.changeSummary ?? null,
               createdByAgentId: input.createdByAgentId ?? null,
               createdByUserId: input.createdByUserId ?? null,
-              createdByRunId: input.createdByRunId ?? null,
+              createdByRunId,
               createdAt: now,
             })
             .returning();

@@ -54,6 +54,7 @@ import {
 import { trackRoutineRun } from "@paperclipai/shared/telemetry";
 import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { resolveRunIdForWrite } from "./run-attribution.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
@@ -674,6 +675,18 @@ export function routineService(
       ));
     }
 
+    // NFM-4983 / ADR-019 extension: `actor.runId` is the unvalidated JWT
+    // claim / header value and may reference no heartbeat_runs row; the
+    // revision inserts below would fail document_revisions' run-id FK and 500
+    // an already-succeeded routine mutation. Probe once and degrade to null.
+    // Probe only: the inserts may run inside the caller's transaction, where a
+    // failed statement poisons it (25P02) — ADR-019 residual.
+    const createdByRunId = await resolveRunIdForWrite(executor, actor.runId ?? null, {
+      target: "document_revisions.created_by_run_id",
+      entityType: "routine_description_document",
+      entityId: routine.id,
+    });
+
     const now = new Date();
     const body = routine.description ?? "";
     const existing = await getRoutineDescriptionDocument(routine.id, executor);
@@ -693,7 +706,7 @@ export function routineService(
           changeSummary: options.changeSummary ?? null,
           createdByAgentId: actor.agentId ?? null,
           createdByUserId: actor.userId ?? null,
-          createdByRunId: actor.runId ?? null,
+          createdByRunId,
           createdAt: now,
         })
         .returning();
@@ -757,7 +770,7 @@ export function routineService(
         changeSummary: options.changeSummary ?? null,
         createdByAgentId: actor.agentId ?? null,
         createdByUserId: actor.userId ?? null,
-        createdByRunId: actor.runId ?? null,
+        createdByRunId,
         createdAt: now,
       })
       .returning();
@@ -805,6 +818,16 @@ export function routineService(
     const snapshot = await buildRoutineRevisionSnapshot(executor, routine);
     const nextRevisionNumber = routine.latestRevisionId ? routine.latestRevisionNumber + 1 : 1;
     const now = new Date();
+    // NFM-4983 / ADR-019 extension: probe `actor.runId` (unvalidated JWT
+    // claim / header) before it reaches routine_revisions' run-id FK; a
+    // forged or stale id degrades to null instead of 500ing the routine
+    // mutation. Probe only — callers may hold the transaction open
+    // (ADR-019 residual for in-transaction writers).
+    const createdByRunId = await resolveRunIdForWrite(executor, actor.runId ?? null, {
+      target: "routine_revisions.created_by_run_id",
+      entityType: "routine",
+      entityId: routine.id,
+    });
     const [revision] = await executor
       .insert(routineRevisions)
       .values({
@@ -818,7 +841,7 @@ export function routineService(
         restoredFromRevisionId: options.restoredFromRevisionId ?? null,
         createdByAgentId: actor.agentId ?? null,
         createdByUserId: actor.userId ?? null,
-        createdByRunId: actor.runId ?? null,
+        createdByRunId,
         createdAt: now,
       })
       .returning();
