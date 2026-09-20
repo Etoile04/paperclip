@@ -847,7 +847,10 @@ export const requestCheckboxConfirmationPayloadSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  // Bounded vocabulary. Out-of-band auto-expiry (healer cron, watchdogs) must
+  // record outcome="auto_expired" and put free-form provenance in `reason` —
+  // never mint new outcome values per rule (NFM-4974/NFM-4978 D1).
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "auto_expired"]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),

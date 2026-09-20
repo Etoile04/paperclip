@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type { RequestCheckboxConfirmationInteraction, RequestConfirmationInteraction } from "@paperclipai/shared";
 import {
   agents,
   companies,
@@ -27,6 +28,10 @@ import {
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import {
+  __resetInteractionResultFallbackMetricsForTests,
+  snapshotInteractionResultFallbackMetrics,
+} from "../metrics/interaction-result-fallback.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1802,6 +1807,188 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         id: created.id,
         status: "accepted",
       });
+    });
+  });
+
+  describe("read-path tolerance for malformed stored results (NFM-4978 D2)", () => {
+    beforeEach(() => {
+      __resetInteractionResultFallbackMetricsForTests();
+    });
+
+    async function seedIssueForDirectRowInserts(title = "Poisoned interactions") {
+      const companyId = randomUUID();
+      const goalId = randomUUID();
+      const issueId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+      await db.insert(goals).values({
+        id: goalId,
+        companyId,
+        title,
+        level: "task",
+        status: "active",
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        goalId,
+        title,
+        status: "in_progress",
+        priority: "medium",
+      });
+
+      return { companyId, goalId, issueId };
+    }
+
+    it("serves read-time fallbacks for expired rows of every kind and bumps the fallback metric", async () => {
+      const { issueId, companyId } = await seedIssueForDirectRowInserts();
+
+      // The historical NFM-4974 poison shape: out-of-band writers stored
+      // outcome values outside the enum.
+      const poisonedConfirmationResult = { version: 1, outcome: "auto_expired_healer" };
+
+      await db.insert(issueThreadInteractions).values([
+        {
+          id: randomUUID(),
+          companyId,
+          issueId,
+          kind: "request_confirmation",
+          status: "expired",
+          payload: { version: 1, prompt: "Ship the canary?" },
+          result: poisonedConfirmationResult,
+          resolvedAt: new Date(),
+        },
+        {
+          id: randomUUID(),
+          companyId,
+          issueId,
+          kind: "request_checkbox_confirmation",
+          status: "expired",
+          payload: { version: 1, prompt: "Pick follow-ups", options: [{ id: "opt-1", label: "One" }] },
+          result: poisonedConfirmationResult,
+          resolvedAt: new Date(),
+        },
+        {
+          id: randomUUID(),
+          companyId,
+          issueId,
+          kind: "ask_user_questions",
+          status: "expired",
+          payload: {
+            version: 1,
+            questions: [{
+              id: "q-1",
+              prompt: "Which region?",
+              selectionMode: "single",
+              options: [{ id: "o-1", label: "EU" }, { id: "o-2", label: "US" }],
+            }],
+          },
+          result: { version: 2, note: "written out-of-band" },
+          resolvedAt: new Date(),
+        },
+        {
+          id: randomUUID(),
+          companyId,
+          issueId,
+          kind: "suggest_tasks",
+          status: "expired",
+          payload: { version: 1, tasks: [{ clientKey: "t-1", title: "Follow up" }] },
+          result: { version: 2, note: "written out-of-band" },
+          resolvedAt: new Date(),
+        },
+      ]);
+
+      const hydrated = await interactionsSvc.listForIssue(issueId);
+      expect(hydrated).toHaveLength(4);
+
+      const confirmation = hydrated.find(
+        (i): i is RequestConfirmationInteraction => i.kind === "request_confirmation",
+      );
+      expect(confirmation?.status).toBe("expired");
+      expect(confirmation?.result).toMatchObject({ version: 1, outcome: "auto_expired" });
+      expect(confirmation?.result?.reason).toContain("read-time fallback (raw=");
+      expect(confirmation?.result?.reason).toContain("auto_expired_healer");
+
+      const checkbox = hydrated.find(
+        (i): i is RequestCheckboxConfirmationInteraction => i.kind === "request_checkbox_confirmation",
+      );
+      expect(checkbox?.result).toMatchObject({ version: 1, outcome: "auto_expired" });
+      expect(checkbox?.result?.reason).toContain("read-time fallback (raw=");
+
+      const questions = hydrated.find((i) => i.kind === "ask_user_questions");
+      expect(questions?.result).toEqual({
+        version: 1,
+        answers: [],
+        cancelled: true,
+        cancellationReason: expect.stringContaining("read-time fallback (raw="),
+      });
+
+      const suggested = hydrated.find((i) => i.kind === "suggest_tasks");
+      expect(suggested?.result).toEqual({
+        version: 1,
+        rejectionReason: expect.stringContaining("read-time fallback (raw="),
+      });
+
+      const snapshot = await snapshotInteractionResultFallbackMetrics();
+      expect(snapshot).toEqual({
+        suggest_tasks: 1,
+        ask_user_questions: 1,
+        request_confirmation: 1,
+        request_checkbox_confirmation: 1,
+      });
+    });
+
+    it("serves result null for malformed results on non-expired rows and still counts the event", async () => {
+      const { issueId, companyId } = await seedIssueForDirectRowInserts();
+
+      await db.insert(issueThreadInteractions).values({
+        id: randomUUID(),
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        payload: { version: 1, prompt: "Still pending?" },
+        result: { version: 1, outcome: "auto_expired_healer" },
+      });
+
+      const hydrated = await interactionsSvc.listForIssue(issueId);
+      expect(hydrated).toHaveLength(1);
+      expect(hydrated[0]!.status).toBe("pending");
+      expect(hydrated[0]!.result).toBeNull();
+
+      const snapshot = await snapshotInteractionResultFallbackMetrics();
+      expect(snapshot["request_confirmation"]).toBe(1);
+    });
+
+    it("hydrates the post-D1 auto_expired outcome without triggering any fallback", async () => {
+      const { issueId, companyId } = await seedIssueForDirectRowInserts();
+
+      await db.insert(issueThreadInteractions).values({
+        id: randomUUID(),
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "expired",
+        payload: { version: 1, prompt: "Ship the canary?" },
+        result: { version: 1, outcome: "auto_expired", reason: "nfmd-pending-healer" },
+        resolvedAt: new Date(),
+      });
+
+      const hydrated = await interactionsSvc.listForIssue(issueId);
+      expect(hydrated[0]!.result).toEqual({
+        version: 1,
+        outcome: "auto_expired",
+        reason: "nfmd-pending-healer",
+      });
+
+      const snapshot = await snapshotInteractionResultFallbackMetrics();
+      expect(Object.values(snapshot).every((value) => value === 0)).toBe(true);
     });
   });
 });

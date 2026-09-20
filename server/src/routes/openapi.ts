@@ -2989,6 +2989,14 @@ registry.registerPath({
   path: "/api/issues/{id}/interactions",
   tags: ["issues"],
   summary: "List issue thread interactions",
+  description:
+    "Interactions that expire out-of-band (healer cron, watchdogs) resolve with " +
+    "`result.outcome = \"auto_expired\"` (request_confirmation and " +
+    "request_checkbox_confirmation); free-form expiry provenance lives in `result.reason`. " +
+    "Auto-expiry does NOT fire a `wake_assignee` continuation — the assignee is only woken " +
+    "when a board user or agent resolves the interaction through the API. Rows whose stored " +
+    "`result` predates this contract are hydrated with a read-time fallback rather than " +
+    "failing this route.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
