@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog } from "@paperclipai/db";
+import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { publishLiveEvent } from "./live-events.js";
@@ -62,6 +63,27 @@ export interface LogActivityInput {
   details?: Record<string, unknown> | null;
 }
 
+const ACTIVITY_LOG_RUN_ID_FK = "activity_log_run_id_heartbeat_runs_id_fk";
+
+/**
+ * True when `err` is a Postgres foreign-key violation on activity_log.run_id.
+ * Drizzle may wrap the driver error in a `DrizzleQueryError`, so the original
+ * error is also inspected via `cause`. The constraint field is spelled
+ * `constraint` on node-pg errors and `constraint_name` on postgres.js errors;
+ * both shapes are accepted.
+ */
+function isRunIdForeignKeyViolation(err: unknown): boolean {
+  const candidates = [err, (err as { cause?: unknown } | null | undefined)?.cause];
+  return candidates.some((candidate) => {
+    const e = candidate as
+      | { code?: string; constraint?: string; constraint_name?: string }
+      | null
+      | undefined;
+    const constraint = e?.constraint ?? e?.constraint_name;
+    return e?.code === "23503" && constraint === ACTIVITY_LOG_RUN_ID_FK;
+  });
+}
+
 export async function logActivity(db: Db, input: LogActivityInput) {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
@@ -70,7 +92,37 @@ export async function logActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = sanitizedDetails
     ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
     : null;
-  await db.insert(activityLog).values({
+
+  // NFM-4977 / ADR-019: `actor.runId` may originate from an unvalidated agent
+  // JWT `run_id` claim or an `x-paperclip-run-id` header and reference no
+  // heartbeat_runs row. Writing it would violate activity_log's run_id FK and
+  // 500 an already-succeeded operation, so probe once and degrade to null
+  // instead of rejecting the write.
+  let runId = input.runId ?? null;
+  if (runId) {
+    const exists = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    if (!exists) {
+      logger.warn(
+        {
+          runId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          action: input.action,
+          entityType: input.entityType,
+          entityId: input.entityId,
+        },
+        "activity log run id does not reference a heartbeat run; dropping run attribution",
+      );
+      runId = null;
+    }
+  }
+
+  const values = {
     companyId: input.companyId,
     actorType: input.actorType,
     actorId: input.actorId,
@@ -78,9 +130,22 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     entityType: input.entityType,
     entityId: input.entityId,
     agentId: input.agentId ?? null,
-    runId: input.runId ?? null,
+    runId,
     details: redactedDetails,
-  });
+  };
+
+  try {
+    await db.insert(activityLog).values(values);
+  } catch (err) {
+    // Belt for the probe→insert race (run row deleted in between, e.g. by a
+    // company/agent teardown cascade): retry once without run attribution.
+    if (runId === null || !isRunIdForeignKeyViolation(err)) throw err;
+    logger.warn(
+      { err, runId, actorType: input.actorType, actorId: input.actorId, action: input.action },
+      "activity log insert hit the run_id foreign key after the existence probe; retrying without run attribution",
+    );
+    await db.insert(activityLog).values({ ...values, runId: null });
+  }
 
   publishLiveEvent({
     companyId: input.companyId,
@@ -92,7 +157,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       entityType: input.entityType,
       entityId: input.entityId,
       agentId: input.agentId ?? null,
-      runId: input.runId ?? null,
+      runId,
       details: redactedDetails,
     },
   });
@@ -111,7 +176,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       payload: {
         ...redactedDetails,
         agentId: input.agentId ?? null,
-        runId: input.runId ?? null,
+        runId,
       },
     };
     publishPluginDomainEvent(event);
