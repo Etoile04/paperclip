@@ -489,6 +489,32 @@ function isRepeatedProductiveContinuationRecovery(latestRun: SuccessfulLatestIss
     isProductiveContinuationRun(latestRun);
 }
 
+export type ContinuationSeedCoverageDecision =
+  | { kind: "proceed" }
+  | {
+      kind: "skip";
+      reason: "future_monitor_next_check_at" | "liveness_fanout_opt_out";
+    };
+
+// NFM-5137: seed-time coverage check for the continuation enqueue sites. A
+// future scheduled monitor check (issue.monitorNextCheckAt) or a liveness
+// fan-out opt-out (issue.livenessFanoutOptOut) means the issue already has a
+// live continuation path — seeding another continuation wake for such issues
+// caused the NFM-5131 runaway continuation-storm. Scoped to continuation
+// enqueue sites only: the todo assignment-dispatch branch stays untouched.
+export function decideContinuationSeedCoverage(
+  issue: Pick<typeof issues.$inferSelect, "monitorNextCheckAt" | "livenessFanoutOptOut">,
+  now: Date,
+): ContinuationSeedCoverageDecision {
+  if (issue.monitorNextCheckAt != null && issue.monitorNextCheckAt.getTime() > now.getTime()) {
+    return { kind: "skip", reason: "future_monitor_next_check_at" };
+  }
+  if (issue.livenessFanoutOptOut === true) {
+    return { kind: "skip", reason: "liveness_fanout_opt_out" };
+  }
+  return { kind: "proceed" };
+}
+
 function parseLivenessIncidentKey(incidentKey: string | null | undefined) {
   if (!incidentKey) return null;
   return parseIssueGraphLivenessIncidentKey(incidentKey);
@@ -3172,6 +3198,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       assignmentDispatched: 0,
       dispatchRequeued: 0,
       continuationRequeued: 0,
+      continuationCovered: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
@@ -3400,6 +3427,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        // NFM-5137: a future scheduled monitor or a liveness fan-out opt-out
+        // already covers this issue — do not seed another continuation wake.
+        const coverage = decideContinuationSeedCoverage(issue, new Date());
+        if (coverage.kind === "skip") {
+          logger.info(
+            {
+              issueId: issue.id,
+              identifier: issue.identifier,
+              reason: coverage.reason,
+              monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
+              livenessFanoutOptOut: issue.livenessFanoutOptOut ?? null,
+            },
+            "continuation seed skipped: issue already covered by a live path (issue.productive_terminal_continuation_recovery)",
+          );
+          result.skipped += 1;
+          result.continuationCovered += 1;
+          continue;
+        }
+
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
           agentId,
@@ -3492,6 +3538,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {
         result.skipped += 1;
+        continue;
+      }
+
+      // NFM-5137: a future scheduled monitor or a liveness fan-out opt-out
+      // already covers this issue — do not seed another continuation wake.
+      const coverage = decideContinuationSeedCoverage(issue, new Date());
+      if (coverage.kind === "skip") {
+        logger.info(
+          {
+            issueId: issue.id,
+            identifier: issue.identifier,
+            reason: coverage.reason,
+            monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
+            livenessFanoutOptOut: issue.livenessFanoutOptOut ?? null,
+          },
+          "continuation seed skipped: issue already covered by a live path (issue.continuation_recovery)",
+        );
+        result.skipped += 1;
+        result.continuationCovered += 1;
         continue;
       }
 
