@@ -1072,6 +1072,119 @@ export function recoveryService(
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
   },
 ) {
+export type ContinuationSeedCoverageDecision =
+  | { kind: "proceed" }
+  | {
+      kind: "skip";
+      reason: "future_monitor_next_check_at" | "liveness_fanout_opt_out";
+    };
+
+// NFM-5137: seed-time coverage check for the continuation enqueue sites. A
+// future scheduled monitor check (issue.monitorNextCheckAt) or a liveness
+// fan-out opt-out (issue.livenessFanoutOptOut) means the issue already has a
+// live continuation path — seeding another continuation wake for such issues
+// caused the NFM-5131 runaway continuation-storm. Scoped to continuation
+// enqueue sites only: the todo assignment-dispatch branch stays untouched.
+export function decideContinuationSeedCoverage(
+  issue: Pick<typeof issues.$inferSelect, "monitorNextCheckAt" | "livenessFanoutOptOut">,
+  now: Date,
+): ContinuationSeedCoverageDecision {
+  if (issue.monitorNextCheckAt != null && issue.monitorNextCheckAt.getTime() > now.getTime()) {
+    return { kind: "skip", reason: "future_monitor_next_check_at" };
+  }
+  if (issue.livenessFanoutOptOut === true) {
+    return { kind: "skip", reason: "liveness_fanout_opt_out" };
+  }
+  return { kind: "proceed" };
+}
+
+function parseLivenessIncidentKey(incidentKey: string | null | undefined) {
+  if (!incidentKey) return null;
+  return parseIssueGraphLivenessIncidentKey(incidentKey);
+}
+
+function livenessRecoveryLeafIssueId(finding: IssueLivenessFinding) {
+  return finding.recoveryIssueId;
+}
+
+function livenessRecoveryLeafFingerprint(finding: IssueLivenessFinding) {
+  return buildIssueGraphLivenessLeafKey({
+    companyId: finding.companyId,
+    state: finding.state,
+    leafIssueId: livenessRecoveryLeafIssueId(finding),
+  });
+}
+
+function livenessRecoveryLeafKey(companyId: string, state: string, leafIssueId: string) {
+  return buildIssueGraphLivenessLeafKey({ companyId, state, leafIssueId });
+}
+
+function isUniqueLivenessRecoveryConflict(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const maybe = error as { code?: string; constraint?: string; message?: string };
+  return maybe.code === "23505" &&
+    (
+      maybe.constraint === "issues_active_liveness_recovery_incident_uq" ||
+      maybe.constraint === "issues_active_liveness_recovery_leaf_uq" ||
+      typeof maybe.message === "string" &&
+        (
+          maybe.message.includes("issues_active_liveness_recovery_incident_uq") ||
+          maybe.message.includes("issues_active_liveness_recovery_leaf_uq")
+        )
+    );
+}
+
+function formatDependencyPath(finding: IssueLivenessFinding) {
+  return finding.dependencyPath
+    .map((entry) => entry.identifier ?? entry.issueId)
+    .join(" -> ");
+}
+
+function buildLivenessEscalationDescription(finding: IssueLivenessFinding) {
+  const source = finding.dependencyPath[0];
+  const recovery = finding.dependencyPath.find((entry) => entry.issueId === finding.recoveryIssueId);
+  const selectedOwner = finding.recommendedOwnerAgentId ?? "none";
+
+  return [
+    "Paperclip detected a harness-level issue graph liveness incident.",
+    "",
+    "## Source",
+    "",
+    `- Source issue: ${source?.identifier ?? source?.issueId ?? finding.issueId}`,
+    `- Recovery target issue: ${recovery?.identifier ?? recovery?.issueId ?? finding.recoveryIssueId}`,
+    `- Incident key: \`${finding.incidentKey}\``,
+    `- Detected invariant: \`${finding.state}\``,
+    `- Dependency path: ${formatDependencyPath(finding)}`,
+    `- Reason: ${finding.reason}`,
+    "",
+    "## Ownership",
+    "",
+    `- Selected owner agent: \`${selectedOwner}\``,
+    `- Candidate owner agents: ${finding.recommendedOwnerCandidateAgentIds.length > 0 ? finding.recommendedOwnerCandidateAgentIds.map((id) => `\`${id}\``).join(", ") : "none"}`,
+    "",
+    "## Next Action",
+    "",
+    finding.recommendedAction,
+    "",
+    "Resolve the blocked chain, then mark this escalation issue done so the original issue can resume when all blockers are cleared.",
+  ].join("\n");
+}
+
+function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escalation: typeof issues.$inferSelect) {
+  return [
+    "Paperclip detected a harness-level liveness incident in this issue's dependency graph.",
+    "",
+    `- Escalation issue: ${escalation.identifier ?? escalation.id}`,
+    `- Incident key: \`${finding.incidentKey}\``,
+    `- Finding: \`${finding.state}\``,
+    `- Dependency path: ${formatDependencyPath(finding)}`,
+    `- Reason: ${finding.reason}`,
+    `- Manager action requested: ${finding.recommendedAction}`,
+    "",
+    "This issue now keeps its existing blockers and is also blocked by the escalation issue so dependency wakeups remain explicit.",
+  ].join("\n");
+}
+
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -5663,6 +5776,7 @@ export function recoveryService(
       dispatchRequeued: 0,
       continuationRequeued: 0,
       dispositionRepairRequeued: 0,
+      continuationCovered: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
@@ -6698,6 +6812,25 @@ export function recoveryService(
           continue;
         }
 
+        // NFM-5137: a future scheduled monitor or a liveness fan-out opt-out
+        // already covers this issue — do not seed another continuation wake.
+        const coverage = decideContinuationSeedCoverage(issue, new Date());
+        if (coverage.kind === "skip") {
+          logger.info(
+            {
+              issueId: issue.id,
+              identifier: issue.identifier,
+              reason: coverage.reason,
+              monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
+              livenessFanoutOptOut: issue.livenessFanoutOptOut ?? null,
+            },
+            "continuation seed skipped: issue already covered by a live path (issue.productive_terminal_continuation_recovery)",
+          );
+          result.skipped += 1;
+          result.continuationCovered += 1;
+          continue;
+        }
+
         const queued = await enqueueStrandedIssueRecovery({
           issueId: issue.id,
           agentId,
@@ -6816,6 +6949,25 @@ export function recoveryService(
       }
 
       const recoveryOutcome: { retryExhausted?: boolean } = {};
+      // NFM-5137: a future scheduled monitor or a liveness fan-out opt-out
+      // already covers this issue — do not seed another continuation wake.
+      const coverage = decideContinuationSeedCoverage(issue, new Date());
+      if (coverage.kind === "skip") {
+        logger.info(
+          {
+            issueId: issue.id,
+            identifier: issue.identifier,
+            reason: coverage.reason,
+            monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
+            livenessFanoutOptOut: issue.livenessFanoutOptOut ?? null,
+          },
+          "continuation seed skipped: issue already covered by a live path (issue.continuation_recovery)",
+        );
+        result.skipped += 1;
+        result.continuationCovered += 1;
+        continue;
+      }
+
       const queued = await enqueueStrandedIssueRecovery({
         issueId: issue.id,
         agentId,
