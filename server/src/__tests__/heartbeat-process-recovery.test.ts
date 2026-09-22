@@ -3903,6 +3903,187 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  // NFM-5137: seed-time coverage skip. A future scheduled monitor check or a
+  // liveness fan-out opt-out means the issue already has a live continuation
+  // path — the stranded scan must NOT enqueue another continuation seed for
+  // it (NFM-5131 continuation-storm root cause; regression shapes NFM-5119
+  // optOut=t, NFM-4954 future monitor, NFM-5102 future monitor).
+  describe("continuation seed-time coverage skip (NFM-5137)", () => {
+    const futureMonitor = () => new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pastMonitor = () => new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    async function setIssueCoverage(
+      issueId: string,
+      coverage: { monitorNextCheckAt?: Date | null; livenessFanoutOptOut?: boolean | null },
+    ) {
+      await db.update(issues).set(coverage).where(eq(issues.id, issueId));
+    }
+
+    it("skips the productive-terminal continuation seed when a future monitor check covers the issue", async () => {
+      const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        livenessState: "advanced",
+      });
+      await setIssueCoverage(issueId, { monitorNextCheckAt: futureMonitor() });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.continuationCovered).toBe(1);
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.id).toBe(runId);
+
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(1);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe("in_progress");
+    });
+
+    it("skips the general continuation seed when a future monitor check covers the issue", async () => {
+      const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "process_lost",
+      });
+      await setIssueCoverage(issueId, { monitorNextCheckAt: futureMonitor() });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.continuationCovered).toBe(1);
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.id).toBe(runId);
+
+      const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(1);
+    });
+
+    it("still enqueues the productive-terminal continuation seed when the monitor check is in the past", async () => {
+      const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        livenessState: "advanced",
+      });
+      await setIssueCoverage(issueId, { monitorNextCheckAt: pastMonitor() });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(1);
+      expect(result.continuationCovered).toBe(0);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const retryRun = runs.find((row) => row.id !== runId);
+      expect(retryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+        issueId,
+        retryReason: "issue_continuation_needed",
+        source: "issue.productive_terminal_continuation_recovery",
+      });
+      if (retryRun) {
+        await waitForRunToSettle(heartbeat, retryRun.id);
+      }
+    });
+
+    it("still enqueues the general continuation seed when the monitor check is in the past", async () => {
+      const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "process_lost",
+      });
+      await setIssueCoverage(issueId, { monitorNextCheckAt: pastMonitor() });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(1);
+      expect(result.continuationCovered).toBe(0);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const retryRun = runs.find((row) => row.id !== runId);
+      expect(retryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+        issueId,
+        retryReason: "issue_continuation_needed",
+        source: "issue.continuation_recovery",
+      });
+      if (retryRun) {
+        await waitForRunToSettle(heartbeat, retryRun.id);
+      }
+    });
+
+    it("skips the continuation seed when the issue opted out of liveness fan-out (NFM-5119 shape)", async () => {
+      const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "process_lost",
+      });
+      await setIssueCoverage(issueId, { livenessFanoutOptOut: true });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.continuationCovered).toBe(1);
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.id).toBe(runId);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe("in_progress");
+    });
+
+    it("still enqueues the continuation seed with no monitor and no fan-out opt-out (current behavior)", async () => {
+      const { issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "process_lost",
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(1);
+      expect(result.continuationCovered).toBe(0);
+      expect(result.issueIds).toEqual([issueId]);
+    });
+
+    it("leaves the todo assignment-dispatch branch unaffected by the coverage skip", async () => {
+      const { agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "failed",
+        runErrorCode: "process_lost",
+      });
+      await setIssueCoverage(issueId, { monitorNextCheckAt: futureMonitor() });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.dispatchRequeued).toBe(1);
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.continuationCovered).toBe(0);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const retryRun = runs.find((row) => row.contextSnapshot && (row.contextSnapshot as Record<string, unknown>).retryReason === "assignment_recovery");
+      expect(retryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+        issueId,
+        retryReason: "assignment_recovery",
+      });
+      if (retryRun) {
+        await waitForRunToSettle(heartbeat, retryRun.id);
+      }
+    });
+  });
+
   it("reuses the raced stranded recovery issue when duplicate active recovery creation conflicts", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
