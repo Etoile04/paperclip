@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { gunzipSync } from "node:zlib";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
@@ -35,6 +36,55 @@ async function createSiblingDatabase(connectionString: string, databaseName: str
   const targetUrl = new URL(connectionString);
   targetUrl.pathname = `/${databaseName}`;
   return targetUrl.toString();
+}
+
+/**
+ * Partitioned parent + declarative partition, each carrying a distinctive row
+ * marker so dump leaks are detectable.
+ */
+async function createPartitionedEventTables(connectionString: string): Promise<void> {
+  const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+  try {
+    await sql.unsafe(`
+      CREATE TABLE "public"."partitioned_events" (
+        "id" serial,
+        "note" text NOT NULL,
+        "created_at" timestamptz NOT NULL,
+        CONSTRAINT "partitioned_events_pk" PRIMARY KEY ("id", "created_at")
+      ) PARTITION BY RANGE ("created_at");
+      CREATE TABLE "public"."partitioned_events_2026_09" PARTITION OF "public"."partitioned_events"
+        FOR VALUES FROM ('2026-09-01T00:00:00Z') TO ('2026-10-01T00:00:00Z');
+      INSERT INTO "public"."partitioned_events" ("note", "created_at")
+      VALUES ('nfm5187-partition-row', '2026-09-15T00:00:00Z');
+    `);
+  } finally {
+    await sql.end();
+  }
+}
+
+/**
+ * Ordinary parent + traditional-inheritance child (INHERITS cannot target a
+ * partitioned table, so this case needs its own parent).
+ */
+async function createLegacyInheritanceTables(connectionString: string): Promise<void> {
+  const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+  try {
+    await sql.unsafe(`
+      CREATE TABLE "public"."legacy_parent" (
+        "id" integer NOT NULL,
+        "note" text NOT NULL
+      );
+      INSERT INTO "public"."legacy_parent" ("id", "note")
+      VALUES (5001, 'nfm5187-legacy-row');
+      CREATE TABLE "public"."legacy_parent_child" (
+        "child_extra" text
+      ) INHERITS ("public"."legacy_parent");
+      INSERT INTO "public"."legacy_parent_child" ("id", "note")
+      VALUES (9001, 'nfm5187-legacy-child-row');
+    `);
+  } finally {
+    await sql.end();
+  }
 }
 
 afterEach(async () => {
@@ -405,6 +455,147 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       } finally {
         await sourceSql.end();
         await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "cascades excludeTables to partitions and inheritance children of a partitioned table (NFM-5184 AC3)",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      await createPartitionedEventTables(sourceConnectionString);
+      await createLegacyInheritanceTables(sourceConnectionString);
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_partition_cascade_target",
+      );
+      const backupDir = createTempDir("paperclip-db-partition-cascade-");
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        // Worktree-seed shape: forced JavaScript engine + exact-name parent exclusion.
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-partition-cascade-test",
+          backupEngine: "javascript",
+          excludeTables: ["partitioned_events", "legacy_parent"],
+        });
+
+        const dumpText = gunzipSync(fs.readFileSync(result.backupFile)).toString("utf8");
+        expect(dumpText).not.toContain("partitioned_events_2026_09");
+        expect(dumpText).not.toContain("legacy_parent_child");
+        expect(dumpText).not.toContain("nfm5187-partition-row");
+        expect(dumpText).not.toContain("nfm5187-legacy-row");
+        expect(dumpText).not.toContain("nfm5187-legacy-child-row");
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        const remaining = await restoreSql.unsafe<{ table_name: string }[]>(`
+          SELECT table_name
+          FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN (
+              'partitioned_events',
+              'partitioned_events_2026_09',
+              'legacy_parent',
+              'legacy_parent_child'
+            )
+          ORDER BY table_name
+        `);
+        // Excluded ordinary tables keep their (empty) schema — historical
+        // behavior; everything cascaded from an exclusion is gone.
+        expect(remaining).toEqual([{ table_name: "legacy_parent" }]);
+      } finally {
+        await restoreSql.end();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "fails closed when a partitioned table would be included in a JavaScript-engine backup (NFM-5184 AC4)",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      await createPartitionedEventTables(sourceConnectionString);
+      const backupDir = createTempDir("paperclip-db-partition-fail-closed-");
+
+      const backupError = await runDatabaseBackup({
+        connectionString: sourceConnectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        filenamePrefix: "paperclip-partition-fail-closed-test",
+        backupEngine: "javascript",
+      }).then(
+        () => {
+          throw new Error("expected runDatabaseBackup to reject");
+        },
+        (error: unknown) => error,
+      );
+
+      expect(backupError).toBeInstanceOf(Error);
+      const message = (backupError as Error).message;
+      expect(message).toContain("partitioned");
+      expect(message).toContain("public.partitioned_events");
+      expect(message).toContain("pg_dump");
+      expect(message).toContain("excludeTables");
+
+      const leftoverArtifacts = fs.readdirSync(backupDir);
+      expect(leftoverArtifacts).toEqual([]);
+    },
+    60_000,
+  );
+
+  it(
+    "warns with the pg_dump error before auto-falling back to the JavaScript engine",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-fallback-warning-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const previousPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/nonexistent/nfm5187-pg-dump";
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."fallback_records" (
+            "id" serial PRIMARY KEY,
+            "note" text NOT NULL
+          );
+          INSERT INTO "public"."fallback_records" ("note")
+          VALUES ('nfm5187-fallback-row');
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-fallback-warning-test",
+          backupEngine: "auto",
+        });
+
+        const dumpText = gunzipSync(fs.readFileSync(result.backupFile)).toString("utf8");
+        expect(dumpText).toContain("nfm5187-fallback-row");
+
+        const fallbackWarnings = warnSpy.mock.calls
+          .map((call) => String(call[0]))
+          .filter((text) => text.includes("falling back"));
+        expect(fallbackWarnings).toHaveLength(1);
+        expect(fallbackWarnings[0]).toContain("pg_dump");
+        expect(fallbackWarnings[0]).toContain("ENOENT");
+      } finally {
+        warnSpy.mockRestore();
+        if (previousPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = previousPgDumpPath;
+        }
+        await sourceSql.end();
       }
     },
     60_000,

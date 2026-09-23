@@ -59,6 +59,14 @@ type SequenceDefinition = {
 type TableDefinition = {
   schema_name: string;
   tablename: string;
+  relkind: string;
+};
+
+type TableInheritanceEdge = {
+  child_schema: string;
+  child_table: string;
+  parent_schema: string;
+  parent_table: string;
 };
 
 type ExtensionDefinition = {
@@ -70,6 +78,9 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+
+// pg_class.relkind for a partitioned table (PARTITION BY parent).
+const PARTITIONED_TABLE_RELKIND = "p";
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -309,6 +320,18 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   if (result.code !== 0) {
     throw new Error(`${label} failed with exit code ${result.code ?? "unknown"}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
   }
+}
+
+/**
+ * The "auto" engine falls back to the JavaScript engine whenever pg_dump
+ * fails. That fallback must be audible: a pg_dump failure (e.g. a client
+ * version mismatch) previously degraded every transform-free backup silently.
+ */
+function warnPgDumpEngineFallback(error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.warn(
+    `paperclip database backup: pg_dump engine failed (${detail}); falling back to the JavaScript backup engine`,
+  );
 }
 
 async function runPgDumpBackup(opts: {
@@ -563,6 +586,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         if (backupEngine === "pg_dump") {
           throw error;
         }
+        warnPgDumpEngineFallback(error);
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
         sqlClosed = false;
       }
@@ -588,13 +612,70 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emit("");
 
     const allTables = await sql<TableDefinition[]>`
-      SELECT table_schema AS schema_name, table_name AS tablename
-      FROM information_schema.tables
-      WHERE table_type = 'BASE TABLE'
-        AND ${sql.unsafe(nonSystemSchemaPredicate("table_schema"))}
-      ORDER BY table_schema, table_name
+      SELECT t.table_schema AS schema_name, t.table_name AS tablename, c.relkind
+      FROM information_schema.tables t
+      JOIN pg_class c ON c.relname = t.table_name
+      JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.table_schema
+      WHERE t.table_type = 'BASE TABLE'
+        AND ${sql.unsafe(nonSystemSchemaPredicate("t.table_schema"))}
+      ORDER BY t.table_schema, t.table_name
     `;
-    const tables = allTables;
+
+    // Partition-safe table selection (NFM-5184 Phase-0):
+    // - exclusions cascade through pg_inherits to partitions and (cheaply)
+    //   traditional-inheritance children of any excluded table;
+    // - an excluded partitioned table is dropped entirely because the engine
+    //   cannot represent it as flat DDL either;
+    // - an included partitioned table aborts the backup (fail-closed): this
+    //   engine has no PARTITION BY / ATTACH PARTITION emission, so dumping one
+    //   would produce a structurally broken restore.
+    const inheritEdges = await sql<TableInheritanceEdge[]>`
+      SELECT child_ns.nspname AS child_schema,
+             child.relname AS child_table,
+             parent_ns.nspname AS parent_schema,
+             parent.relname AS parent_table
+      FROM pg_inherits inh
+      JOIN pg_class child ON child.oid = inh.inhrelid
+      JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
+      JOIN pg_class parent ON parent.oid = inh.inhparent
+      JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
+    `;
+    const parentsByChild = new Map<string, string[]>();
+    for (const edge of inheritEdges) {
+      const childKey = tableKey(edge.child_schema, edge.child_table);
+      const parents = parentsByChild.get(childKey) ?? [];
+      parents.push(tableKey(edge.parent_schema, edge.parent_table));
+      parentsByChild.set(childKey, parents);
+    }
+    const excludedAncestorByTable = new Map<string, boolean>();
+    const hasExcludedAncestor = (table: string): boolean => {
+      const cached = excludedAncestorByTable.get(table);
+      if (cached !== undefined) return cached;
+      // Guard against inheritance cycles while the walk is in flight.
+      excludedAncestorByTable.set(table, false);
+      const excluded = (parentsByChild.get(table) ?? []).some(
+        (parent) => excludedTableNames.has(parent) || hasExcludedAncestor(parent),
+      );
+      excludedAncestorByTable.set(table, excluded);
+      return excluded;
+    };
+    const tables = allTables.filter(({ schema_name, tablename, relkind }) => {
+      const key = tableKey(schema_name, tablename);
+      if (hasExcludedAncestor(key)) return false;
+      if (excludedTableNames.has(key) && relkind === PARTITIONED_TABLE_RELKIND) return false;
+      return true;
+    });
+    const partitionedIncludedTables = tables
+      .filter(({ relkind }) => relkind === PARTITIONED_TABLE_RELKIND)
+      .map(({ schema_name, tablename }) => tableKey(schema_name, tablename));
+    if (partitionedIncludedTables.length > 0) {
+      throw new Error(
+        `JavaScript backup engine cannot dump partitioned table(s): ${partitionedIncludedTables.join(", ")}. ` +
+          `This engine has no PARTITION BY / ATTACH PARTITION support, so dumping them as flat tables would produce a structurally broken restore. ` +
+          `Use the pg_dump backup engine (backupEngine "pg_dump", or "auto" without excludeTables/nullifyColumns) ` +
+          `or add the partitioned table(s) to excludeTables.`,
+      );
+    }
     const includedTableNames = new Set(tables.map(({ schema_name, tablename }) => tableKey(schema_name, tablename)));
     const includedSchemas = new Set(tables.map(({ schema_name }) => schema_name));
 
