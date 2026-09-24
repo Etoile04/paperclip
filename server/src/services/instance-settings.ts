@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { companies, instanceSettings } from "@paperclipai/db";
+import { DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS } from "@paperclipai/shared";
 
 /**
  * A `Db` or an open transaction handle — the subset of query builders the

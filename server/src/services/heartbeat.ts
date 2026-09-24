@@ -18728,6 +18728,162 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
+  // Shared process_lost finalization used by reapOrphanedRuns (dead/detached
+  // children discovered after a server restart) and by the shutdown drain.
+  async function finalizeProcessLostRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    input: {
+      adapterType: string;
+      adapterConfig: Record<string, unknown> | null;
+      tracksLocalChild: boolean;
+      descendantOnlyCleanup?: boolean;
+      messageOverride?: string;
+      startNextQueued?: boolean;
+      now?: Date;
+      monitorDispatchLostWithoutFutureWake?: boolean;
+    },
+  ): Promise<{ finalizedRun: typeof heartbeatRuns.$inferSelect; retriedRun: typeof heartbeatRuns.$inferSelect | null } | null> {
+    const now = input.now ?? new Date();
+    const shouldRetry =
+      (run.processLossRetryCount ?? 0) < 1 &&
+      ((input.tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
+        input.monitorDispatchLostWithoutFutureWake === true);
+    const baseMessage =
+      input.messageOverride ?? buildProcessLossMessage(run, input.descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+    const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
+
+    const failureWrite = await setRunStatusFromLive(
+      run.id,
+      "failed",
+      ["running"],
+      {
+        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        errorCode: "process_lost",
+        finishedAt: now,
+        resultJson: mergeRunStopMetadataForAgent(
+          { adapterType: input.adapterType, adapterConfig: input.adapterConfig ?? {} },
+          "failed",
+          {
+            conversationContinuationEligible,
+            resultJson: parseObject(run.resultJson),
+            errorCode: "process_lost",
+            errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+          },
+        ),
+      },
+    );
+    if (!failureWrite.updated || !failureWrite.run) return null;
+    let finalizedRun: typeof heartbeatRuns.$inferSelect | null = failureWrite.run;
+    await setWakeupStatus(run.wakeupRequestId, "failed", {
+      finishedAt: now,
+      error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+    });
+    if (!finalizedRun) finalizedRun = await getRun(run.id);
+    if (!finalizedRun) return null;
+    finalizedRun =
+      (await classifyAndPersistRunLiveness(
+        finalizedRun,
+        parseObject(finalizedRun.resultJson),
+      )) ?? finalizedRun;
+    await releaseEnvironmentLeasesForRun({
+      runId: finalizedRun.id,
+      companyId: finalizedRun.companyId,
+      agentId: finalizedRun.agentId,
+      status: finalizedRun.status,
+      failureReason: finalizedRun.error ?? undefined,
+    });
+
+    let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+    const retryAgent = await getAgent(run.agentId);
+    if (shouldRetry) {
+      if (retryAgent) {
+        retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+      }
+    } else if (retryAgent) {
+      const scheduled =
+        await scheduleInteractionContinuationInfrastructureRetryIfEligible(
+          finalizedRun,
+          retryAgent,
+        );
+      retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
+    }
+    if (!retriedRun) {
+      await releaseIssueExecutionAndPromote(finalizedRun);
+    }
+
+    await appendRunEvent(finalizedRun, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "error",
+      message: shouldRetry
+        ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
+        : baseMessage,
+      payload: {
+        ...(run.processPid ? { processPid: run.processPid } : {}),
+        ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+        ...(input.descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
+        ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    if (input.startNextQueued !== false) {
+      await startNextQueuedRunForAgent(run.agentId);
+    }
+    return { finalizedRun, retriedRun };
+  }
+
+  // Shutdown drain (NFM-4785): terminate tracked adapter children and
+  // finalize their runs before the process exits, so a deploy restart cannot
+  // orphan a live child against a severed output channel. Runs without a
+  // tracked child are left for the next boot's startup reap.
+  async function terminateActiveRunsForShutdown() {
+    const terminated: string[] = [];
+    for (const runId of [...runningProcesses.keys()]) {
+      const entry = runningProcesses.get(runId) ?? null;
+      const run = await getRun(runId).catch(() => null);
+      if (!run || isHeartbeatRunTerminalStatus(run.status)) {
+        runningProcesses.delete(runId);
+        continue;
+      }
+      const pid = run.processPid ?? entry?.child.pid ?? null;
+      const processGroupId = run.processGroupId ?? entry?.processGroupId ?? null;
+      if (typeof pid === "number" || typeof processGroupId === "number") {
+        await terminateHeartbeatRunProcess({
+          pid,
+          processGroupId,
+          graceMs: Math.min((entry?.graceSec ?? 5) * 1000, 10_000),
+        });
+      }
+      const message =
+        `Server shutdown terminated in-flight adapter child${typeof pid === "number" ? ` (pid ${pid})` : ""}`;
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message,
+        payload: {
+          ...(typeof pid === "number" ? { pid } : {}),
+          ...(typeof processGroupId === "number" ? { processGroupId } : {}),
+        },
+      }).catch(() => undefined);
+      const agent = await getAgent(run.agentId).catch(() => null);
+      await finalizeProcessLostRun(run, {
+        adapterType: agent?.adapterType ?? "",
+        adapterConfig: agent?.adapterConfig ?? null,
+        tracksLocalChild: isTrackedLocalChildProcessAdapter(agent?.adapterType ?? ""),
+        messageOverride: message,
+        startNextQueued: false,
+      });
+      runningProcesses.delete(runId);
+      detachedSinceAt.delete(runId);
+      terminated.push(runId);
+    }
+    return { terminated };
+  }
+
   // Clamp the stored attempt count to the range [0, cap]. The SQL reader
   // `pendingCleanupAttemptsSql` clamps to the same range, so both readers yield
   // the same value for every input. The claim predicate compares the two values,
@@ -19312,7 +19468,7 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; detachedMaxAgeMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
     // Recovery never launches a provider or infers stopped ownership from

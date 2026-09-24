@@ -4454,6 +4454,39 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       reservation?: BridgeBodyReservation;
     },
   ): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> => {
+    // NFM-3858 defense-in-depth: the precompletion merge guard intercepts
+    // done-transition PATCHes before they reach the API server, mirroring the
+    // API-layer PreCompletionMerge gate at the adapter-runtime boundary. It
+    // runs ahead of every forward, so both the file bridge and the duplex
+    // broker paths are covered.
+    if (precompletionGuard) {
+      // The guard only inspects method/path/body; bridge requests carry a
+      // Buffer body (and query/headers the guard never reads), so project
+      // to its narrow input shape.
+      const guardResult = await precompletionGuard.intercept({
+        method: request.method,
+        path: request.path,
+        body:
+          request.body === undefined
+            ? undefined
+            : typeof request.body === "string"
+              ? request.body
+              : request.body.toString("utf8"),
+      });
+      if (guardResult) {
+        if (bridgeDebugEnabled) {
+          await onLog(
+            "stdout",
+            `[paperclip] Bridge precompletion guard blocked ${request.method} ${request.path}\n`,
+          );
+        }
+        return {
+          status: guardResult.status,
+          headers: guardResult.headers,
+          body: Buffer.from(guardResult.body),
+        };
+      }
+    }
     const method = request.method.trim().toUpperCase() || "GET";
     // The per-request debug log prints the method, the path, and the query. The
     // duplex path suppresses it, so no route or query rides a log line there. The
