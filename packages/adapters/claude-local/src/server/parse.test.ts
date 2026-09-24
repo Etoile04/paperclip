@@ -14,10 +14,8 @@ import {
   isClaudeModelNotFoundError,
 } from "./parse.js";
 
-<<<<<<< HEAD
 describe("detectClaudeLoginRequired", () => {
   it("classifies Claude's invalid API key login prompt as auth required", () => {
-=======
 // Exact incident string from the shared-account 5h usage-cap outage
 // (429 [1308], engine host TZ Asia/Shanghai).
 const USAGE_CAP_1308_INCIDENT =
@@ -25,7 +23,6 @@ const USAGE_CAP_1308_INCIDENT =
 
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as transient", () => {
->>>>>>> e8d2c8180 (feat(claude-local): classify 429 [1308] usage-cap exhaustion (NFM-4661) (#13))
     expect(
       detectClaudeLoginRequired({
         parsed: null,

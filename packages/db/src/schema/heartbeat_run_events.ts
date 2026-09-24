@@ -37,12 +37,12 @@ export const heartbeatRunEvents = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
-    runSeqUq: uniqueIndex("heartbeat_run_events_run_seq_uq").on(table.runId, table.seq),
+    runSeqUq: uniqueIndex("heartbeat_run_events_run_seq_uq").on(table.runId, table.seq, table.createdAt),
     runSourceEventUq: uniqueIndex("heartbeat_run_events_run_source_event_uq")
-      .on(table.runId, table.sourceEventId)
+      .on(table.runId, table.createdAt, table.sourceEventId)
       .where(sql`${table.sourceEventId} is not null`),
     runSourceSeqUq: uniqueIndex("heartbeat_run_events_run_source_seq_uq")
-      .on(table.runId, table.sourceInstanceId, table.sourceSeq)
+      .on(table.runId, table.createdAt, table.sourceInstanceId, table.sourceSeq)
       .where(sql`${table.sourceInstanceId} is not null and ${table.sourceSeq} is not null`),
     companyRunIdx: index("heartbeat_run_events_company_run_idx").on(table.companyId, table.runId),
     companyCreatedIdx: index("heartbeat_run_events_company_created_idx").on(table.companyId, table.createdAt),

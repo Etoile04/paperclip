@@ -20487,6 +20487,14 @@ export function heartbeatService(
     return recovery.reconcileResolvedDependencyWakeBackstop(opts);
   }
 
+  async function reconcileIssueGraphLiveness(opts?: {
+    runId?: string | null;
+    force?: boolean;
+    lookbackHours?: number;
+  }) {
+    return recovery.reconcileIssueGraphLiveness(opts);
+  }
+
   // ADR-009 §4.3 (NFM-3584) — daily 06:00 UTC reconciliation passthrough.
   // Feature-flag-gated inside `recovery.reconcileBlockedByIssueIds`.
   async function reconcileBlockedByIssueIds() {
@@ -31067,6 +31075,8 @@ export function heartbeatService(
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
     sweepOrphanedActiveLeases,
+    terminateActiveRunsForShutdown,
+    reconcileIssueGraphLiveness,
     sweepPendingCleanupLeases,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
