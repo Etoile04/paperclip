@@ -211,7 +211,8 @@ describe("worktree instance cleanup", () => {
       worktreesDir,
       dependencies: {
         stopEmbeddedPostgres: async (dataDir) => {
-          expect(dataDir).toBe(path.join(instanceRoot, "db"));
+          // Cleanup canonicalizes paths through fs.realpath before comparing.
+          expect(dataDir).toBe(await fs.realpath(path.join(instanceRoot, "db")));
           expect(await fs.stat(instanceRoot)).toBeDefined();
           calls.push("stop");
           return true;

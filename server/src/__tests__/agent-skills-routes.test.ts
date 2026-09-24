@@ -119,6 +119,24 @@ vi.mock("../adapters/index.js", () => ({
     : mockAdapter),
   listAdapterModels: vi.fn(),
   detectAdapterModel: vi.fn(),
+  listServerAdapters: () => [
+    "codex_local",
+    "opencode_local",
+    "gemini_local",
+    "cursor",
+    "claude_local",
+  ].map((type) => ({ type, ...mockAdapter })),
+  requireServerAdapter: vi.fn(() => mockAdapter),
+}));
+
+// Keep adapter availability hermetic: do not read the real
+// ~/.paperclip/adapter-settings.json disabled list.
+vi.mock("../services/adapter-plugin-store.js", () => ({
+  getDisabledAdapterTypes: () => [],
+  isAdapterDisabled: () => false,
+  listAdapterPlugins: () => [],
+  getAdapterPluginByType: () => undefined,
+  setAdapterDisabled: vi.fn(),
 }));
 
 function registerModuleMocks() {

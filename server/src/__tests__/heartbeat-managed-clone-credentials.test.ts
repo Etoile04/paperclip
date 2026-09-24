@@ -95,7 +95,9 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
       });
       expect(await fs.readFile(path.join(repo!.cwd, "README.md"), "utf8")).toBe("local changes");
       await expect(fs.stat(path.join(repo!.cwd, "secret.txt"))).rejects.toMatchObject({ code: "ENOENT" });
-      expect((await execFile("git", ["remote", "get-url", "origin"], { cwd: repo!.cwd })).stdout.trim()).toBe("https://github.com/example/backend.git");
+      // Read the stored URL via git config: `git remote get-url` applies the
+      // machine's url.<x>.insteadOf rewrites and would display an SSH alias.
+      expect((await execFile("git", ["config", "--get", "remote.origin.url"], { cwd: repo!.cwd })).stdout.trim()).toBe("https://github.com/example/backend.git");
     } finally {
       await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
     }

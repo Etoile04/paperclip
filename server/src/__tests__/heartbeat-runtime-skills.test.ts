@@ -139,6 +139,21 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     if (oldPaperclipApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
     else process.env.PAPERCLIP_API_URL = oldPaperclipApiUrl;
     if (paperclipHome) {
+      // Upstream's content-addressed runtime cache marks directories
+      // read-only (0555) once published; make them writable before removal.
+      const makeWritable = async (dir: string): Promise<void> => {
+        let entries: string[] = [];
+        try {
+          await fs.chmod(dir, 0o700).catch(() => {});
+          entries = (await fs.readdir(dir).catch(() => [] as string[]));
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          await makeWritable(path.join(dir, entry));
+        }
+      };
+      await makeWritable(paperclipHome);
       await fs.rm(paperclipHome, { recursive: true, force: true });
     }
     await tempDb?.cleanup();
@@ -452,6 +467,8 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       name: "Paperclip",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+      // Wakeup dispatch requires a resolvable responsible user.
+      defaultResponsibleUserId: "responsible-user",
     });
     // Dead-source registrations with full bodies: only the materialization
     // scope decides whether the shared __runtime__ root gets a directory.
@@ -522,9 +539,19 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     expect(noPreferenceRun).not.toBeNull();
     expect((await waitForRunToFinish(heartbeat, noPreferenceRun!.id))?.status).toBe("succeeded");
 
+    // Upstream 916 materializes catalog skills into the content-addressed
+    // __runtime_cache_v1__ root (keyed by skill id); the legacy __runtime__
+    // root is only for name-based materialized copies. The NFM-4856 F3
+    // semantic is that scoping decides which of those roots get written.
+    const cacheRoot = path.join(paperclipHome!, "instances", "default", "skills", companyId, "__runtime_cache_v1__");
+    const scopedCacheDir = path.join(cacheRoot, scopedSkillId);
+    const unscopedCacheDir = path.join(cacheRoot, unscopedSkillId);
+
     let runtimeDirs = await fs.readdir(runtimeRoot).catch(() => [] as string[]);
     expect(runtimeDirs.some((dir) => dir.startsWith("scoped-coach"))).toBe(false);
     expect(runtimeDirs.some((dir) => dir.startsWith("unscoped-coach"))).toBe(false);
+    await expect(fs.readdir(scopedCacheDir)).rejects.toThrow();
+    await expect(fs.readdir(unscopedCacheDir)).rejects.toThrow();
     const noPreferenceEntries = capturedRuns
       .find((run) => run.agentId === agentWithoutPreferenceId)?.skills ?? [];
     expect(noPreferenceEntries.find((entry) => entry.key === scopedKey)?.sourceStatus).toBe("missing");
@@ -533,14 +560,19 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     expect(scopedRun).not.toBeNull();
     expect((await waitForRunToFinish(heartbeat, scopedRun!.id))?.status).toBe("succeeded");
 
+    // The explicit desiredSkills scope materializes the scoped skill only.
     runtimeDirs = await fs.readdir(runtimeRoot).catch(() => [] as string[]);
-    expect(runtimeDirs.some((dir) => dir.startsWith("scoped-coach"))).toBe(true);
     expect(runtimeDirs.some((dir) => dir.startsWith("unscoped-coach"))).toBe(false);
+    await expect(fs.readdir(scopedCacheDir)).resolves.toBeDefined();
+    await expect(fs.readdir(unscopedCacheDir)).rejects.toThrow();
     const scopedEntries = capturedRuns
       .filter((run) => run.agentId === agentWithPreferenceId)
       .at(-1)?.skills ?? [];
     const scopedEntry = scopedEntries.find((entry) => entry.key === scopedKey);
-    expect(scopedEntry?.sourceStatus).toBe("stale");
+    // Dead local locator + content-addressed cache → healthy "available"
+    // upstream resolution; the F4 "stale" flag is reserved for local_path
+    // sources whose directory disappeared.
+    expect(scopedEntry?.sourceStatus).toBe("available");
     await expect(fs.readFile(path.join(scopedEntry!.source, "SKILL.md"), "utf8"))
       .resolves.toContain("Scoped Coach");
   });

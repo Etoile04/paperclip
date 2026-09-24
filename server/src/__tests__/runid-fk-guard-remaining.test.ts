@@ -5,6 +5,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   companies,
+  companyMemberships,
   createDb,
   documentAnnotationThreads,
   documentRevisions,
@@ -80,6 +81,7 @@ describeEmbeddedPostgres("remaining run-id FK guards (NFM-4983)", () => {
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -97,6 +99,16 @@ describeEmbeddedPostgres("remaining run-id FK guards (NFM-4983)", () => {
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+    });
+    // Upstream requires every routine write to resolve a responsible user;
+    // these actor objects carry no userId, so seed an owner membership the
+    // company-default fallback can resolve.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: `owner-${companyId}`,
+      membershipRole: "owner",
+      status: "active",
     });
     await db.insert(agents).values({
       id: agentId,

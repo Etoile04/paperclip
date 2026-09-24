@@ -91,7 +91,11 @@ afterEach(async () => {
 
 describe("managed worktree seed source through the server spawn path", () => {
   it("re-derives an ambient-instance manifest written before provisioning", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-server-seed-source-"));
+    // Canonicalize the temp root: the registered base workspace must be
+    // canonical (macOS /var/folders is a symlink alias of /private/var/...).
+    const tempRoot = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-server-seed-source-")),
+    );
     cleanup.push(tempRoot);
     const repoRoot = path.join(tempRoot, "repo");
     const hooksDir = path.join(tempRoot, "hooks");

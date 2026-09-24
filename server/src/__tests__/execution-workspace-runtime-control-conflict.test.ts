@@ -157,8 +157,10 @@ function createRegisteredRepairFixture(
   prefix: string,
   options: { targetInstanceId?: string; withCli?: boolean } = {},
 ) {
-  const workspaceCwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  const baseCwd = fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}base-`));
+  // Registered workspaces must be canonical (fs.realpath); macOS exposes
+  // os.tmpdir() through the /var/folders -> /private/var/folders symlink.
+  const workspaceCwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  const baseCwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}base-`)));
   const configDir = path.join(workspaceCwd, ".paperclip");
   const sourceConfigPath = path.join(baseCwd, ".paperclip", "config.json");
   const targetInstanceId = options.targetInstanceId ?? "repair-target";

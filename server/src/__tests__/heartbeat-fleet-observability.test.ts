@@ -19,6 +19,7 @@ import {
   agentRuntimeState,
   agentWakeupRequests,
   companies,
+  companyMemberships,
   createDb,
   environmentLeases,
   heartbeatRunEvents,
@@ -86,6 +87,7 @@ describeEmbeddedPostgres("NFM-4946 — fleet observability wiring via enqueueWak
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -99,6 +101,15 @@ describeEmbeddedPostgres("NFM-4946 — fleet observability wiring via enqueueWak
       name: "Paperclip Fleet Obs",
       issuePrefix: `F${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+    });
+    // Upstream's wakeup dispatch requires a resolvable responsible user;
+    // seed an owner membership so the company-default fallback resolves.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: `owner-${companyId}`,
+      membershipRole: "owner",
+      status: "active",
     });
     await db.insert(agents).values({
       id: agentId,

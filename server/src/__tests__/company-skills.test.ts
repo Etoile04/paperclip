@@ -140,22 +140,25 @@ describe("project workspace skill discovery", () => {
       workspaceCwd: workspace,
     });
 
+    // Discovery canonicalizes every path through fs.realpath, so expected
+    // dirs must be canonicalized too (macOS /var/folders -> /private/var/...).
+    const canonical = (p: string) => fs.realpath(p);
     expect(discovered).toEqual([
-      { skillDir: path.resolve(workspace), directoryRoot: ".", relativePath: ".", inventoryMode: "project_root" },
+      { skillDir: await canonical(path.resolve(workspace)), directoryRoot: ".", relativePath: ".", inventoryMode: "project_root" },
       {
-        skillDir: path.resolve(workspace, ".agents", "skills", "release"),
+        skillDir: await canonical(path.resolve(workspace, ".agents", "skills", "release")),
         directoryRoot: ".agents/skills",
         relativePath: ".agents/skills/release",
         inventoryMode: "full",
       },
       {
-        skillDir: path.resolve(workspace, "skills", ".system", "paperclip"),
+        skillDir: await canonical(path.resolve(workspace, "skills", ".system", "paperclip")),
         directoryRoot: "skills/.system",
         relativePath: "skills/.system/paperclip",
         inventoryMode: "full",
       },
       {
-        skillDir: path.resolve(workspace, "skills", "find-skills"),
+        skillDir: await canonical(path.resolve(workspace, "skills", "find-skills")),
         directoryRoot: "skills",
         relativePath: "skills/find-skills",
         inventoryMode: "full",
@@ -380,7 +383,7 @@ describe("project workspace skill discovery", () => {
 
     expect(discovered).toEqual([
       {
-        skillDir: path.resolve(workspace, "content", "specialists", "editorial"),
+        skillDir: await fs.realpath(path.resolve(workspace, "content", "specialists", "editorial")),
         directoryRoot: "content/specialists",
         relativePath: "content/specialists/editorial",
         inventoryMode: "full",

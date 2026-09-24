@@ -3226,7 +3226,6 @@ export function buildPaperclipEnv(
   // runtime container (e.g. when the public base URL is VPN/tailnet-only).
   const apiUrl =
     (opts?.preferLocalTransport ? process.env.PAPERCLIP_LOCAL_API_URL : undefined) ??
-    process.env.PAPERCLIP_RUNTIME_API_URL ??
     process.env.PAPERCLIP_API_URL ??
     process.env.PAPERCLIP_RUNTIME_API_URL ??
     `http://${runtimeHost}:${runtimePort}`;

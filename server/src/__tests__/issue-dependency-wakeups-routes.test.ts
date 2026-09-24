@@ -66,6 +66,7 @@ vi.mock("../services/index.js", () => ({
   getIssueContinuationSummaryDocument: vi.fn(async () => null),
   instanceSettingsService: () => ({
     get: vi.fn(),
+    getExperimental: vi.fn(async () => ({})),
     listCompanyIds: vi.fn(),
   }),
   issueApprovalService: () => ({}),
@@ -126,10 +127,29 @@ async function createApp() {
   const query: Record<string, unknown> = {};
   query.innerJoin = vi.fn(() => query);
   query.where = vi.fn(() => whereResult);
+  const instanceSettingsRow = {
+    id: "instance-settings-1",
+    singletonKey: "default",
+    defaultEnvironmentId: null,
+    general: {},
+    experimental: {},
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  };
+  const insertBuilder: Record<string, unknown> = {};
+  insertBuilder.values = vi.fn(() => insertBuilder);
+  insertBuilder.onConflictDoUpdate = vi.fn(() => insertBuilder);
+  insertBuilder.returning = vi.fn(async () => [instanceSettingsRow]);
+  const updateBuilder: Record<string, unknown> = {};
+  updateBuilder.set = vi.fn(() => updateBuilder);
+  updateBuilder.where = vi.fn(() => updateBuilder);
+  updateBuilder.returning = vi.fn(async () => [instanceSettingsRow]);
   const routeDb = {
     select: vi.fn(() => ({
       from: vi.fn(() => query),
     })),
+    insert: vi.fn(() => insertBuilder),
+    update: vi.fn(() => updateBuilder),
     transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
   };
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
