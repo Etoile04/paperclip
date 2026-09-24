@@ -188,6 +188,8 @@ describeEmbeddedPostgres("heartbeat shutdown drain and detached run bounds", () 
       name: "Paperclip",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+      // Upstream run dispatch requires a resolvable responsible user.
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,

@@ -2580,7 +2580,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     cleanupDirs.add(workspaceDir);
     const skillDir = path.join(workspaceDir, "content", "teams", "editorial");
     await fs.mkdir(skillDir, { recursive: true });
-    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Editorial\n---\n", "utf8");
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Editorial\n---\n\nSkill body content.", "utf8");
     await fs.writeFile(path.join(workspaceDir, "content", "README.md"), "# Content\n", "utf8");
     await fs.writeFile(path.join(workspaceDir, "content", "skill.md"), "# Not a valid skill filename\n", "utf8");
     for (let entryIndex = 0; entryIndex < 251; entryIndex += 1) {
@@ -2642,8 +2642,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const cursorSkillDir = path.join(workspaceDir, ".cursor", "skills", "preview-cursor");
     await fs.mkdir(codexSkillDir, { recursive: true });
     await fs.mkdir(cursorSkillDir, { recursive: true });
-    await fs.writeFile(path.join(codexSkillDir, "SKILL.md"), "---\nname: Preview Codex\ndescription: Codex candidate\n---\n", "utf8");
-    await fs.writeFile(path.join(cursorSkillDir, "SKILL.md"), "---\nname: Preview Cursor\n---\n", "utf8");
+    await fs.writeFile(path.join(codexSkillDir, "SKILL.md"), "---\nname: Preview Codex\ndescription: Codex candidate\n---\n\nSkill body content.", "utf8");
+    await fs.writeFile(path.join(cursorSkillDir, "SKILL.md"), "---\nname: Preview Cursor\n---\n\nSkill body content.", "utf8");
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
@@ -2699,7 +2699,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     cleanupDirs.add(workspaceDir);
     const skillDir = path.join(workspaceDir, ".codex", "skills", "same-path");
     await fs.mkdir(skillDir, { recursive: true });
-    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Same Path\n---\n", "utf8");
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Same Path\n---\n\nSkill body content.", "utf8");
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
@@ -2749,8 +2749,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     cleanupDirs.add(bundledSkillDir);
     const skillDir = path.join(workspaceDir, ".claude", "skills", "built-in-review");
     await fs.mkdir(skillDir, { recursive: true });
-    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Built In Review\n---\n", "utf8");
-    await fs.writeFile(path.join(bundledSkillDir, "SKILL.md"), "---\nname: Built In Review\n---\n", "utf8");
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Built In Review\n---\n\nSkill body content.", "utf8");
+    await fs.writeFile(path.join(bundledSkillDir, "SKILL.md"), "---\nname: Built In Review\n---\n\nSkill body content.", "utf8");
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
@@ -2763,7 +2763,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       key: "paperclipai/paperclip/built-in-review",
       slug: "built-in-review",
       name: "Built In Review",
-      markdown: "---\nname: Built In Review\n---\n",
+      markdown: "---\nname: Built In Review\n---\n\nSkill body content.",
       sourceType: "local_path",
       sourceLocator: bundledSkillDir,
       trustLevel: "markdown_only",
@@ -2808,8 +2808,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     cleanupDirs.add(existingSkillDir);
     const skillDir = path.join(workspaceDir, ".cursor", "skills", "shared-skill");
     await fs.mkdir(skillDir, { recursive: true });
-    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Shared Skill\n---\n", "utf8");
-    await fs.writeFile(path.join(existingSkillDir, "SKILL.md"), "---\nname: Shared Skill\n---\n", "utf8");
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Shared Skill\n---\n\nSkill body content.", "utf8");
+    await fs.writeFile(path.join(existingSkillDir, "SKILL.md"), "---\nname: Shared Skill\n---\n\nSkill body content.", "utf8");
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
@@ -2822,7 +2822,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       key: "local/existing/shared-skill",
       slug: "shared-skill",
       name: "Shared Skill",
-      markdown: "---\nname: Shared Skill\n---\n",
+      markdown: "---\nname: Shared Skill\n---\n\nSkill body content.",
       sourceType: "local_path",
       sourceLocator: existingSkillDir,
       trustLevel: "markdown_only",
@@ -2885,9 +2885,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     await fs.mkdir(selectedSkillDir, { recursive: true });
     await fs.mkdir(ignoredSkillDir, { recursive: true });
     await fs.mkdir(ignoredLinkedSkillDir, { recursive: true });
-    await fs.writeFile(path.join(selectedSkillDir, "SKILL.md"), "---\nname: Selected Skill\n---\n", "utf8");
-    await fs.writeFile(path.join(ignoredSkillDir, "SKILL.md"), "---\nname: Ignored Skill\n---\n", "utf8");
-    await fs.writeFile(outsideSkillFile, "---\nname: Ignored Linked Skill\n---\n", "utf8");
+    await fs.writeFile(path.join(selectedSkillDir, "SKILL.md"), "---\nname: Selected Skill\n---\n\nSkill body content.", "utf8");
+    await fs.writeFile(path.join(ignoredSkillDir, "SKILL.md"), "---\nname: Ignored Skill\n---\n\nSkill body content.", "utf8");
+    await fs.writeFile(outsideSkillFile, "---\nname: Ignored Linked Skill\n---\n\nSkill body content.", "utf8");
     await fs.symlink(outsideSkillFile, path.join(ignoredLinkedSkillDir, "SKILL.md"));
     await db.insert(companies).values({
       id: companyId,
@@ -2959,8 +2959,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const otherCompanySkillDir = path.join(otherWorkspaceDir, ".codex", "skills", "foreign-skill");
     await fs.mkdir(selectedSkillDir, { recursive: true });
     await fs.mkdir(otherCompanySkillDir, { recursive: true });
-    await fs.writeFile(path.join(selectedSkillDir, "SKILL.md"), "---\nname: Selected Skill\n---\n", "utf8");
-    await fs.writeFile(path.join(otherCompanySkillDir, "SKILL.md"), "---\nname: Foreign Skill\n---\n", "utf8");
+    await fs.writeFile(path.join(selectedSkillDir, "SKILL.md"), "---\nname: Selected Skill\n---\n\nSkill body content.", "utf8");
+    await fs.writeFile(path.join(otherCompanySkillDir, "SKILL.md"), "---\nname: Foreign Skill\n---\n\nSkill body content.", "utf8");
 
     await db.insert(companies).values([
       {
@@ -3050,8 +3050,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const linkedSkillDir = path.join(workspaceDir, ".codex", "skills", "linked-skill");
     const outsideSkillFile = path.join(outsideDir, "outside-skill.md");
     await fs.mkdir(linkedSkillDir, { recursive: true });
-    await fs.writeFile(outsideSkillFile, "---\nname: Outside Skill\n---\n", "utf8");
-    await fs.writeFile(path.join(outsideDir, "SKILL.md"), "---\nname: Outside Directory Skill\n---\n", "utf8");
+    await fs.writeFile(outsideSkillFile, "---\nname: Outside Skill\n---\n\nSkill body content.", "utf8");
+    await fs.writeFile(path.join(outsideDir, "SKILL.md"), "---\nname: Outside Directory Skill\n---\n\nSkill body content.", "utf8");
     await fs.symlink(outsideSkillFile, path.join(linkedSkillDir, "SKILL.md"));
     await fs.symlink(outsideDir, path.join(workspaceDir, "linked-directory"));
     await db.insert(companies).values({

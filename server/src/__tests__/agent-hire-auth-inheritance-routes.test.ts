@@ -26,6 +26,18 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { secretService } from "../services/secrets.js";
+import { vi } from "vitest";
+
+// Keep adapter availability hermetic: this suite hires codex_local and
+// grok_local agents and must not depend on the real
+// ~/.paperclip/adapter-settings.json disabled list.
+vi.mock("../services/adapter-plugin-store.js", () => ({
+  getDisabledAdapterTypes: () => [],
+  isAdapterDisabled: () => false,
+  listAdapterPlugins: () => [],
+  getAdapterPluginByType: () => undefined,
+  setAdapterDisabled: vi.fn(),
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;

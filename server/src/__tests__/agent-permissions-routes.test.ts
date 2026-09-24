@@ -123,6 +123,17 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(),
 }));
 
+// Agent-creation routes consult the plugin store's disabled-adapter list;
+// default to no disabled adapters so tests are hermetic and do not depend
+// on the real ~/.paperclip/adapter-settings.json.
+vi.mock("../services/adapter-plugin-store.js", () => ({
+  getDisabledAdapterTypes: () => [],
+  isAdapterDisabled: () => false,
+  listAdapterPlugins: () => [],
+  getAdapterPluginByType: () => undefined,
+  setAdapterDisabled: vi.fn(),
+}));
+
 function registerModuleMocks() {
   vi.doMock("@paperclipai/adapter-opencode-local/server", async () => {
     const actual = await vi.importActual<typeof import("@paperclipai/adapter-opencode-local/server")>("@paperclipai/adapter-opencode-local/server");

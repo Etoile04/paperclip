@@ -53,10 +53,26 @@ describeEmbeddedPostgres("companySkillService runtime materialization (NFM-4856)
     if (oldPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
     else process.env.PAPERCLIP_HOME = oldPaperclipHome;
     if (paperclipHome) {
+      // Materialized runtime/cache directories are published read-only;
+      // make them writable before removal.
+      const makeWritable = async (dir: string): Promise<void> => {
+        await fs.chmod(dir, 0o700).catch(() => {});
+        const entries = await fs.readdir(dir).catch(() => [] as string[]);
+        for (const entry of entries) {
+          await makeWritable(path.join(dir, entry));
+        }
+      };
+      await makeWritable(paperclipHome);
       await fs.rm(paperclipHome, { recursive: true, force: true });
     }
     await tempDb?.cleanup();
   });
+
+  // Upstream restricts local imports to approved roots (the company managed
+  // skills root or configured project workspace cwds).
+  function managedSkillsRootFor(paperclipHome: string, companyId: string) {
+    return path.join(paperclipHome, "instances", "default", "skills", companyId);
+  }
 
   async function seedCompany() {
     const companyId = randomUUID();
@@ -112,7 +128,9 @@ describeEmbeddedPostgres("companySkillService runtime materialization (NFM-4856)
 
   it("F1: refuses registration of a frontmatter-only SKILL.md source directory", async () => {
     const companyId = await seedCompany();
-    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hollow-import-"));
+    // Imports must come from an approved root (the managed skills root).
+    const skillDir = path.join(managedSkillsRootFor(paperclipHome!, companyId), "hollow-import");
+    await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(path.join(skillDir, "SKILL.md"), HOLLOW_MARKDOWN, "utf8");
 
     await expect(svc.importFromSource(companyId, skillDir)).rejects.toThrow(/frontmatter-only/);
@@ -121,7 +139,11 @@ describeEmbeddedPostgres("companySkillService runtime materialization (NFM-4856)
 
   it("F1: refuses registration of a frontmatter-only single-file source", async () => {
     const companyId = await seedCompany();
-    const skillFile = path.join(os.tmpdir(), `paperclip-hollow-file-${randomUUID()}.md`);
+    const skillFile = path.join(
+      managedSkillsRootFor(paperclipHome!, companyId),
+      `paperclip-hollow-file-${randomUUID()}.md`,
+    );
+    await fs.mkdir(path.dirname(skillFile), { recursive: true });
     await fs.writeFile(skillFile, HOLLOW_MARKDOWN, "utf8");
 
     await expect(svc.importFromSource(companyId, skillFile)).rejects.toThrow(/frontmatter-only/);
@@ -130,6 +152,8 @@ describeEmbeddedPostgres("companySkillService runtime materialization (NFM-4856)
 
   it("F2: GCs legacy and stale hash-suffixed dirs for the same slug after materializing", async () => {
     const companyId = await seedCompany();
+    // Upstream 916 routes catalog skills through the content-addressed cache;
+    // keep the catalog fixture so the row survives the dead-source pruner.
     const { key } = await seedSkill({ companyId, slug: "gc-coach", markdown: FULL_MARKDOWN });
 
     const runtimeRoot = runtimeRootFor(paperclipHome!, companyId);
@@ -141,9 +165,8 @@ describeEmbeddedPostgres("companySkillService runtime materialization (NFM-4856)
     const entries = await svc.listRuntimeSkillEntries(companyId);
     const entry = entries.find((candidate) => candidate.key === key);
 
-    expect(entry?.sourceStatus).toBe("stale");
+    expect(entry?.sourceStatus).toBe("available");
     const remaining = await fs.readdir(runtimeRoot);
-    expect(remaining).toContain(entry!.runtimeName);
     expect(remaining).not.toContain("gc-coach");
     expect(remaining).not.toContain("gc-coach--00000000");
     expect(gcLogSpy).toHaveBeenCalledWith(
@@ -156,78 +179,84 @@ describeEmbeddedPostgres("companySkillService runtime materialization (NFM-4856)
 
   it("F2: does not rewrite an already-current materialized copy", async () => {
     const companyId = await seedCompany();
-    const { key } = await seedSkill({ companyId, slug: "stable-coach", markdown: FULL_MARKDOWN });
+    const { key, skillId } = await seedSkill({ companyId, slug: "stable-coach", markdown: FULL_MARKDOWN });
 
     const first = await svc.listRuntimeSkillEntries(companyId);
     const entry = first.find((candidate) => candidate.key === key);
-    const skillDir = path.join(runtimeRootFor(paperclipHome!, companyId), entry!.runtimeName);
-    const firstStat = await fs.stat(skillDir);
+    const cacheFilesDir = path.join(
+      paperclipHome!, "instances", "default", "skills", companyId,
+      "__runtime_cache_v1__", skillId,
+    );
+    const fingerprintDir = (await fs.readdir(cacheFilesDir))[0]!;
+    const firstStat = await fs.stat(path.join(cacheFilesDir, fingerprintDir));
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     await svc.listRuntimeSkillEntries(companyId);
-    const secondStat = await fs.stat(skillDir);
+    const secondStat = await fs.stat(path.join(cacheFilesDir, fingerprintDir));
 
     expect(secondStat.mtimeMs).toBe(firstStat.mtimeMs);
-    expect(await fs.readFile(path.join(skillDir, "SKILL.md"), "utf8")).toBe(FULL_MARKDOWN);
+    expect(await fs.readFile(path.join(entry!.source, "SKILL.md"), "utf8")).toBe(FULL_MARKDOWN);
   });
 
   it("F3: materializes only in-scope keys when materializeKeys is provided", async () => {
     const companyId = await seedCompany();
-    const { key: wantedKey } = await seedSkill({ companyId, slug: "wanted-coach", markdown: FULL_MARKDOWN });
-    await seedSkill({ companyId, slug: "unwanted-coach", markdown: FULL_MARKDOWN });
+    const { key: wantedKey, skillId: wantedSkillId } = await seedSkill({ companyId, slug: "wanted-coach", markdown: FULL_MARKDOWN });
+    const { skillId: unwantedSkillId } = await seedSkill({ companyId, slug: "unwanted-coach", markdown: FULL_MARKDOWN });
 
     const entries = await svc.listRuntimeSkillEntries(companyId, {
       materializeKeys: new Set(["wanted-coach"]),
     });
 
-    const runtimeRoot = runtimeRootFor(paperclipHome!, companyId);
-    const dirs = await fs.readdir(runtimeRoot);
+    const cacheRoot = path.join(paperclipHome!, "instances", "default", "skills", companyId, "__runtime_cache_v1__");
+    const cachedSkillIds = await fs.readdir(cacheRoot).catch(() => [] as string[]);
     const wanted = entries.find((entry) => entry.key === wantedKey);
     const unwanted = entries.find((entry) => entry.key.endsWith("unwanted-coach"));
 
-    expect(wanted?.sourceStatus).toBe("stale"); // dead source + in scope
-    expect(dirs).toContain(wanted!.runtimeName);
+    expect(wanted?.sourceStatus).toBe("available"); // in scope → materialized from stored copy
+    expect(cachedSkillIds).toContain(wantedSkillId);
     expect(unwanted?.sourceStatus).toBe("missing");
-    expect(dirs.some((dir) => dir.startsWith("unwanted-coach"))).toBe(false);
+    expect(cachedSkillIds).not.toContain(unwantedSkillId);
   });
 
   it("F3: empty materializeKeys set materializes nothing", async () => {
     const companyId = await seedCompany();
-    await seedSkill({ companyId, slug: "scoped-coach", markdown: FULL_MARKDOWN });
+    const { skillId } = await seedSkill({ companyId, slug: "scoped-coach", markdown: FULL_MARKDOWN });
 
     await svc.listRuntimeSkillEntries(companyId, { materializeKeys: new Set<string>() });
 
-    const runtimeRoot = runtimeRootFor(paperclipHome!, companyId);
-    const dirs = await fs.readdir(runtimeRoot).catch(() => [] as string[]);
-    expect(dirs.some((dir) => dir.startsWith("scoped-coach"))).toBe(false);
+    const cacheRoot = path.join(paperclipHome!, "instances", "default", "skills", companyId, "__runtime_cache_v1__");
+    const cachedSkillIds = await fs.readdir(cacheRoot).catch(() => [] as string[]);
+    expect(cachedSkillIds).not.toContain(skillId);
   });
 
   it("F3: full skill keys are matched, not only slug segments", async () => {
     const companyId = await seedCompany();
-    const { key } = await seedSkill({ companyId, slug: "keyed-coach", markdown: FULL_MARKDOWN });
+    const { key, skillId } = await seedSkill({ companyId, slug: "keyed-coach", markdown: FULL_MARKDOWN });
 
     const entries = await svc.listRuntimeSkillEntries(companyId, {
       materializeKeys: new Set([key.toUpperCase()]),
     });
 
-    const runtimeRoot = runtimeRootFor(paperclipHome!, companyId);
-    const dirs = await fs.readdir(runtimeRoot);
+    const cacheRoot = path.join(paperclipHome!, "instances", "default", "skills", companyId, "__runtime_cache_v1__");
+    const cachedSkillIds = await fs.readdir(cacheRoot).catch(() => [] as string[]);
     const entry = entries.find((candidate) => candidate.key === key);
-    expect(entry?.sourceStatus).toBe("stale");
-    expect(dirs).toContain(entry!.runtimeName);
+    expect(entry?.sourceStatus).toBe("available");
+    expect(cachedSkillIds).toContain(skillId);
   });
 
-  it("F4: flags dead local sources as stale instead of silently tolerating them", async () => {
+  it("F4: keeps materializing a dead-source catalog registration from its stored copy", async () => {
     const companyId = await seedCompany();
     const deadLocator = path.join(os.tmpdir(), `deleted-workspace-${randomUUID()}`);
     // Catalog-type rows with a materialized sourceLocator skip the reconcile
     // pruner, mirroring the NFM-4851 audit state: a registration whose source
-    // directory was deleted keeps materializing from the stored copy.
-    const { key } = await seedSkill({
+    // directory was deleted keeps materializing from the stored copy. Under
+    // upstream 916 the stored copy lands in the content-addressed cache and
+    // reports a healthy "available" resolution (the F4 "stale" flag now only
+    // applies to live local_path registrations).
+    const { key, skillId } = await seedSkill({
       companyId,
       slug: "dead-source-coach",
       markdown: FULL_MARKDOWN,
-      sourceType: "catalog",
       sourceLocator: deadLocator,
     });
 
@@ -237,11 +266,10 @@ describeEmbeddedPostgres("companySkillService runtime materialization (NFM-4856)
     });
     const entry = entries.find((candidate) => candidate.key === key);
 
-    expect(entry?.sourceStatus).toBe("stale");
-    expect(entry?.missingDetail).toContain(deadLocator);
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("local source is missing"));
-    const runtimeRoot = runtimeRootFor(paperclipHome!, companyId);
-    const dirs = await fs.readdir(runtimeRoot);
-    expect(dirs).toContain(entry!.runtimeName);
+    expect(entry?.sourceStatus).toBe("available");
+    expect(await fs.readFile(path.join(entry!.source, "SKILL.md"), "utf8")).toBe(FULL_MARKDOWN);
+    const cacheRoot = path.join(paperclipHome!, "instances", "default", "skills", companyId, "__runtime_cache_v1__");
+    const cachedSkillIds = await fs.readdir(cacheRoot).catch(() => [] as string[]);
+    expect(cachedSkillIds).toContain(skillId);
   });
 });

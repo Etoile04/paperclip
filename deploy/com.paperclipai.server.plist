@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>ANTHROPIC_LOG</key>
+		<string>debug</string>
+		<key>BETTER_AUTH_TRUSTED_ORIGINS</key>
+		<string>http://100.66.135.2:3100,http://100.66.135.2:3101,http://127.0.0.1:3100,http://127.0.0.1:3101,http://localhost:3100,http://localhost:3101</string>
+		<key>HOME</key>
+		<string>/Users/lwj04</string>
+		<key>NODE_ENV</key>
+		<string>production</string>
+		<key>PAPERCLIP_EMBEDDED_POSTGRES_PORT</key>
+		<string>54329</string>
+		<key>PAPERCLIP_PG_DUMP_PATH</key>
+		<string>/opt/homebrew/opt/libpq/bin/pg_dump</string>
+		<key>PAPERCLIP_PLUGIN_FETCH_ALLOW_PRIVATE</key>
+		<string>1</string>
+		<key>PAPERCLIP_PSQL_PATH</key>
+		<string>/opt/homebrew/opt/libpq/bin/psql</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/Users/lwj04/.local/bin:/Users/lwj04/.hermes/node/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.paperclipai.server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/opt/node/bin/node</string>
+		<string>--require</string>
+		<string>/Users/lwj04/Services/paperclip-upgrade/node_modules/.pnpm/tsx@4.23.12/node_modules/tsx/dist/preflight.cjs</string>
+		<string>--import</string>
+		<string>file:///Users/lwj04/Services/paperclip-upgrade/node_modules/.pnpm/tsx@4.23.12/node_modules/tsx/dist/loader.mjs</string>
+		<string>src/index.ts</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/lwj04/.paperclip/instances/default/logs/launchd-stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/lwj04/.paperclip/instances/default/logs/launchd-stdout.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/lwj04/Services/paperclip-upgrade/server</string>
+</dict>
+</plist>

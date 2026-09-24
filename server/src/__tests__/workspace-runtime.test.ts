@@ -4096,7 +4096,10 @@ describe("realizeExecutionWorkspace", () => {
     expect(operations[0]?.command).toBe("printf 'cleanup ok\\n'");
     expect(operations[1]?.metadata).toMatchObject({
       cleanupAction: "remove_worktree_instance",
-      instanceRoot,
+      // Teardown records the canonicalized (fs.realpath) instance root; the
+      // instance root itself is deleted by the cleanup, so canonicalize the
+      // still-existing parent instead.
+      instanceRoot: path.join(await fs.realpath(worktreesDir), "instances", instanceId),
     });
     expect(operations[2]?.metadata).toMatchObject({
       cleanupAction: "worktree_remove",
@@ -9691,7 +9694,7 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
 
     const workspace = await realizeExistingBranch(repoRoot, "feature/legacy-checkout");
 
-    expect(workspace.cwd).toBe(path.resolve(legacyPath));
+    expect(workspace.cwd).toBe(await fs.realpath(path.resolve(legacyPath)));
     expect(workspace.branchName).toBe("feature/legacy-checkout");
     expect(workspace.created).toBe(false);
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(branchTip);

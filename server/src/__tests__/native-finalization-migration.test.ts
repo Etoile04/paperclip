@@ -122,8 +122,13 @@ describe("P6-18 / MIG-01..04 native finalization migration", () => {
       expect(after[0]?.seq).toBe(Number(before[0]?.seq));
       expect(after[1]?.seq).toBe(Number(before[1]?.seq));
       expect(after[3]?.seq).toBe(Number(before[3]?.seq));
+      // The production schema keeps heartbeat_run_events RANGE-partitioned by
+      // created_at, so uniqueness degrades to (run_id, seq, created_at). A
+      // conflicting insert must therefore repeat the created_at of the
+      // surviving seq-5 event ("2026-08-01T00:00:02.000Z").
       await expect(db.insert(heartbeatRunEvents).values({
         companyId, runId, agentId, seq: 5, eventType: "must-conflict",
+        createdAt: new Date("2026-08-01T00:00:02.000Z"),
       })).rejects.toThrow();
     } finally {
       await temporary.cleanup();

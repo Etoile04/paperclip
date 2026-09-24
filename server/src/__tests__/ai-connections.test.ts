@@ -4,7 +4,7 @@ import { issueRecoveryActionService } from "../services/issue-recovery-actions.j
 import * as localCredentials from "../services/local-ai-credentials.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, access, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, access, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
@@ -24,6 +24,7 @@ import { validateAiApiKey } from "../routes/ai-connections.js";
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
 let db: ReturnType<typeof createDb>;
 let home: string;
+let projectCwd: string;
 const companyId = randomUUID();
 const otherCompanyId = randomUUID();
 const agentId = randomUUID();
@@ -42,6 +43,11 @@ beforeAll(async () => {
   await db.insert(companies).values([{ id: companyId, name: "AI connection tests", issuePrefix: "AIT" }, { id: otherCompanyId, name: "Other", issuePrefix: "AIO" }]);
   await db.insert(agents).values({ id: agentId, companyId, name: "Nova", adapterType: "claude_local" });
   await db.insert(companyMemberships).values(["alice", "bob"].map(principalId => ({ companyId, principalId, principalType: "user", status: "active", membershipRole: "member" })));
+  projectCwd = await mkdtemp(path.join(home, "project-"));
+  // A fixed clean project cwd: assertManagedAiProjectAuth walks every parent
+  // directory of the cwd looking for ambient credential files, which would
+  // otherwise pick up the developer's real ~/.claude/settings.json.
+  await mkdir(projectCwd, { recursive: true });
 }, 90000);
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
@@ -125,7 +131,7 @@ describe("managed AI connections", () => {
     const subscription = await service.save(companyId, subscriptionUser, { provider, method: "subscription", ownership: "personal", name: "Subscription", loginSessionId: "fixture", allAgents: true, agentIds: [] }, token);
     const api = await service.save(companyId, apiUser, { provider, method: "api_key", ownership: "personal", name: "API", apiKey: "fixture", allAgents: true, agentIds: [] }, "fixture-api");
     // This is the exact same saved bot config, including a legacy setup method.
-    const bot = { ...input, adapterType, binding: { provider, method: "subscription", mode: "responsible_user" } as const, config: { model: "unchanged-model", env: { [apiEnv]: "ambient", CLAUDE_CODE_OAUTH_TOKEN: "ambient" } } };
+    const bot = { ...input, adapterType, binding: { provider, method: "subscription", mode: "responsible_user" } as const, config: { model: "unchanged-model", cwd: projectCwd, env: { [apiEnv]: "ambient", CLAUDE_CODE_OAUTH_TOKEN: "ambient" } } };
     const original = structuredClone(bot);
     const [subRun, apiRun] = await Promise.all([subscriptionUser, apiUser].map(responsibleUserId => prepareManagedAiRuntime(db, { ...bot, responsibleUserId })));
     try {
@@ -273,7 +279,7 @@ describe("managed AI connections", () => {
   });
   it("isolates concurrent homes and overrides ambient credentials without changing the model", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "ambient-never-use");
-    const config = { model: "unchanged-model", env: { ANTHROPIC_API_KEY: "project-never-use" } };
+    const config = { model: "unchanged-model", cwd: projectCwd, env: { ANTHROPIC_API_KEY: "project-never-use" } };
     const [a,b] = await Promise.all(["alice", "bob"].map(responsibleUserId => prepareManagedAiRuntime(db, { ...input, responsibleUserId, config })));
     const ae = a.config.env as Record<string,string>, be = b.config.env as Record<string,string>;
     expect(ae.ANTHROPIC_API_KEY).toBe("fixture-Alice second"); expect(be.ANTHROPIC_API_KEY).toBe("fixture-Bob first");
@@ -353,7 +359,7 @@ describe("managed AI connections", () => {
   it("runs two Claude subscription executions for the same grant at the same time", async () => {
     // Claude writes no auth file back to the grant, so two runs share no
     // mutable state and must not wait for each other.
-    const subscription = { ...input, binding: { ...binding, method: "subscription" as const }, responsibleUserId: "alice", config: { model: "same-model" } };
+    const subscription = { ...input, binding: { ...binding, method: "subscription" as const }, responsibleUserId: "alice", config: { model: "same-model", cwd: projectCwd } };
     const account = (await service.list(companyId, "alice")).find(account => account.provider === "anthropic" && account.method === "subscription")!;
     await service.setDefault(companyId, "alice", account.grantId);
     const [first, second] = await Promise.all([prepareManagedAiRuntime(db, subscription), prepareManagedAiRuntime(db, subscription)]);

@@ -14638,10 +14638,28 @@ export function heartbeatService(
     // Native sessions have their own fenced same-run controller. Legacy
     // bootstrap recovery shares the durable delay and incident counter with
     // transient retries; process loss must not open a second retry budget.
-    if (run.runtimeMode === "native" || legacyExecutionNeedsReconciliation(run))
-      return null;
-    const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
-    return scheduled.outcome === "scheduled" ? scheduled.run : null;
+    // NFM-4784/NFM-4785 (fork): a deliberately terminated orphaned child
+    // finalizes with the process-loss retry-once contract — that contract
+    // takes precedence over the legacy-reconciliation veto for process_lost
+    // runs (finalizeProcessLostRun already bounds the budget to one retry).
+    if (run.runtimeMode === "native") return null;
+    const scheduled = await scheduleBoundedRetryForRun(run, agent, {
+      now,
+      // NFM-4784/4785 (fork): only runs that tracked a live local child get
+      // the retry-once contract; lost monitors without a tracked child still
+      // defer to legacy reconciliation.
+      bypassLegacyReconciliationVeto:
+        Boolean(run.processPid) || Boolean(run.processGroupId),
+    });
+    if (scheduled.outcome !== "scheduled") return null;
+    // NFM-4785 (fork): the retry-once budget is stamped on the retry run so
+    // a re-reaped chain cannot open a second process-loss retry.
+    const processLossRetryCount = (run.processLossRetryCount ?? 0) + 1;
+    await db
+      .update(heartbeatRuns)
+      .set({ processLossRetryCount })
+      .where(eq(heartbeatRuns.id, scheduled.run.id));
+    return { ...scheduled.run, processLossRetryCount };
   }
 
   function toHotRestartIntentRun(input: {
@@ -15515,6 +15533,7 @@ export function heartbeatService(
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      bypassLegacyReconciliationVeto?: boolean;
     },
   ) {
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
@@ -15608,7 +15627,15 @@ export function heartbeatService(
       };
     }
 
-    if (legacyExecutionNeedsReconciliation(run)) {
+    // NFM-4784/NFM-4785 (fork): the process-loss retry-once contract applies
+    // to orphaned local children terminated by the orphan reap / shutdown
+    // drain — those runs carry positive death evidence and are bounded by
+    // processLossRetryCount, so the legacy-reconciliation veto must not
+    // swallow them (see bypassLegacyReconciliationVeto).
+    if (
+      !opts?.bypassLegacyReconciliationVeto &&
+      legacyExecutionNeedsReconciliation(run)
+    ) {
       return {
         outcome: "not_scheduled" as const,
         reason:
@@ -22109,6 +22136,19 @@ export function heartbeatService(
       const runtimeSkillPreference = readPaperclipSkillSyncPreference(
         effectiveResolvedConfig,
       );
+      // NFM-4856 F3 (fork): materialize only what this run is actually
+      // assigned (explicit desiredSkills, which include run-scoped mentioned
+      // keys). Agents without an explicit preference consume no
+      // Paperclip-managed skills, so they must not trigger a full-catalog
+      // rewrite of the shared runtime root either.
+      const runtimeSkillMaterializeKeys = new Set(
+        (runtimeSkillPreference.explicit
+          ? runtimeSkillPreference.desiredSkills
+          : []
+        )
+          .map((key) => key.trim().toLowerCase())
+          .filter(Boolean),
+      );
       const nativeRunnerPreparationSpans: NativeRunHistoricalSpan[] = [];
       const skillsPrepareStartedAtMs = Date.now();
       const runtimeSkillEntries = await (async () => {
@@ -22122,6 +22162,7 @@ export function heartbeatService(
                   true,
               },
             ),
+            materializeKeys: runtimeSkillMaterializeKeys,
           });
         } catch (error) {
           if (agent.adapterType === "paperclip_runner") {

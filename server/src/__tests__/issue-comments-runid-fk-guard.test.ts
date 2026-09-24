@@ -43,17 +43,25 @@ if (!embeddedPostgresSupport.supported) {
  */
 function deceptiveProbeDb(db: Db, fabricatedRunId: string): Db {
   const wrapper = Object.create(db) as Db;
+  const heartbeatRows = [{ id: fabricatedRunId }];
   (wrapper as unknown as { select: unknown }).select = () => ({
     from: (table: unknown) => {
       if (table === heartbeatRuns) {
         return {
           where: () => ({
+            // resolveCommentCreatedByRun awaits `.then` directly on the
+            // where() chain, while the NFM-4982 exists probe awaits
+            // `.limit(1).then(...)`. Support both shapes.
             limit: () => ({
               then: (
                 onFulfilled: (rows: unknown[]) => unknown,
                 onRejected?: (err: unknown) => unknown,
-              ) => Promise.resolve([{ id: fabricatedRunId }]).then(onFulfilled, onRejected),
+              ) => Promise.resolve(heartbeatRows).then(onFulfilled, onRejected),
             }),
+            then: (
+              onFulfilled: (rows: unknown[]) => unknown,
+              onRejected?: (err: unknown) => unknown,
+            ) => Promise.resolve(heartbeatRows).then(onFulfilled, onRejected),
           }),
         };
       }

@@ -1542,6 +1542,9 @@ describe("company portability", () => {
   it("infers portable git metadata from a local checkout without task warning fan-out", async () => {
     const portability = companyPortabilityService({} as any);
     const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-portability-git-"));
+    // Ignore the machine's global git config (url.<x>.insteadOf rewrites
+    // would make `git remote get-url` display an SSH alias for https URLs).
+    vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null");
     execFileSync("git", ["init"], { cwd: repoDir, stdio: "ignore" });
     execFileSync("git", ["checkout", "-b", "main"], { cwd: repoDir, stdio: "ignore" });
     execFileSync("git", ["remote", "add", "origin", "https://github.com/paperclipai/paperclip.git"], {
@@ -1622,6 +1625,7 @@ describe("company portability", () => {
     expect(extension).toContain('projectWorkspaceKey: "paperclip"');
     expect(exported.warnings).not.toContainEqual(expect.stringContaining("does not have a portable repoUrl"));
     expect(exported.warnings).not.toContainEqual(expect.stringContaining("reference workspace workspace-1"));
+    vi.unstubAllEnvs();
   });
 
   it("collapses repeated task workspace warnings into one summary per missing workspace", async () => {

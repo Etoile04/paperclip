@@ -9,7 +9,9 @@ import { afterEach, describe, expect, it } from "vitest";
 // classify failures (retry connection-level faults and 5xx, never retry a
 // definitive 4xx), and must stop at two attempts total to honor the shared
 // bounded-write-retry rule.
-const HELPER_PATH = path.resolve("scripts/paperclip-issue-update.sh");
+// The script lives at the repo root; resolve it from this file's location so
+// the test does not depend on the vitest working directory.
+const HELPER_PATH = path.resolve(import.meta.dirname, "../../../scripts/paperclip-issue-update.sh");
 
 interface HelperResult {
   code: number | null;

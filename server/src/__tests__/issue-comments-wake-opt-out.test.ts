@@ -52,6 +52,15 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
 }));
 
+vi.mock("../services/runner-goals.js", () => ({
+  runnerGoalService: () => ({
+    projection: vi.fn(async () => null),
+    act: vi.fn(),
+  }),
+  RunnerGoalActionError: class RunnerGoalActionError extends Error {},
+  RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
+}));
+
 vi.mock("../services/index.js", () => ({
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
@@ -81,6 +90,9 @@ vi.mock("../services/index.js", () => ({
     saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
   }),
   goalService: () => ({}),
+  companySkillService: () => ({
+    completeTestRunForIssue: vi.fn(async () => null),
+  }),
   heartbeatService: () => mockHeartbeatService,
   instanceSettingsService: () => ({
     get: vi.fn(async () => ({
@@ -90,6 +102,7 @@ vi.mock("../services/index.js", () => ({
         feedbackDataSharingPreference: "prompt",
       },
     })),
+    getExperimental: vi.fn(async () => ({})),
     listCompanyIds: vi.fn(async () => ["company-1"]),
   }),
   issueApprovalService: () => ({}),
@@ -117,11 +130,18 @@ vi.mock("../services/index.js", () => ({
   routineService: () => ({
     syncRunStatusForIssue: vi.fn(async () => undefined),
   }),
+  runnerGoalService: () => ({
+    projection: vi.fn(async () => null),
+    act: vi.fn(),
+  }),
   workProductService: () => ({}),
 }));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
+    companySkillService: () => ({
+      completeTestRunForIssue: vi.fn(async () => null),
+    }),
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
     }),
@@ -159,6 +179,7 @@ function registerModuleMocks() {
           feedbackDataSharingPreference: "prompt",
         },
       })),
+      getExperimental: vi.fn(async () => ({})),
       listCompanyIds: vi.fn(async () => ["company-1"]),
     }),
     issueApprovalService: () => ({}),
@@ -185,6 +206,10 @@ function registerModuleMocks() {
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
+    }),
+    runnerGoalService: () => ({
+      projection: vi.fn(async () => null),
+      act: vi.fn(),
     }),
     workProductService: () => ({}),
   }));

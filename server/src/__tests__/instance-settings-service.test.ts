@@ -70,6 +70,13 @@ describe("instance settings service", () => {
       enableSandboxDuplexBridge: false,
       enableRunnerPreviewIngress: false,
       enableWorktreeRunExecution: false,
+      // Upstream v2026.916.0 added these experimental flags; they materialize
+      // with schema defaults in the normalized view.
+      adr009ReconciliationHookEnabled: false,
+      enableIssueGraphLivenessAutoRecovery: false,
+      issueGraphLivenessAutoRecoveryLookbackHours: 24,
+      phantomBackfillHookEnabled: false,
+      precompletionMergeHookEnabled: false,
       worktreeRunExecutionActivatedAt: null,
       worktreeRunExecutionActivationInstanceId: null,
     });

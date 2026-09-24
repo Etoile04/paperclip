@@ -40,17 +40,26 @@ if (!embeddedPostgresSupport.supported) {
  */
 function deceptiveProbeDb(db: Db, fabricatedRunId: string): Db {
   const wrapper = Object.create(db) as Db;
+  const fabricatedRows = [{ id: fabricatedRunId }];
   (wrapper as unknown as { select: unknown }).select = () => ({
     from: (table: unknown) => {
       if (table === heartbeatRuns) {
+        const heartbeatRows: unknown[] = fabricatedRows;
         return {
           where: () => ({
+            // resolveResponsibleUserIdForActivity awaits `.then` directly on
+            // the where() chain, while the NFM-4977 exists probe awaits
+            // `.limit(1).then(...)`. Support both shapes.
             limit: () => ({
               then: (
                 onFulfilled: (rows: unknown[]) => unknown,
                 onRejected?: (err: unknown) => unknown,
-              ) => Promise.resolve([{ id: fabricatedRunId }]).then(onFulfilled, onRejected),
+              ) => Promise.resolve(heartbeatRows).then(onFulfilled, onRejected),
             }),
+            then: (
+              onFulfilled: (rows: unknown[]) => unknown,
+              onRejected?: (err: unknown) => unknown,
+            ) => Promise.resolve(heartbeatRows).then(onFulfilled, onRejected),
           }),
         };
       }
@@ -139,6 +148,9 @@ describeEmbeddedPostgres("activity log run-id FK guard (NFM-4977)", () => {
   it("degrades a forged JWT run_id claim to null instead of throwing (NFM-4977)", async () => {
     await seed();
     const forgedRunId = randomUUID(); // never inserted into heartbeat_runs
+    // The merged logActivity returns the persisted row (upstream shape); the
+    // NFM-4977 guarantee is that the write resolves with run attribution
+    // degraded to null rather than throwing.
     await expect(
       logActivity(db, {
         companyId,
@@ -150,7 +162,7 @@ describeEmbeddedPostgres("activity log run-id FK guard (NFM-4977)", () => {
         entityType: "issue_comment",
         entityId: randomUUID(),
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({ id: expect.any(String) });
     expect(await insertedRunIds("test.forged_run")).toEqual([null]);
   });
 
@@ -183,7 +195,7 @@ describeEmbeddedPostgres("activity log run-id FK guard (NFM-4977)", () => {
         entityType: "issue",
         entityId: randomUUID(),
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({ id: expect.any(String) });
     // Exactly one row persisted, without run attribution — no throw, no dupe.
     expect(await insertedRunIds("test.race_belt")).toEqual([null]);
   });

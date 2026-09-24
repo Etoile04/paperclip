@@ -41,6 +41,7 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
       feedbackDataSharingPreference: "prompt",
     },
   })),
+  getExperimental: vi.fn(async () => ({})),
   listCompanyIds: vi.fn(async () => ["company-1"]),
 }));
 const mockRoutineService = vi.hoisted(() => ({

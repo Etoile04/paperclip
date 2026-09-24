@@ -6348,7 +6348,13 @@ export function recoveryService(
         issue.companyId,
         issue.id,
       );
-      if (activeRecoveryAction?.ownerType === "board") {
+      if (
+        activeRecoveryAction?.ownerType === "board" &&
+        // NFM-4958 (fork): a new run verdict inside an exhausted
+        // successful-run handoff chain is re-arm evidence for the recovery
+        // owner — the handoff escalation below owns it, not this gate.
+        !isExhaustedSuccessfulRunHandoff(latestRun)
+      ) {
         result.skipped += 1;
         continue;
       }
@@ -6411,7 +6417,15 @@ export function recoveryService(
               eq(heartbeatRuns.id, executionRecoverySource.id),
             ),
           );
-        if (source && legacyExecutionNeedsReconciliation(source)) {
+        if (
+          source &&
+          // NFM-4958 (fork): a failed corrective run inside an exhausted
+          // successful-run handoff chain is re-arm evidence for the recovery
+          // owner, not generic legacy reconciliation — the handoff block
+          // below owns it.
+          !isExhaustedSuccessfulRunHandoff(source) &&
+          legacyExecutionNeedsReconciliation(source)
+        ) {
           await terminalizeLegacyExecution({
             db,
             run: source,
