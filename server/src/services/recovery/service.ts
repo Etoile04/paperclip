@@ -5701,10 +5701,18 @@ export function recoveryService(
     if (!input.explicitEscalation) {
       const lastAction = await recoveryActionsSvc.getMostRecentForIssue(input.issue.companyId, input.issue.id);
       const lastAttemptAt = lastAction?.lastAttemptAt == null ? null : new Date(lastAction.lastAttemptAt);
+      // A different incoming run is new evidence by itself: timestamp
+      // comparison alone misses same-instant re-arms (frozen test clocks,
+      // sub-second retry loops) and would wrongly suppress a genuine second arm.
+      const lastEvidence = (lastAction?.evidence ?? {}) as Record<string, unknown>;
+      const lastRunId = readNonEmptyString(lastEvidence.latestRunId);
+      const incomingRunId = input.latestRun?.id ?? null;
+      const isNewRun = incomingRunId != null && incomingRunId !== lastRunId;
       const armDecision = decideStrandedArmRateLimit({
         now: new Date(),
         lastAttemptAt,
-        hasNewEvidence: await hasStrandedArmEvidenceSince(input.issue, lastAttemptAt),
+        hasNewEvidence:
+          isNewRun || (await hasStrandedArmEvidenceSince(input.issue, lastAttemptAt)),
       });
       if (armDecision.kind === "skip") {
         logger.info(

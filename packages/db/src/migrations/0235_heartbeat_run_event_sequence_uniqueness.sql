@@ -24,5 +24,9 @@ SET "next_event_seq" = COALESCE((
 	WHERE event."run_id" = run."id"
 ), 1);--> statement-breakpoint
 -- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle migrations run transactionally, so CONCURRENTLY is unavailable. The duplicate repair and uniqueness invariant must commit atomically before native event writers rely on the sequence key.
-CREATE UNIQUE INDEX IF NOT EXISTS "heartbeat_run_events_run_seq_uq" ON "heartbeat_run_events" USING btree ("run_id","seq");--> statement-breakpoint
+-- Fork adaptation: production (Etoile04) keeps heartbeat_run_events RANGE-partitioned
+-- by created_at, and Postgres requires every unique index on a partitioned table to
+-- include the partition key. Uniqueness degrades to (run_id, seq, created_at), which
+-- the per-run next_event_seq generator makes equivalent in practice.
+CREATE UNIQUE INDEX IF NOT EXISTS "heartbeat_run_events_run_seq_uq" ON "heartbeat_run_events" USING btree ("run_id","seq","created_at");--> statement-breakpoint
 DROP INDEX IF EXISTS "heartbeat_run_events_run_seq_idx";
