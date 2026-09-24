@@ -2380,7 +2380,7 @@ export function pluginRoutes(
           const configRows = await registry.listConfigs(plugin.id);
           bridgeDeps.workerManager.setProactiveCompanyScopes(
             plugin.id,
-            configRows.map((row) => row.companyId),
+            configRows.map((row) => row.companyId).filter((id): id is string => id != null),
           );
         } catch {
           // Non-fatal: the set is rebuilt from the DB on the next worker start.

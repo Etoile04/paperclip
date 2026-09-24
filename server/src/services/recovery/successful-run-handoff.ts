@@ -20,6 +20,80 @@ import { activityLog, agentWakeupRequests, agents, heartbeatRuns, issues } from 
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 
+// ---------------------------------------------------------------------------
+// Recovery model profile hints (ported verbatim from the fork's
+// `recovery/model-profile-hint.ts`, which the upstream refactor dropped).
+// NFM status-only recovery marks its wakes/assignments with a "cheap" model
+// profile so heavyweight work never runs on recovery-only continuations.
+// ---------------------------------------------------------------------------
+
+export const RECOVERY_MODEL_PROFILE_KEY = "cheap" as const;
+
+export type RecoveryModelProfileWorkClass = "status_only" | "normal_model";
+
+export const STATUS_ONLY_RECOVERY_GUARD_CONTEXT = {
+  recoveryIntent: "status_only",
+  allowDeliverableWork: false,
+  allowDocumentUpdates: false,
+  resumeRequiresNormalModel: true,
+} as const;
+
+const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
+  "modelProfile",
+  "paperclipModelProfile",
+  "recoveryIntent",
+  "allowDeliverableWork",
+  "allowDocumentUpdates",
+  "resumeRequiresNormalModel",
+] as const;
+
+type RecoveryModelProfileHintKey = (typeof RECOVERY_MODEL_PROFILE_HINT_KEYS)[number];
+type WithoutRecoveryModelProfileHints<T> = Omit<T, RecoveryModelProfileHintKey>;
+
+export function scrubRecoveryModelProfileHints<T extends Record<string, unknown>>(
+  input: T,
+): WithoutRecoveryModelProfileHints<T> {
+  const output: Record<string, unknown> = { ...input };
+  for (const key of RECOVERY_MODEL_PROFILE_HINT_KEYS) {
+    delete output[key];
+  }
+  return output as WithoutRecoveryModelProfileHints<T>;
+}
+
+export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
+  input: T,
+  workClass: "normal_model",
+): WithoutRecoveryModelProfileHints<T>;
+export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
+  input: T,
+  workClass: "status_only",
+): WithoutRecoveryModelProfileHints<T> & typeof STATUS_ONLY_RECOVERY_GUARD_CONTEXT & {
+  modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY;
+};
+export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
+  input: T,
+  workClass: RecoveryModelProfileWorkClass,
+):
+  | WithoutRecoveryModelProfileHints<T>
+  | (WithoutRecoveryModelProfileHints<T> & typeof STATUS_ONLY_RECOVERY_GUARD_CONTEXT & {
+    modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY;
+  }) {
+  if (workClass === "normal_model") {
+    return scrubRecoveryModelProfileHints(input);
+  }
+
+  return {
+    ...scrubRecoveryModelProfileHints(input),
+    ...STATUS_ONLY_RECOVERY_GUARD_CONTEXT,
+    modelProfile: RECOVERY_MODEL_PROFILE_KEY,
+  };
+}
+
+export function recoveryAssigneeAdapterOverrides(_workClass: Extract<RecoveryModelProfileWorkClass, "status_only">) {
+  return { modelProfile: RECOVERY_MODEL_PROFILE_KEY };
+}
+
+
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
 export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state";
 export const OPEN_EXECUTING_CHILDREN_HANDOFF_SKIP_REASON = "open child issues own the next action (delegation)";

@@ -842,8 +842,8 @@ export function hydrateInteraction(
         kind: "request_item_verdicts",
         payload: requestItemVerdictsPayloadSchema.parse(row.payload),
         result: parseStoredInteractionResult(
+          "request_item_verdicts",
           requestItemVerdictsResultSchema,
-          row.result,
           row,
         ),
       } satisfies RequestItemVerdictsInteraction;
@@ -853,8 +853,8 @@ export function hydrateInteraction(
         kind: "connection_intent",
         payload: connectionIntentPayloadSchema.parse(row.payload),
         result: parseStoredInteractionResult(
+          "connection_intent",
           connectionIntentResultSchema,
-          row.result,
           row,
         ),
       } satisfies ConnectionIntentInteraction;

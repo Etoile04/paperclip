@@ -2307,20 +2307,6 @@ export function pluginLoader(
       // (eventSubscriptions: 0) for the worker's life (LOOA-695). The same rows
       // drive startup config delivery in step 5b below. Listing is best-effort:
       // if it fails the worker still starts, just with no proactive access.
-      let configRows: Awaited<ReturnType<typeof registry.listConfigs>> = [];
-      try {
-        configRows = await registry.listConfigs(pluginId);
-      } catch (listErr) {
-        log.debug(
-          {
-            pluginId,
-            pluginKey,
-            err: listErr instanceof Error ? listErr.message : String(listErr),
-          },
-          "plugin-loader: could not list stored configs before worker start",
-        );
-      }
-
       // ------------------------------------------------------------------
       // 5. Spawn worker process
       // ------------------------------------------------------------------
@@ -2344,7 +2330,7 @@ export function pluginLoader(
         // before any setup()-time worker→host call (LOOA-695). The authorized
         // set is exactly the plugin's configured companies — proactive access
         // never reaches an unconfigured company.
-        proactiveCompanyScopes: configRows.map((row) => row.companyId),
+        proactiveCompanyScopes: configRows.map((row) => row.companyId).filter((id): id is string => id != null),
       };
 
       // Repo-local plugin installs can resolve workspace TS sources at runtime

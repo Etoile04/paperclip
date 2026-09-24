@@ -10988,6 +10988,22 @@ export function issueRoutes(
         })();
         if (!updatedSource[0]) return null;
 
+        // NFM-4983 / ADR-019 extension: probe the unvalidated `actor.runId`
+        // (agent JWT `run_id` claim / `x-paperclip-run-id` header) before it
+        // reaches issue_work_products' run-id FK; a forged or stale id degrades
+        // to null instead of 500ing the already-succeeded promotion. Probe
+        // only — this insert runs inside the promotion transaction, where a
+        // failed statement poisons it (25P02); ADR-019 residual.
+        const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
+          target: "issue_work_products.created_by_run_id",
+          entityType: "issue",
+          entityId: issue.id,
+          actorType: actor.actorType,
+          actorId:
+            actor.agentId ??
+            (actor.actorType === "user" ? actor.actorId : null) ??
+            "unknown",
+        });
         return tx
           .insert(issueWorkProducts)
           .values({

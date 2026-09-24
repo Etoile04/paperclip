@@ -50,6 +50,38 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  adr009ReconciliationHookEnabled: {
+    title: "ADR-009 reconciliation routine",
+    description:
+      "Daily 06:00 UTC reconciliation routine that prunes done/cancelled blockers from every dependent's blockedByIssueIds (NFM-3584).",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  enableIssueGraphLivenessAutoRecovery: {
+    title: "Issue graph liveness auto-recovery",
+    description:
+      "Automatic recovery escalation for blocked dependency chains flagged by the issue graph liveness scanner (NFM-4798).",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  precompletionMergeHookEnabled: {
+    title: "Pre-completion merge gate",
+    description:
+      "API-layer PreCompletionMerge gate on PATCH /api/issues/{id} (NFM-3857).",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  phantomBackfillHookEnabled: {
+    title: "Phantom merge-pass backfill",
+    description:
+      "Daily 05:00 UTC backfill routine scanning done issues with merge-style titles and zero comments, emitting recovery children (NFM-3860). Off by default.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableNativeRunner: {
     title: "Paperclip Runner",
     description:

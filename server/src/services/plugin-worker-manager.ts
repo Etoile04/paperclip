@@ -987,6 +987,20 @@ export function createPluginWorkerHandle(
   // loader used to call setProactiveCompanyScopes only AFTER startWorker
   // resolved, which was too late for the gateway's one-shot events.subscribe
   // and left outbound push permanently dead (LOOA-695).
+  // ------------------------------------------------------------------
+  // Proactive company scopes (LOOA-629, LOOA-695)
+  // ------------------------------------------------------------------
+  // A proactive plugin (e.g. the chat gateway) does company-scoped work from
+  // its own timers/loops — not inside a host-issued top-level invocation
+  // (onEvent/performAction/executeTool/configChanged). Those worker→host calls
+  // carry no `paperclipInvocationId`, so the governed-access gate
+  // (host-client-factory.ts) rejects any company-scoped request with
+  // "company context is required" (regression class from #9557). The host
+  // authorizes a bounded set of companies — the plugin's configured companies,
+  // set by the loader after startup config delivery — for such proactive work.
+  // A no-invocation call that references one of these companies resolves to
+  // that company's scope; a call referencing any other company stays denied,
+  // and in-invocation calls keep their strict single-company match.
   const proactiveCompanyScopes = new Set<string>();
   for (const id of options.proactiveCompanyScopes ?? []) {
     const trimmed = readNonEmptyString(id);
