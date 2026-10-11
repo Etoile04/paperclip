@@ -5,6 +5,9 @@ import {
   WEEKLY_RETENTION_PRESETS,
   MONTHLY_RETENTION_PRESETS,
   DEFAULT_BACKUP_RETENTION,
+  MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
 } from "../types/instance.js";
 import { feedbackDataSharingPreferenceSchema } from "./feedback.js";
 import { shapeWithoutDefaults } from "./partial.js";
@@ -112,6 +115,7 @@ export const instanceExperimentalSettingsSchema = z.object({
    * orphaned blockers on the canary tier.
    */
   precompletionMergeHookEnabled: z.boolean().default(false),
+  /**
    * ADR-010 §D2 (NFM-3860): enables the daily 05:00 UTC phantom-merge-pass
    * backfill routine that scans for `done` issues matching the
    * NFM-3850 phantom-pass signature and emits a recovery child per

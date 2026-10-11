@@ -4931,7 +4931,19 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         // NFM-3858 defense-in-depth: precompletion merge guard intercepts
         // done-transition PATCHes before they reach the API server.
         if (precompletionGuard) {
-          const guardResult = await precompletionGuard.intercept(request);
+          // The guard only inspects method/path/body; bridge requests carry a
+          // Buffer body (plus query/headers the guard never reads), so project
+          // to its narrow input shape.
+          const guardResult = await precompletionGuard.intercept({
+            method: request.method,
+            path: request.path,
+            body:
+              request.body === undefined
+                ? undefined
+                : typeof request.body === "string"
+                  ? request.body
+                  : request.body.toString("utf8"),
+          });
           if (guardResult) {
             return {
               status: guardResult.status,

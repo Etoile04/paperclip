@@ -193,6 +193,9 @@ describe("instance experimental settings validators", () => {
       }),
     ).toEqual({
       enableApps: true,
+    });
+  });
+
   it("defaults the PreCompletionMerge hook flag (NFM-3857) off", () => {
     const settings = instanceExperimentalSettingsSchema.parse({});
     expect(settings.precompletionMergeHookEnabled).toBe(false);

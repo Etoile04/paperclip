@@ -885,13 +885,6 @@
       "breakpoints": true
     },
     {
-      "idx": 126,
-      "version": "7",
-      "when": 1788902405129,
-      "tag": "0126_codify_20260908_emergency_schema_patches",
-      "breakpoints": true
-    },
-    {
       "idx": 127,
       "version": "7",
       "when": 1782526500000,
@@ -1232,6 +1225,13 @@
       "version": "7",
       "when": 1784211956161,
       "tag": "0176_issue_create_idempotency_key_expiry",
+      "breakpoints": true
+    },
+    {
+      "idx": 177,
+      "version": "7",
+      "when": 1784211956162,
+      "tag": "0177_activity_log_responsible_user",
       "breakpoints": true
     },
     {
@@ -2044,6 +2044,34 @@
       "version": "7",
       "when": 1790796608171,
       "tag": "0293_broad_rattler",
+      "breakpoints": true
+    },
+    {
+      "idx": 294,
+      "version": "7",
+      "when": 1790796608465,
+      "tag": "0294_liveness_fanout_opt_out",
+      "breakpoints": true
+    },
+    {
+      "idx": 295,
+      "version": "7",
+      "when": 1790796608466,
+      "tag": "0295_codify_20260908_emergency_schema_patches",
+      "breakpoints": true
+    },
+    {
+      "idx": 296,
+      "version": "7",
+      "when": 1790796608467,
+      "tag": "0296_output_channel_severed_transcript_liveness",
+      "breakpoints": true
+    },
+    {
+      "idx": 297,
+      "version": "7",
+      "when": 1790796608468,
+      "tag": "0297_fleet_throttle_metric_counters",
       "breakpoints": true
     }
   ]
