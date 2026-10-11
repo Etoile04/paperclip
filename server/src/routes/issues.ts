@@ -18381,7 +18381,6 @@ export function issueRoutes(
         allowSharing: req.body.allowSharing === true,
       });
 
-            const createdByRunId = await resolveRunIdForWrite(tx, actor.runId ?? null, {
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
