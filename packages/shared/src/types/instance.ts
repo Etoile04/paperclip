@@ -3,6 +3,9 @@ import type { FeedbackDataSharingPreference } from "./feedback.js";
 export const DAILY_RETENTION_PRESETS = [3, 7, 14] as const;
 export const WEEKLY_RETENTION_PRESETS = [1, 2, 4] as const;
 export const MONTHLY_RETENTION_PRESETS = [1, 3, 6] as const;
+export const DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24;
+export const MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 1;
+export const MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24 * 30;
 export interface BackupRetentionPolicy {
   dailyDays: (typeof DAILY_RETENTION_PRESETS)[number];
   weeklyWeeks: (typeof WEEKLY_RETENTION_PRESETS)[number];
@@ -164,6 +167,7 @@ export interface InstanceExperimentalSettings {
    * `5f082df9-b131-4d6d-bf27-f678d4307325`.
    */
   precompletionMergeHookEnabled: boolean;
+  /**
    * ADR-010 §D2 (NFM-3860): toggles the daily 05:00 UTC phantom-merge-pass
    * backfill routine that scans for `done` issues with merge-style titles
    * and zero comments (phantom pass cluster), then emits a recovery child

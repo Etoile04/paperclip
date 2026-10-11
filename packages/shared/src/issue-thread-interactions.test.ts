@@ -16,7 +16,6 @@ import {
   requestItemVerdictsResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
   requestCheckboxConfirmationResultSchema,
-  requestConfirmationResultSchema,
 } from "./validators/issue.js";
 
 describe("issue thread interaction schemas", () => {
@@ -654,6 +653,8 @@ describe("issue thread interaction schemas", () => {
         { id: "api", verdict: "reject", reason: "Needs revision" },
       ],
     })).toThrow("verdict item ids must be unique");
+  });
+
   it("round-trips outcome=auto_expired through confirmation result schemas (NFM-4978 D1)", () => {
     const parsed = requestConfirmationResultSchema.parse({
       version: 1,

@@ -4682,6 +4682,7 @@ export async function runChildProcess(
       pid: number;
       processGroupId: number | null;
       startedAt: string;
+    }) => Promise<void>;
     onChannelSevered?: (meta: {
       stream: "stdout" | "stderr";
       childPid: number | null;
