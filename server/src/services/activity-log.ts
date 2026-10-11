@@ -161,10 +161,6 @@ export function publishActivity(publication: ActivityPublication) {
   if (publication.pluginEvent) publishPluginDomainEvent(publication.pluginEvent);
 }
 
-export async function persistActivity(db: Db, input: LogActivityInput) {
-  const redactedDetails = await redactActivityDetails(db, input.details ?? null);
-  const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
-  const [activity] = await db.insert(activityLog).values({
 const ACTIVITY_LOG_RUN_ID_FK = "activity_log_run_id_heartbeat_runs_id_fk";
 
 /**
@@ -186,45 +182,11 @@ function isRunIdForeignKeyViolation(err: unknown): boolean {
   });
 }
 
-export async function logActivity(db: Db, input: LogActivityInput) {
-  const currentUserRedactionOptions = {
-    enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
-  };
-  const sanitizedDetails = input.details ? sanitizeRecord(input.details) : null;
-  const redactedDetails = sanitizedDetails
-    ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
-    : null;
 
-  // NFM-4977 / ADR-019: `actor.runId` may originate from an unvalidated agent
-  // JWT `run_id` claim or an `x-paperclip-run-id` header and reference no
-  // heartbeat_runs row. Writing it would violate activity_log's run_id FK and
-  // 500 an already-succeeded operation, so probe once and degrade to null
-  // instead of rejecting the write.
-  let runId = input.runId ?? null;
-  if (runId) {
-    const exists = await db
-      .select({ id: heartbeatRuns.id })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .limit(1)
-      .then((rows) => rows.length > 0);
-    if (!exists) {
-      logger.warn(
-        {
-          runId,
-          actorType: input.actorType,
-          actorId: input.actorId,
-          action: input.action,
-          entityType: input.entityType,
-          entityId: input.entityId,
-        },
-        "activity log run id does not reference a heartbeat run; dropping run attribution",
-      );
-      runId = null;
-    }
-  }
-
-  const values = {
+export async function persistActivity(db: Db, input: LogActivityInput) {
+  const redactedDetails = await redactActivityDetails(db, input.details ?? null);
+  const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
+  const [activity] = await db.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
     actorId: input.actorId,
@@ -236,37 +198,6 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     responsibleUserId,
     details: redactedDetails,
   }).returning({ id: activityLog.id });
-    runId,
-    details: redactedDetails,
-  };
-
-  try {
-    await db.insert(activityLog).values(values);
-  } catch (err) {
-    // Belt for the probe→insert race (run row deleted in between, e.g. by a
-    // company/agent teardown cascade): retry once without run attribution.
-    if (runId === null || !isRunIdForeignKeyViolation(err)) throw err;
-    logger.warn(
-      { err, runId, actorType: input.actorType, actorId: input.actorId, action: input.action },
-      "activity log insert hit the run_id foreign key after the existence probe; retrying without run attribution",
-    );
-    await db.insert(activityLog).values({ ...values, runId: null });
-  }
-
-  publishLiveEvent({
-    companyId: input.companyId,
-    type: "activity.logged",
-    payload: {
-      actorType: input.actorType,
-      actorId: input.actorId,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId,
-      agentId: input.agentId ?? null,
-      runId,
-      details: redactedDetails,
-    },
-  });
 
   const payload = {
     actorType: input.actorType,
@@ -319,13 +250,6 @@ export async function logActivity(
     postCommitPublications.push(publication);
   } else {
     publishActivity(publication);
-      payload: {
-        ...redactedDetails,
-        agentId: input.agentId ?? null,
-        runId,
-      },
-    };
-    publishPluginDomainEvent(event);
   }
   return activity;
 }

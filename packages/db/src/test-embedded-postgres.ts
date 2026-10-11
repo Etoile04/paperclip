@@ -2,19 +2,19 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { applyPendingMigrations, closeRegisteredClients, ensurePostgresDatabase } from "./client.js";
-import {
-  createEmbeddedPostgresLogBuffer,
-  formatEmbeddedPostgresError,
-} from "./embedded-postgres-error.js";
 import postgres from "postgres";
 import {
   applyPendingMigrations,
   applyPendingMigrationsManually,
+  closeRegisteredClients,
   ensurePostgresDatabase,
   inspectMigrations,
   readMigrationFileContent,
 } from "./client.js";
+import {
+  createEmbeddedPostgresLogBuffer,
+  formatEmbeddedPostgresError,
+} from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 
 // Time budget (ms) for a vitest test in the embedded-Postgres cost class: a

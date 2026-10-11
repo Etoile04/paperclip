@@ -5,6 +5,12 @@ import {
   __setEmbeddedPostgresCtorProviderForTests,
   __startEmbeddedPostgresWithRetryForTests as startWithRetry,
 } from "./test-embedded-postgres.js";
+import postgres from "postgres";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./test-embedded-postgres.js";
+
 
 // A fake embedded-postgres constructor. It records every constructed instance so
 // the test can assert the retry uses a fresh port and a fresh data directory each
@@ -49,6 +55,23 @@ function makeFakeCtor(failFirst: number) {
 
   return { ctor: FakeEmbeddedPostgres, constructed };
 }
+
+const cleanups: Array<() => Promise<void>> = [];
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+async function createTempDatabase(): Promise<string> {
+  const db = await startEmbeddedPostgresTestDatabase("paperclip-db-replay-lineage-");
+  cleanups.push(db.cleanup);
+  return db.connectionString;
+}
+
+afterEach(async () => {
+  while (cleanups.length > 0) {
+    const cleanup = cleanups.pop();
+    await cleanup?.();
+  }
+});
 
 describe("startEmbeddedPostgresWithRetry", () => {
   afterEach(() => {
@@ -110,29 +133,7 @@ describe("startEmbeddedPostgresWithRetry", () => {
     // generic "embedded Postgres startup failed" text.
     expect((error as Error).message).toContain("Address already in use");
   });
-import postgres from "postgres";
-import { afterEach, describe, expect, it } from "vitest";
-import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./test-embedded-postgres.js";
 
-const cleanups: Array<() => Promise<void>> = [];
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-
-async function createTempDatabase(): Promise<string> {
-  const db = await startEmbeddedPostgresTestDatabase("paperclip-db-replay-lineage-");
-  cleanups.push(db.cleanup);
-  return db.connectionString;
-}
-
-afterEach(async () => {
-  while (cleanups.length > 0) {
-    const cleanup = cleanups.pop();
-    await cleanup?.();
-  }
-});
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -192,4 +193,5 @@ describeEmbeddedPostgres("startEmbeddedPostgresTestDatabase fresh-database repla
     },
     60_000,
   );
+});
 });

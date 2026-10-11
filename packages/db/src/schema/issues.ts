@@ -12,7 +12,6 @@ import {
   uniqueIndex,
   unique,
   bigint,
-  boolean,
   check,
 } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";

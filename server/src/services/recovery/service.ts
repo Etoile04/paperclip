@@ -5097,36 +5097,44 @@ export function recoveryService(
   async function sourceHasNewPathOutsideRecoveryAction(
     action: typeof issueRecoveryActions.$inferSelect,
   ) {
-    const [run, wake] = await Promise.all([
-  // NFM-4958 3: "new evidence" since the last arm attempt is (a) a run verdict
-  // that did not cleanly succeed (non-succeeded status or non-null errorCode)
-  // concluded after the attempt, or (b) a route-written issue status transition
-  // (activity `issue.updated` with `_previous.status`) after the attempt.
-  // Explicit escalation (c) is handled by the caller-side bypass flag.
+    const issue = action.sourceIssueId
+      ? (await db
+          .select({ id: issues.id, companyId: issues.companyId })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, action.companyId),
+              eq(issues.id, action.sourceIssueId),
+            ),
+          )
+          .limit(1))[0]
+      : undefined;
+    if (!issue || !action.lastArmAt) return false;
+    return hasStrandedArmEvidenceSince(issue, action.lastArmAt);
+  }
+
   async function hasStrandedArmEvidenceSince(
     issue: Pick<typeof issues.$inferSelect, "id" | "companyId">,
     lastAttemptAt: Date | null,
   ): Promise<boolean> {
     if (!lastAttemptAt) return true;
-    const [failedRun, statusTransition] = await Promise.all([
+    const [run, wake, statusTransition] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
         .where(
           and(
-            eq(heartbeatRuns.companyId, action.companyId),
+            eq(heartbeatRuns.companyId, issue.companyId),
             inArray(heartbeatRuns.status, [
               ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
             ]),
-            sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${action.sourceIssueId}`,
+            sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${issue.id}`,
             sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId', '') <> ${action.id}`,
-            eq(heartbeatRuns.companyId, issue.companyId),
             or(
               ne(heartbeatRuns.status, "succeeded"),
               isNotNull(heartbeatRuns.errorCode),
             ),
             gt(heartbeatRuns.finishedAt, lastAttemptAt),
-            sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id} or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issue.id})`,
           ),
         )
         .limit(1)
@@ -5142,8 +5150,13 @@ export function recoveryService(
               "claimed",
               "deferred_issue_execution",
             ]),
-            sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} ->> 'taskId') = ${action.sourceIssueId}`,
+            sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} ->> 'taskId') = ${issue.id}`,
             sql`coalesce(${agentWakeupRequests.payload} ->> 'recoveryActionId', '') <> ${action.id}`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+      db
         .select({ id: activityLog.id })
         .from(activityLog)
         .where(
@@ -5159,7 +5172,7 @@ export function recoveryService(
         .limit(1)
         .then((rows) => rows[0] ?? null),
     ]);
-    return Boolean(run || wake);
+    return Boolean(run || wake || statusTransition);
   }
 
   async function reconcileActiveRecoveryActions() {
@@ -9582,7 +9595,8 @@ async function retireObsoleteLivenessRecoveryIssues(findings: IssueLivenessFindi
     reconcileStrandedAssignedIssues,
     reconcileLegacyContinuation,
     legacyRepairDispatchBlock,
-    sweepStaleIssueLocks,    reconcileResolvedDependencyWakeBackstop,
+    sweepStaleIssueLocks,
+    reconcileResolvedDependencyWakeBackstop,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     reconcileBlockedByIssueIds,

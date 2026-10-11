@@ -642,7 +642,7 @@ function parseStoredInteractionResult<S extends z.ZodTypeAny>(
   return null;
 }
 
-function hydrateInteraction(
+/**
  * Cap on the stringified raw result embedded in read-time fallback `reason` /
  * `cancellationReason` / `rejectionReason` values. The result schemas allow
  * 4000 chars, but fallback provenance only needs enough to identify the writer;

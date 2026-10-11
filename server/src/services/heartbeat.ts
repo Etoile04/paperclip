@@ -319,6 +319,7 @@ import {
   providerTraceStore,
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
+import {
   flushFleetThrottleCounters,
   recordFleetThrottleCounterTrip,
 } from "./fleet-throttle-counter-sink.js";
@@ -845,7 +846,7 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
   "failed",
   "cancelled",
   "timed_out",
-] as const;
+  // NFM-4784: severed-channel terminal — outcome unknown, verify via transcript.
   "observability_lost",
 ] as const;
 // NFM-4784: a transcript written within this window of the reap scan counts
@@ -22377,19 +22378,6 @@ export function heartbeatService(
       const runtimeSkillPreference = readPaperclipSkillSyncPreference(
         effectiveResolvedConfig,
       );
-      // NFM-4856 F3 (fork): materialize only what this run is actually
-      // assigned (explicit desiredSkills, which include run-scoped mentioned
-      // keys). Agents without an explicit preference consume no
-      // Paperclip-managed skills, so they must not trigger a full-catalog
-      // rewrite of the shared runtime root either.
-      const runtimeSkillMaterializeKeys = new Set(
-        (runtimeSkillPreference.explicit
-          ? runtimeSkillPreference.desiredSkills
-          : []
-        )
-          .map((key) => key.trim().toLowerCase())
-          .filter(Boolean),
-      );
       const nativeRunnerPreparationSpans: NativeRunHistoricalSpan[] = [];
       const skillsPrepareStartedAtMs = Date.now();
       const runtimeSkillEntries = await (async () => {
@@ -22403,7 +22391,6 @@ export function heartbeatService(
                   true,
               },
             ),
-            materializeKeys: runtimeSkillMaterializeKeys,
           });
         } catch (error) {
           if (agent.adapterType === "paperclip_runner") {
@@ -23509,94 +23496,6 @@ export function heartbeatService(
             runId: run.id,
             issueId: issueRef?.id ?? null,
             issueIdentifier: issueRef?.identifier ?? null,
-            adapterType: agent.adapterType,
-          },
-          "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
-        );
-      }
-      let adapterFinalizeOutcome: "succeeded" | "failed" | null = null;
-      const recordWorkspaceFinalize = async (
-        status: "succeeded" | "failed",
-        metadata?: Record<string, unknown>,
-      ) => {
-        if (adapterFinalizeOutcome) return;
-        await workspaceOperationRecorder.recordOperation({
-          phase: "workspace_finalize",
-          cwd: executionWorkspace.cwd,
-          metadata: {
-            adapterType: agent.adapterType,
-            executionTargetKind: executionTarget?.kind ?? "local",
-            ...metadata,
-          },
-          run: async () => ({ status }),
-        });
-        // Only mark the outcome after the row landed, so a transient write
-        // failure on the succeeded path can still be recovered by recording
-        // finalize=failed from the catch path below.
-        adapterFinalizeOutcome = status;
-      };
-
-      let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
-      try {
-        adapterResult = await adapter.execute({
-          runId: run.id,
-          agent,
-          runtime: runtimeForAdapter,
-          config: runtimeConfig,
-          context,
-          runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
-          executionTarget,
-          executionTransport: remoteExecution
-            ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
-            : undefined,
-          onLog,
-          onMeta: onAdapterMeta,
-          onRuntimeProgress: async (progress) => {
-            await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
-          },
-          onSpawn: async (meta) => {
-            await persistRunProcessMetadata(run.id, {
-              pid: meta.pid,
-              processGroupId:
-                "processGroupId" in meta && typeof meta.processGroupId === "number"
-                  ? meta.processGroupId
-                  : null,
-              startedAt: meta.startedAt,
-              // NFM-4784 contract #4: transcript path persisted at adapter
-              // start so liveness probes never infer paths at alert time.
-              transcriptPath:
-                "transcriptPath" in meta && typeof meta.transcriptPath === "string"
-                  ? meta.transcriptPath
-                  : null,
-            });
-          },
-          // NFM-4784 remedy (b): reader-stream death with the child possibly
-          // alive. Records the channel_severed marker; never death evidence.
-          onChannelSevered: async (meta) => {
-            await markRunChannelSevered({
-              runId: run.id,
-              childPid: meta.childPid,
-              reason: meta.reason,
-            });
-          },
-          authToken: authToken ?? undefined,
-        });
-        // Adapter returned cleanly, which means its workspace-restore finally
-        // block also ran without throwing. Record the workspace_finalize
-        // barrier so dependents that share this executionWorkspace can wake.
-        // If recording the barrier itself fails, propagate as a run failure
-        // rather than silently leaving dependents stranded behind a missing
-        // finalize row.
-        await recordWorkspaceFinalize("succeeded");
-      } catch (adapterErr) {
-        // Adapter (or its restore finally) threw — or the finalize record
-        // write itself threw. Either way the workspace may be in a partial
-        // state. Best-effort record finalize=failed so the dependent readiness
-        // check keeps the gate closed instead of waking on stale local state,
-        // and surface the original error to the caller.
-        try {
-          await recordWorkspaceFinalize("failed", {
-            errorMessage: adapterErr instanceof Error ? adapterErr.message : String(adapterErr),
           });
           const existingRuntimeEnv = parseObject(runtimeConfig.env);
           const scratchEnv = buildHeartbeatRunScratchEnv(
