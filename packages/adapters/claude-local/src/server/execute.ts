@@ -1298,7 +1298,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: proc.signal,
       timedOut: false,
       errorMessage,
-      errorCode: resolvedErrorCode,
+      errorCode: typeof resolvedErrorCode === "string" ? resolvedErrorCode : null,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,

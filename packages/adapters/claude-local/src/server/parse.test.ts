@@ -640,3 +640,5 @@ describe("parseClaudeStreamJson usage extraction", () => {
     expect(parsed.usageBasis).toBe("per_run");
   });
 });
+});
+});

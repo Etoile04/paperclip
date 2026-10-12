@@ -47,7 +47,7 @@ function terminalNativeInteractionCopy(
           ? "Skipped in Paperclip"
           : outcome === "withdrawn"
             ? "Withdrawn in Paperclip"
-            : outcome === "addressee_deleted"
+            : (outcome as string) === "addressee_deleted"
               ? "Cancelled: addressed agent was removed"
               : "Cancelled in Paperclip";
       return { body, text: `${body}.` };

@@ -1,6 +1,5 @@
 import type { Db } from "@paperclipai/db";
 import { companies, instanceSettings } from "@paperclipai/db";
-import { DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS } from "@paperclipai/shared";
 
 /**
  * A `Db` or an open transaction handle — the subset of query builders the
@@ -272,7 +271,6 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       adr009ReconciliationHookEnabled: parsed.data.adr009ReconciliationHookEnabled ?? false,
       // NFM-3857 — API-layer PreCompletionMerge gate (default OFF).
       precompletionMergeHookEnabled: parsed.data.precompletionMergeHookEnabled ?? false,
-      adr009ReconciliationHookEnabled: parsed.data.adr009ReconciliationHookEnabled ?? false,
       // ADR-010 §D2 (NFM-3860) — daily phantom-merge-pass backfill flag.
       phantomBackfillHookEnabled: parsed.data.phantomBackfillHookEnabled ?? false,
     };

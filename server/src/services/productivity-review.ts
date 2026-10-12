@@ -17,7 +17,7 @@ import { issueService } from "./issues.js";
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
-} from "./recovery/model-profile-hint.js";
+} from "./recovery/successful-run-handoff.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;

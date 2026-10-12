@@ -2307,6 +2307,20 @@ export function pluginLoader(
       // (eventSubscriptions: 0) for the worker's life (LOOA-695). The same rows
       // drive startup config delivery in step 5b below. Listing is best-effort:
       // if it fails the worker still starts, just with no proactive access.
+      let configRows: Awaited<ReturnType<typeof registry.listConfigs>> = [];
+      try {
+        configRows = await registry.listConfigs(pluginId);
+      } catch (listErr) {
+        log.debug(
+          {
+            pluginId,
+            pluginKey,
+            err: listErr instanceof Error ? listErr.message : String(listErr),
+          },
+          "plugin-loader: could not list stored configs before worker start",
+        );
+      }
+
       // ------------------------------------------------------------------
       // 5. Spawn worker process
       // ------------------------------------------------------------------
