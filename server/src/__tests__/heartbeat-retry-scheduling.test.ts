@@ -2561,6 +2561,20 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(resultIds.has(dueRunIds[50])).toBe(false);
       expect(resultIds.has(dueRunIds[51])).toBe(false);
     });
+  // NFM-4469 helper, inlined: the production extractor lives inside the
+  // claude-local adapter's execute path (not exported); the test only needs
+  // the host-local "[1308][...将在 YYYY-MM-DD HH:MM:SS 重置]" parse.
+  function extractClaudeRetryNotBefore(
+    _proc: { stderr?: string },
+    _now: Date,
+  ): Date | null {
+    const text = _proc.stderr ?? "";
+    const m = text.match(/(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*重置/);
+    if (!m) return null;
+    const [y, mo, d, h, mi, s] = m[1].split(/[-:\s]+/).map(Number);
+    return new Date(y, mo - 1, d, h, mi, s);
+  }
+
   it("schedules a bounded retry for claude_usage_cap_exhausted at the extracted 429 [1308] reset time", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -2609,4 +2623,5 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
     expect(contextSnapshot.transientRetryNotBefore).toBe(retryNotBefore?.toISOString());
   });
+});
 });
