@@ -20,7 +20,6 @@ import {
   or,
   sql,
 } from "drizzle-orm";
-import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
 import type { ZodType } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
@@ -59,7 +58,6 @@ import type {
   IssueThreadInteractionKind,
   IssueThreadInteractionResolverPolicy,
   IssueThreadInteractionResolverPolicyProvenance,
-  IssueThreadInteractionKind,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
@@ -141,10 +139,8 @@ import {
 
 export { extractGitHubPullRequestReferences } from "./github-pull-request-merge.js";
 export type { GitHubPullRequestReference } from "./github-pull-request-merge.js";
-import { conflict, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { recordInteractionResultFallback } from "../metrics/interaction-result-fallback.js";
-import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 
 type InteractionActor = {
   identityContextId?: string | null;
@@ -627,20 +623,6 @@ function isEquivalentCreateRequest(
  * unparseable `result` to `null` (the interaction still lists; a
  * resolved-but-unparseable result is treated as absent) instead of throwing.
  */
-function parseStoredInteractionResult<S extends z.ZodTypeAny>(
-  schema: S,
-  raw: unknown,
-  row: Pick<IssueThreadInteractionRow, "id" | "kind">,
-): z.infer<S> | null {
-  if (raw == null) return null;
-  const parsed = schema.safeParse(raw);
-  if (parsed.success) return parsed.data;
-  console.warn(
-    `[paperclip] Dropping unparseable ${row.kind} interaction result for interaction ${row.id}`,
-    parsed.error.issues,
-  );
-  return null;
-}
 
 /**
  * Cap on the stringified raw result embedded in read-time fallback `reason` /
@@ -683,7 +665,7 @@ function parseStoredInteractionResult<T>(
   kind: IssueThreadInteractionKind,
   schema: ZodType<T>,
   row: IssueThreadInteractionRow,
-  buildFallback: (rawDescription: string) => T,
+  buildFallback?: (rawDescription: string) => T,
 ): T | null {
   if (row.result == null) return null;
   const parsed = schema.safeParse(row.result);
@@ -702,6 +684,13 @@ function parseStoredInteractionResult<T>(
     logger.warn(
       logContext,
       "issue thread interaction result failed schema validation on a non-expired row; serving result: null",
+    );
+    return null;
+  }
+  if (!buildFallback) {
+    logger.warn(
+      logContext,
+      "issue thread interaction result failed schema validation on an expired row; serving result: null",
     );
     return null;
   }
@@ -766,9 +755,6 @@ export function hydrateInteraction(
         kind: "suggest_tasks",
         payload: suggestTasksPayloadSchema.parse(row.payload),
         result: parseStoredInteractionResult(
-          suggestTasksResultSchema,
-          row.result,
-          row,
           "suggest_tasks",
           suggestTasksResultSchema,
           row,
@@ -781,9 +767,6 @@ export function hydrateInteraction(
         kind: "ask_user_questions",
         payload: askUserQuestionsPayloadSchema.parse(row.payload),
         result: parseStoredInteractionResult(
-          askUserQuestionsResultSchema,
-          row.result,
-          row,
           "ask_user_questions",
           askUserQuestionsResultSchema,
           row,
@@ -801,14 +784,11 @@ export function hydrateInteraction(
         kind: "request_confirmation",
         payload: requestConfirmationPayloadSchema.parse(row.payload),
         result: parseStoredInteractionResult(
-          requestConfirmationResultSchema,
-          row.result,
-          row,
           "request_confirmation",
           requestConfirmationResultSchema,
           row,
           (rawDescription) => ({ version: 1, outcome: "auto_expired", reason: rawDescription }),
-        ),
+          ) as RequestConfirmationInteraction["result"],
       } satisfies RequestConfirmationInteraction;
     case "request_checkbox_confirmation":
       return {
@@ -816,14 +796,11 @@ export function hydrateInteraction(
         kind: "request_checkbox_confirmation",
         payload: requestCheckboxConfirmationPayloadSchema.parse(row.payload),
         result: parseStoredInteractionResult(
-          requestCheckboxConfirmationResultSchema,
-          row.result,
-          row,
           "request_checkbox_confirmation",
           requestCheckboxConfirmationResultSchema,
           row,
           (rawDescription) => ({ version: 1, outcome: "auto_expired", reason: rawDescription }),
-        ),
+          ) as RequestCheckboxConfirmationInteraction["result"],
       } satisfies RequestCheckboxConfirmationInteraction;
     case "request_item_verdicts":
       return {

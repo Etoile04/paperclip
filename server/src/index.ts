@@ -1338,14 +1338,14 @@ async function startServerWithDatabaseTeardown(
   const secretProposals = createSecretProposalsService(db as any);
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
     const retentionExecutor = decisionRetentionService(db as any, {
-      notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
+      notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat!.wakeup),
     });
     drainHeartbeatRunsForShutdown = (signal, runIds) => (
-      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
+      heartbeat!.drainRunningRunsForShutdown(signal, new Date(), runIds)
     );
     drainHeartbeatExecutionFinalizers = () =>
-      heartbeat.drainActiveRunExecutions();
-    prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
+      heartbeat!.drainActiveRunExecutions();
+    prepareHotRestartShutdown = heartbeat!.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
   // Wired into the SIGTERM/SIGINT shutdown path so in-flight adapter children
   // are terminated and their runs finalized before the process exits (NFM-4785).

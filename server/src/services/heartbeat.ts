@@ -323,7 +323,7 @@ import {
   flushFleetThrottleCounters,
   recordFleetThrottleCounterTrip,
 } from "./fleet-throttle-counter-sink.js";
-import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -3679,7 +3679,6 @@ const heartbeatRunIssueSummaryColumns = {
     string | null
   >`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
   outputChannelState: heartbeatRuns.outputChannelState,
-  issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
 } as const;
 
 function appendExcerpt(prev: string, chunk: string) {
@@ -13845,22 +13844,6 @@ export function heartbeatService(
     }
 
     if (decision.kind !== "enqueue" || !issue) return;
-    if (decision.kind !== "enqueue" || !issue) {
-      // NFM-4279: make skip reasons observable so delegation skips can be counted.
-      if (decision.kind === "skip") {
-        logger.info(
-          {
-            issueId: issue?.id ?? null,
-            issueIdentifier: issue?.identifier ?? null,
-            runId: run.id,
-            agentId: run.agentId,
-            reason: decision.reason,
-          },
-          "successful run handoff skipped",
-        );
-      }
-      return;
-    }
 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db
@@ -14143,7 +14126,7 @@ export function heartbeatService(
       .returning()
       .then((rows) => rows[0] ?? null);
     if (!updated) return null;
-    await appendRunEvent(updated, await nextRunEventSeq(updated.id), {
+    await appendRunEvent(updated, {
       eventType: "channel_severed",
       stream: "system",
       level: "warn",
@@ -18428,7 +18411,13 @@ export function heartbeatService(
 
   async function finalizeAgentStatus(
     agentId: string,
-    outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
+    outcome:
+      | "succeeded"
+      | "interrupted"
+      | "failed"
+      | "cancelled"
+      | "timed_out"
+      | "observability_lost",
     failureReason?: string | null,
     options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean },
   ) {
@@ -18498,7 +18487,13 @@ export function heartbeatService(
 
   function mergeRunStopMetadataForAgent(
     agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
-    outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
+    outcome:
+      | "succeeded"
+      | "interrupted"
+      | "failed"
+      | "cancelled"
+      | "timed_out"
+      | "observability_lost",
     options?: {
       resultJson?: Record<string, unknown> | null;
       conversationContinuationEligible?: boolean;
@@ -19916,7 +19911,7 @@ export function heartbeatService(
           processGroupId: run.processGroupId,
         });
         detachedSinceAt.delete(run.id);
-        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        await appendRunEvent(run, {
           eventType: "lifecycle",
           stream: "system",
           level: "warn",
@@ -19999,7 +19994,7 @@ export function heartbeatService(
             failureReason: finalizedSeveredRun.error ?? undefined,
           });
           await releaseIssueExecutionAndPromote(finalizedSeveredRun);
-          await appendRunEvent(finalizedSeveredRun, await nextRunEventSeq(finalizedSeveredRun.id), {
+          await appendRunEvent(finalizedSeveredRun, {
             eventType: "lifecycle",
             stream: "system",
             level: "warn",
@@ -20018,7 +20013,6 @@ export function heartbeatService(
         continue;
       }
 
-      const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
         descendantOnlyCleanup = true;
@@ -20502,6 +20496,7 @@ export function heartbeatService(
       | "processStartedAt"
       | "startedAt"
       | "createdAt"
+      | "outputChannelState"
     >,
     now = new Date(),
   ) {
@@ -27969,78 +27964,6 @@ export function heartbeatService(
       });
     }
 
-    // ADR-014 L5 heavy classification (NFM-4946): wakes that carry a
-    // caller-supplied token estimate flow through the fleet-dispatch guard.
-    // The estimate rides on payload.estimatedTokens — forwarded verbatim by
-    // both wakeup routes — so agents/board callers can classify their own
-    // wakes heavy today. Estimate-less wakes keep the pre-NFM-4946 behavior
-    // (not classifiable as heavy → allowed), so timer ticks and legacy
-    // callers are unaffected. Continuations of a RUNNING run get in-flight
-    // semantics (demote to read-only preamble); everything else gets
-    // new-dispatch semantics (block).
-    const estimatedTokens = extractEstimatedTokens({
-      estimatedTokens: opts.estimatedTokens ?? null,
-      payload,
-      contextSnapshot: opts.contextSnapshot ?? null,
-    });
-    if (estimatedTokens !== null) {
-      const burnBudget = await readBurnBudgetForAgent(db, agentId);
-      const inflightRunIdRaw = payload?.runId ?? enrichedContextSnapshot.resumeFromRunId;
-      const inflightRunId =
-        typeof inflightRunIdRaw === "string" && isUuidLike(inflightRunIdRaw) ? inflightRunIdRaw : null;
-      const inflightRun = inflightRunId ? await getRun(inflightRunId) : null;
-      const guardResult = evaluateWakeupDispatch({
-        estimatedTokens,
-        burnBudget,
-        inflight: inflightRun?.agentId === agentId && inflightRun.status === "running",
-      });
-      if (guardResult.verdict === DISPATCH_VERDICT_BLOCK) {
-        recordFleetDispatchBlocked(FleetDispatchBlockedReason.FleetCapTripped);
-        recordFleetThrottleCounterTrip(agent.companyId, METRIC_FLEET_DISPATCH_BLOCKED, {
-          reason: FleetDispatchBlockedReason.FleetCapTripped,
-        });
-        // Trips are rare — flush inline so the counter row is durable even
-        // if the process dies before the next timer tick. A sink failure
-        // must never mask the guard's 409.
-        try {
-          await flushFleetThrottleCounters(db, [agent.companyId]);
-        } catch (error) {
-          logger.warn({ err: error, agentId }, "fleet_throttle_counter_flush_failed");
-        }
-        await writeSkippedRequest("fleet.blocked", {
-          payload: {
-            ...(payload ?? {}),
-            fleetGuard: {
-              verdict: guardResult.verdict,
-              reason: guardResult.reason,
-              estimatedTokens,
-              remainingPctOfCeiling: burnBudget.remainingPctOfCeiling,
-            },
-          },
-        });
-        throw conflict("Fleet dispatch blocked: agent burn budget tripped (ADR-014 L5)", {
-          guardReason: guardResult.reason,
-          estimatedTokens,
-          remainingPctOfCeiling: burnBudget.remainingPctOfCeiling,
-        });
-      }
-      if (guardResult.verdict === DISPATCH_VERDICT_ALLOW_DEMOTED) {
-        recordAgentBurnBudgetDemote(DEMOTE_POLICY);
-        recordFleetThrottleCounterTrip(agent.companyId, METRIC_AGENT_BURN_DEMOTE, {
-          policy: DEMOTE_POLICY,
-        });
-        try {
-          await flushFleetThrottleCounters(db, [agent.companyId]);
-        } catch (error) {
-          logger.warn({ err: error, agentId }, "fleet_throttle_counter_flush_failed");
-        }
-        Object.assign(
-          enrichedContextSnapshot,
-          annotateContextSnapshot(enrichedContextSnapshot, guardResult, burnBudget),
-        );
-      }
-    }
-
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
       if (opts.requestedByActorType !== "user" || executionWaitRequestId) {
@@ -29779,19 +29702,43 @@ export function heartbeatService(
     return newRun;
   }
 
-  /**
-   * Native status commitment deliberately persists dependency/parent wake
-   * intents in the same transaction as the authoritative status projection.
-   * Those rows are not runnable until the heartbeat scheduler has applied its
-   * normal policy, workspace, concurrency, and responsible-user checks. Bridge
-   * the durable intent into that scheduler here instead of treating a bare
-   * `agent_wakeup_requests` row as if it were already a queued heartbeat run.
-   *
-   * The intent is claimed before dispatch. A deterministic dispatcher actor id
-   * lets a later sweep recover the narrow process-crash window after the real
-   * wake was inserted but before the intent was linked to it. Dispatch failure
-   * only requeues the intent; it never changes the provider run outcome.
-   */
+
+  async function releaseIssueExecutionAndPromote(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
+    options: { suppressImmediateRecovery?: boolean } = {},
+  ) {
+    try {
+      const source = await getRun(run.id);
+      const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
+        companyId: run.companyId,
+        runId: run.id,
+        now: new Date(),
+        // A durable authentication card owns recovery. This covers the review path,
+        // while continuation classification blocks periodic generic retries.
+        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source),
+      });
+      await applyWakeQueuePostCommitEffects(postCommitEffects);
+      const completed = await getRun(run.id);
+      const issueId = readNonEmptyString(completed?.contextSnapshot?.issueId)
+        ?? readNonEmptyString(completed?.contextSnapshot?.taskId) ?? completed?.nativeIssueId;
+      if (completed?.status === "succeeded" && issueId) {
+        await settleSlackConversation(db, run.companyId, issueId).catch((err) => {
+          logger.warn({ err, runId: run.id }, "Slack conversation settlement deferred to reconciliation");
+        });
+      }
+    } catch (error) {
+      if (
+        error instanceof WakeQueueApplicationError &&
+        error.code === "responsible_user_unresolved"
+      ) {
+        // Every other `responsible_user_unresolved` HttpError in this file
+        // carries `code` inside its own `details`; match that shape here too.
+        throw new HttpError(422, error.message, { code: error.code, ...error.details });
+      }
+      throw error;
+    }
+  }
+
   async function dispatchPendingNativeStatusWakeups(
     input: {
       companyId?: string;
@@ -31198,7 +31145,6 @@ export function heartbeatService(
           reason: "heartbeat_timer",
           requestedByActorType: "system",
           requestedByActorId: "heartbeat_scheduler",
-          contextSnapshot: annotatedSnapshot,
           contextSnapshot: annotatedSnapshot,
         });
         if (run) enqueued += 1;

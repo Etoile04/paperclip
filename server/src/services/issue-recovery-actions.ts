@@ -256,23 +256,6 @@ export function issueRecoveryActionService(db: Db) {
     return row ? toReadModel(row) : null;
   }
 
-  // NFM-4958 3: most recent arm attempt for the issue regardless of status —
-  // resolved actions still count toward the rate-limit window.
-  async function getMostRecentForIssue(companyId: string, sourceIssueId: string): Promise<IssueRecoveryAction | null> {
-    const row = await db
-      .select()
-      .from(issueRecoveryActions)
-      .where(
-        and(
-          eq(issueRecoveryActions.companyId, companyId),
-          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
-        ),
-      )
-      .orderBy(sql`${issueRecoveryActions.lastAttemptAt} desc nulls last`, desc(issueRecoveryActions.updatedAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return row ? toReadModel(row) : null;
-  }
 
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
     if (sourceIssueIds.length === 0) return new Map<string, IssueRecoveryAction>();

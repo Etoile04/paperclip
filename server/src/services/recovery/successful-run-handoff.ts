@@ -16,9 +16,6 @@ import {
   systemNoticePresentation,
 } from "./notice-format.js";
 import { activityLog } from "@paperclipai/db";
-import { activityLog, agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
-import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
-import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 
 // ---------------------------------------------------------------------------
 // Recovery model profile hints (ported verbatim from the fork's
