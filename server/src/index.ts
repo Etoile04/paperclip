@@ -1182,7 +1182,7 @@ async function startServerWithDatabaseTeardown(
   const executionControlSweeps = [
     ["finalization", () => reconcileAbandonedExecutionControl(db)],
     ["replacement", () => heartbeat ? reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }) : undefined],
-    ["reconciliation_delivery", () => heartbeat ? deliverReconciledExecutions(db, heartbeat.wakeup) : undefined],
+    ["reconciliation_delivery", () => heartbeat ? deliverReconciledExecutions(db, heartbeat!.wakeup) : undefined],
     ["status_delivery", () => deliverExecutionStatuses(db)],
     ["automatic_disposition", () => settleUnrecoverableExecutions(db)],
     ["local_ai_login_cleanup", () => localAiLoginService(db).reapExpired()],
@@ -1352,7 +1352,7 @@ async function startServerWithDatabaseTeardown(
     const statusCards = statusCardService(db as any);
     const issues = issueService(db as any);
     const mergedPullRequestConfirmations = issueThreadInteractionService(db as any, {
-      wakeup: heartbeat.wakeup,
+      wakeup: heartbeat!.wakeup,
     });
     const terminalWorkspaces = executionWorkspaceService(db as any, {
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
@@ -1935,7 +1935,8 @@ async function startServerWithDatabaseTeardown(
       scheduleEnvironmentLeaseCleanupSweep();
       scheduleGitHubConnectionEventPoll();
       scheduleGitHubConnectionContinuitySweep();
-    });  }
+    });
+  }
   
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
