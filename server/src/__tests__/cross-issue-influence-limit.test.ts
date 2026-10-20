@@ -198,8 +198,13 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
-    const fake = counterDb(0, { contextSnapshot: {} });
+  it("counts writes from an unassigned run against the cap instead of denying them", async () => {
+    // A board on-demand wake carries wakeReason as free text and no
+    // issueId/taskId binding (NFM-5677). Its writes must count against the
+    // shared per-run budget rather than fail closed.
+    const fake = counterDb(0, {
+      contextSnapshot: { wakeReason: "NFM-5676: verify dispatch", wakeSource: "on_demand" },
+    });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
       companyId: "22222222-2222-4222-8222-222222222222",
@@ -207,10 +212,37 @@ describe("cross-issue influence limit rollout", () => {
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
+    expect(fake.inserted).toHaveLength(1);
+    expect(fake.inserted[0]).toMatchObject({
+      action: "issue.cross_issue_influence_observed",
+      details: expect.objectContaining({
+        sourceIssueId: null,
+        unassignedRun: true,
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+      }),
     });
-    expect(fake.inserted).toEqual([]);
+  });
+
+  it("fails closed at the cap for an unassigned run like any other run", async () => {
+    const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, {
+      contextSnapshot: { wakeReason: "NFM-5676: verify dispatch" },
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({
+      allowed: false,
+      mode: "enforce",
+      count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+    });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
+    ]);
   });
 });

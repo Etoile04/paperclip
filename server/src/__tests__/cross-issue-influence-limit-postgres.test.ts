@@ -113,4 +113,74 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_observed")).toHaveLength(20);
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_cap_rejected")).toHaveLength(1);
   });
+
+  it("counts every write of an unassigned board on-demand run against the cap", async () => {
+    // NFM-5677: a board on-demand wake snapshot carries wakeReason free text
+    // and no issueId/taskId. Such a run must not be denied outright; each
+    // write — including to the issue named in wakeReason — spends cap budget.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const targetIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "On-Demand Verifier",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      responsibleUserId: "board-user",
+      contextSnapshot: {
+        wakeReason: "NFM-5676: zcode_local external adapter reinstalled; verify dispatch",
+        wakeSource: "on_demand",
+        triggeredBy: "board",
+        wakeTriggerDetail: "manual",
+      },
+    });
+
+    const base = {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId,
+      kind: "comment" as const,
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    };
+    // Repeating the same target spends budget each time: an unassigned run has
+    // no source issue, so no same-issue exemption can apply.
+    const first = await observeCrossIssueInfluence(db, base);
+    const second = await observeCrossIssueInfluence(db, { ...base, kind: "update" });
+
+    expect(first).toMatchObject({ allowed: true, count: 1 });
+    expect(second).toMatchObject({ allowed: true, count: 2 });
+
+    const rows = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.action).toBe("issue.cross_issue_influence_observed");
+      expect(row.details).toMatchObject({
+        sourceIssueId: null,
+        unassignedRun: true,
+        targetIssueId,
+      });
+    }
+  });
 });
