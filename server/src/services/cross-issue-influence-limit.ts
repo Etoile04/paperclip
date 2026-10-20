@@ -109,11 +109,17 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
+    // An unassigned run (e.g. a board on-demand wake) carries no source issue in
+    // its context snapshot. The cap contract says this guard is a rate backstop,
+    // not a permission decision, so an unassigned run's writes count against the
+    // shared per-run budget instead of being denied outright — every write is
+    // cross-issue when the run has no source issue to exempt.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    const unassignedRun = sourceIssueId === null;
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      !unassignedRun &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }
@@ -144,6 +150,7 @@ export async function observeCrossIssueInfluence(
       details: {
         kind: input.kind,
         sourceIssueId,
+        unassignedRun,
         targetIssueId: input.targetIssueId,
         targetIssueIdentifier: input.targetIssueIdentifier ?? null,
         count: decision.count,
@@ -160,6 +167,7 @@ export async function observeCrossIssueInfluence(
       runId: input.runId,
       agentId: input.agentId,
       sourceIssueId,
+      unassignedRun,
       targetIssueId: input.targetIssueId,
       kind: input.kind,
       count: decision.count,
