@@ -3718,7 +3718,7 @@ registry.registerPath({
   tags: ["agents"],
   summary: "Wake up an agent",
   description:
-    "Board failed-run retries supply failedRunId with reason retry_failed_run. Paperclip derives the exact request and current authorization; a chat retry may return a durable queued/deferred receipt before a run exists. Caller task/comment markers and fresh-session overrides do not authorize replay.",
+    "Board failed-run retries supply failedRunId with reason retry_failed_run. Paperclip derives the exact request and current authorization; a chat retry may return a durable queued/deferred receipt before a run exists. Caller task/comment markers and fresh-session overrides do not authorize replay. On-demand wakes may name an issue via payload.issueId (canonical UUID) or payload.issueIdentifier (e.g. NFM-1234): the server resolves it within the agent's company, binds the run's contextSnapshot.issueId/taskId to the canonical UUID, and records wakeIssueBindingSource provenance (\"payload\" or \"reason\"). A structured reference that does not resolve within the agent's company returns 404. Board/user wakes without a structured reference derive the binding from the first issue identifier in the reason text; an unresolvable derived reference stays unbound. Agent-actor wakes never derive from reason text and must use payload.issueId explicitly.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(wakeAgentSchema),

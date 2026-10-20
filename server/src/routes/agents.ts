@@ -37,6 +37,7 @@ import {
   createAgentHireSchema,
   createAgentSchema,
   deriveAgentUrlKey,
+  extractIssueReferenceIdentifiers,
   isUuidLike,
   normalizeIssueIdentifier,
   resetAgentSessionSchema,
@@ -6311,6 +6312,51 @@ export function agentRoutes(
         ),
       );
     }
+    // NFM-5678: bind the issue a board on-demand wake names, so same-issue
+    // writes take the NFM-5677 same-issue exemption instead of spending
+    // cross-issue budget. Resolution is dispatch-side and canonicalizes to the
+    // issue UUID — payload.issueId reaching heartbeat.wakeup must be a
+    // canonical UUID because the service-side execution-context lookups are
+    // UUID-only. The failedRunId retry path derives its binding from the
+    // server record above and stays untouched.
+    let wakeIssueBindingSource: "payload" | "reason" | null = null;
+    let wakeIssueBindingIdentifier: string | null = null;
+    if (!req.body.failedRunId) {
+      const readStructuredRef = (value: unknown): string | null =>
+        typeof value === "string" && value.trim() ? value.trim() : null;
+      const structuredRef =
+        readStructuredRef(wakePayload?.["issueId"]) ??
+        readStructuredRef(wakePayload?.["issueIdentifier"]);
+      // Free text is not a contract, so only board/user actors get derivation:
+      // an agent must not be able to self-declare an exemption target by
+      // typing an identifier into its own wake reason.
+      const derivedRef =
+        structuredRef === null &&
+        req.actor.type !== "agent" &&
+        typeof req.body.reason === "string"
+          ? extractIssueReferenceIdentifiers(req.body.reason)[0] ?? null
+          : null;
+      const reference = structuredRef ?? derivedRef;
+      if (reference) {
+        const issue = await issueService(db).getById(reference);
+        if (issue && issue.companyId === agent.companyId) {
+          wakePayload = {
+            ...wakePayload,
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+          };
+          wakeIssueBindingSource = structuredRef === null ? "reason" : "payload";
+          wakeIssueBindingIdentifier = issue.identifier;
+        } else if (structuredRef !== null) {
+          // An explicit structured reference is a contract: unresolvable or
+          // cross-company is a caller error mirroring the retry path's
+          // notFound("Task not found"), not a silently unbound wake.
+          throw notFound("Task not found");
+        }
+        // A derived reference that does not resolve stays unbound; NFM-5677
+        // unassigned-run semantics apply unchanged.
+      }
+    }
     const run = await heartbeat.wakeup(id, {
       failedRunId: req.body.failedRunId ?? null,
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
@@ -6333,6 +6379,16 @@ export function agentRoutes(
         responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,
         actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
         forceFreshSession: req.body.forceFreshSession === true,
+        // NFM-5678 binding provenance — absent on failedRunId retries, whose
+        // binding is server-derived from the selected run.
+        ...(req.body.failedRunId
+          ? {}
+          : {
+              wakeIssueBindingSource,
+              ...(wakeIssueBindingIdentifier === null
+                ? {}
+                : { wakeIssueBindingIdentifier }),
+            }),
         ...(req.body.reason === "rerun_with_provider_trace" &&
         req.body.debug?.providerTrace === "raw"
           ? { resumeIntent: true }

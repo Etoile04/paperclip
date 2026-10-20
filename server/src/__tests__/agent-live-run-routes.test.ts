@@ -1034,6 +1034,197 @@ describe("agent live run routes", () => {
     );
   });
 
+  describe("board wake issue binding (NFM-5678)", () => {
+    const boundIssueId = "55555555-5555-4555-8555-555555555555";
+    const boundIssue = {
+      id: boundIssueId,
+      companyId: "company-1",
+      identifier: "NFM-9998",
+      status: "in_progress",
+    };
+
+    function wakeOptions() {
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+      return mockHeartbeatService.wakeup.mock.calls[0][1];
+    }
+
+    it("binds a structured payload identifier to the canonical UUID with payload provenance", async () => {
+      mockIssueService.getById.mockResolvedValue(boundIssue);
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ payload: { issueIdentifier: "nfm-9998" } }),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).toHaveBeenCalledWith("nfm-9998");
+      const options = wakeOptions();
+      expect(options.payload).toEqual({ issueId: boundIssueId, issueIdentifier: "NFM-9998" });
+      expect(options.contextSnapshot).toMatchObject({
+        wakeIssueBindingSource: "payload",
+        wakeIssueBindingIdentifier: "NFM-9998",
+      });
+    });
+
+    it("passes a canonical payload issue UUID through and records payload provenance", async () => {
+      mockIssueService.getById.mockResolvedValue(boundIssue);
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ payload: { issueId: boundIssueId } }),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).toHaveBeenCalledWith(boundIssueId);
+      const options = wakeOptions();
+      expect(options.payload).toEqual({ issueId: boundIssueId, issueIdentifier: "NFM-9998" });
+      expect(options.contextSnapshot).toMatchObject({
+        wakeIssueBindingSource: "payload",
+        wakeIssueBindingIdentifier: "NFM-9998",
+      });
+    });
+
+    it("returns 404 without a run when a structured reference does not resolve", async () => {
+      mockIssueService.getById.mockResolvedValue(null);
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ payload: { issueIdentifier: "NFM-0000" } }),
+      );
+      expect(res.status).toBe(404);
+      expect(res.body).toMatchObject({ error: "Task not found" });
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("returns 404 when the structured reference belongs to another company", async () => {
+      mockIssueService.getById.mockResolvedValue({ ...boundIssue, companyId: "company-2" });
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ payload: { issueId: boundIssueId } }),
+      );
+      expect(res.status).toBe(404);
+      expect(res.body).toMatchObject({ error: "Task not found" });
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("derives the binding from the leading reason identifier for a board actor", async () => {
+      mockIssueService.getById.mockResolvedValue(boundIssue);
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ reason: "NFM-9998: verify the external adapter reinstall" }),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).toHaveBeenCalledWith("NFM-9998");
+      const options = wakeOptions();
+      expect(options.payload).toEqual({ issueId: boundIssueId, issueIdentifier: "NFM-9998" });
+      expect(options.contextSnapshot).toMatchObject({
+        wakeIssueBindingSource: "reason",
+        wakeIssueBindingIdentifier: "NFM-9998",
+      });
+    });
+
+    it("stays unbound when a derived reason identifier does not resolve", async () => {
+      mockIssueService.getById.mockResolvedValue(null);
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ reason: "NFM-0000: the scratch card was deleted" }),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      const options = wakeOptions();
+      expect(options.payload).toBeNull();
+      expect(options.contextSnapshot).toMatchObject({ wakeIssueBindingSource: null });
+      expect(options.contextSnapshot).not.toHaveProperty("wakeIssueBindingIdentifier");
+    });
+
+    it("leaves a board wake unbound when the reason names no issue", async () => {
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ reason: "status check, no card reference" }),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockIssueService.getById).not.toHaveBeenCalled();
+      const options = wakeOptions();
+      expect(options.payload).toBeNull();
+      expect(options.contextSnapshot).toMatchObject({ wakeIssueBindingSource: null });
+    });
+
+    it("never derives from reason text for agent actors but binds an explicit payload reference", async () => {
+      const agentActor = {
+        type: "agent",
+        agentId: routeAgentId,
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-1",
+      };
+      const reasonOnly = await requestApp(await createApp(undefined, agentActor), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ reason: "NFM-9998: agent self invoke" }),
+      );
+      expect(reasonOnly.status, JSON.stringify(reasonOnly.body)).toBe(202);
+      expect(mockIssueService.getById).not.toHaveBeenCalled();
+      let options = wakeOptions();
+      expect(options.payload).toBeNull();
+      expect(options.contextSnapshot).toMatchObject({ wakeIssueBindingSource: null });
+
+      mockHeartbeatService.wakeup.mockClear();
+      mockIssueService.getById.mockResolvedValue(boundIssue);
+      const explicit = await requestApp(await createApp(undefined, agentActor), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/wakeup`)
+          .send({ payload: { issueIdentifier: "NFM-9998" } }),
+      );
+      expect(explicit.status, JSON.stringify(explicit.body)).toBe(202);
+      options = wakeOptions();
+      expect(options.payload).toEqual({ issueId: boundIssueId, issueIdentifier: "NFM-9998" });
+      expect(options.contextSnapshot).toMatchObject({
+        wakeIssueBindingSource: "payload",
+        wakeIssueBindingIdentifier: "NFM-9998",
+      });
+    });
+
+    it("keeps failedRunId retries bound only to the failed run's server-derived fields", async () => {
+      const fixture = createFailedChatRetryDb(false);
+      const failedRunId = "66666666-6666-4666-8666-666666666666";
+      mockAgentService.getById.mockResolvedValue({
+        id: routeAgentId,
+        companyId: "company-1",
+      });
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: failedRunId,
+        companyId: "company-1",
+        agentId: routeAgentId,
+        status: "failed",
+        contextSnapshot: { issueId: boundIssueId, taskId: boundIssueId, taskKey: "task-key-1" },
+      });
+      mockIssueService.getById.mockResolvedValue({
+        ...boundIssue,
+        assigneeAgentId: routeAgentId,
+        assigneeUserId: null,
+        projectId: null,
+        parentId: null,
+      });
+      const res = await requestApp(await createApp(fixture.db, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({
+        failedRunId,
+        reason: "retry_failed_run",
+        // A caller-supplied reference must not layer on top of the retry.
+        payload: { issueIdentifier: "NFM-9998" },
+      }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      // Only the retry path's own server-derived lookup ran.
+      expect(mockIssueService.getById).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.getById).toHaveBeenCalledWith(boundIssueId);
+      const options = wakeOptions();
+      expect(options.payload).toEqual({ issueId: boundIssueId, taskId: boundIssueId, taskKey: "task-key-1" });
+      expect(options.contextSnapshot).not.toHaveProperty("wakeIssueBindingSource");
+    });
+
+  });
+
   describe("exact failed chat run retry", () => {
     const retryBody = {
       failedRunId: failedChatRunId,
@@ -1562,6 +1753,11 @@ describe("agent live run routes", () => {
 
   it("marks traced re-runs as explicit resumes so terminal issue context can execute", async () => {
     const issueId = "22222222-2222-4222-8222-222222222222";
+    mockIssueService.getById.mockResolvedValue({
+      id: issueId,
+      companyId: "company-1",
+      identifier: "NFM-TRACE-1",
+    });
     const res = await requestApp(await createApp(), (baseUrl) =>
       request(baseUrl)
         .post(`/api/agents/${routeAgentId}/wakeup?companyId=company-1`)
