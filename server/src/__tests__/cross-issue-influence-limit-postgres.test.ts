@@ -183,4 +183,82 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       });
     }
   });
+
+  it("exempts the named issue and counts other issues for a bound board on-demand run", async () => {
+    // NFM-5678: the wakeup route binds contextSnapshot.issueId at dispatch, so
+    // the guard sees a source issue: writes to the named issue take the
+    // same-issue exemption (no activity row, no budget), everything else
+    // still counts. The guard itself is unchanged (NFM-5677).
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const otherIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Bound Wake Verifier",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      responsibleUserId: "board-user",
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        taskId: sourceIssueId,
+        taskKey: sourceIssueId,
+        wakeReason: "NFM-9998: verify dispatch",
+        wakeSource: "on_demand",
+        triggeredBy: "board",
+        wakeTriggerDetail: "manual",
+        wakeIssueBindingSource: "reason",
+        wakeIssueBindingIdentifier: "NFM-9998",
+      },
+    });
+
+    const base = {
+      companyId,
+      runId,
+      agentId,
+      kind: "comment" as const,
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    };
+    const exempt = await observeCrossIssueInfluence(db, { ...base, targetIssueId: sourceIssueId });
+    const counted = await observeCrossIssueInfluence(db, {
+      ...base,
+      targetIssueId: otherIssueId,
+      kind: "update",
+    });
+
+    expect(exempt).toBeNull();
+    expect(counted).toMatchObject({ allowed: true, count: 1 });
+
+    const rows = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "issue.cross_issue_influence_observed",
+      details: {
+        sourceIssueId,
+        unassignedRun: false,
+        targetIssueId: otherIssueId,
+      },
+    });
+  });
 });
