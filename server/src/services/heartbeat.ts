@@ -27477,42 +27477,6 @@ export function heartbeatService(
     }
   }
 
-  async function releaseIssueExecutionAndPromote(
-    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
-  ) {
-    try {
-      const source = await getRun(run.id);
-      const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
-        companyId: run.companyId,
-        runId: run.id,
-        now: new Date(),
-        // A durable authentication card owns recovery. This covers the review path,
-        // while continuation classification blocks periodic generic retries.
-        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source),
-      });
-      await applyWakeQueuePostCommitEffects(postCommitEffects);
-      const completed = await getRun(run.id);
-      const issueId = readNonEmptyString(completed?.contextSnapshot?.issueId)
-        ?? readNonEmptyString(completed?.contextSnapshot?.taskId) ?? completed?.nativeIssueId;
-      if (completed?.status === "succeeded" && issueId) {
-        await settleSlackConversation(db, run.companyId, issueId).catch((err) => {
-          logger.warn({ err, runId: run.id }, "Slack conversation settlement deferred to reconciliation");
-        });
-      }
-    } catch (error) {
-      if (
-        error instanceof WakeQueueApplicationError &&
-        error.code === "responsible_user_unresolved"
-      ) {
-        // Every other `responsible_user_unresolved` HttpError in this file
-        // carries `code` inside its own `details`; match that shape here too.
-        throw new HttpError(422, error.message, { code: error.code, ...error.details });
-      }
-      throw error;
-    }
-  }
-
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
