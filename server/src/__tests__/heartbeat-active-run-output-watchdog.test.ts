@@ -211,14 +211,18 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(manager?.status).toBe("idle");
   }
 
-  it("warns after five silent minutes and escalates after fifteen without changing active work", async () => {
+  it("warns after the suspicion threshold and escalates after the critical threshold without changing active work", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({ now, ageMs: 0 });
     const summaryAt = (elapsedMs: number) => buildSummary(seeded.runId, new Date(now.getTime() + elapsedMs));
-    await expect(summaryAt(5 * 60_000 - 1)).resolves.toMatchObject({ level: "ok" });
-    await expect(summaryAt(5 * 60_000)).resolves.toMatchObject({ level: "suspicious" });
-    await expect(summaryAt(15 * 60_000 - 1)).resolves.toMatchObject({ level: "suspicious" });
-    await expect(summaryAt(15 * 60_000)).resolves.toMatchObject({ level: "critical" });
+    // Thresholds come from the imported constants so the test tracks whatever
+    // ACTIVE_RUN_OUTPUT_* the fork runs (60/240 min tuning), not upstream literals.
+    const suspicion = ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+    const critical = ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS;
+    await expect(summaryAt(suspicion - 1)).resolves.toMatchObject({ level: "ok" });
+    await expect(summaryAt(suspicion)).resolves.toMatchObject({ level: "suspicious" });
+    await expect(summaryAt(critical - 1)).resolves.toMatchObject({ level: "suspicious" });
+    await expect(summaryAt(critical)).resolves.toMatchObject({ level: "critical" });
     const { recovery, enqueueWakeup } = createRecovery();
     await recovery.scanSilentActiveRuns({ now: new Date(now.getTime() + 35 * 60_000), companyId: seeded.companyId });
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
