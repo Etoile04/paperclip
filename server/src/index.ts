@@ -1563,6 +1563,13 @@ async function startServerWithDatabaseTeardown(
           .catch((err) => {
             logger.warn({ err }, "startup auth recovery sweep failed");
           });
+        // NFM-5774: resume turn-failure degradation evaluation after restart
+        // (no-op unless TURN_FAILURE_SIGNAL_CANARY_STATE_PATH is configured).
+        await heartbeat
+          .evaluateTurnFailureSignal()
+          .catch((err) => {
+            logger.warn({ err }, "startup turn-failure signal evaluation failed");
+          });
         const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
         if (
           recoveredGoalActions.enqueued > 0 ||
@@ -1934,6 +1941,10 @@ async function startServerWithDatabaseTeardown(
             .then(async () => {
               // NFM-5748: fire due auth-recovery re-enqueue retries.
               await heartbeat.sweepAuthRecoveryReenqueues();
+            })
+            .then(async () => {
+              // NFM-5774: evaluate the turn-failure degradation signal.
+              await heartbeat.evaluateTurnFailureSignal();
             })
             .catch((err) => {
               logger.error({ err }, "periodic heartbeat recovery failed");
