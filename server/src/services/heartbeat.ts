@@ -144,6 +144,7 @@ import {
   agentSessionGoalActions,
   agentTaskSessions,
   agentWakeupRequests,
+  authRecoveryEpisodes,
   activityLog,
   approvals,
   assets,
@@ -196,6 +197,13 @@ import {
   getStartupTraceContext,
   getStartupTracer,
 } from "../instrumentation.js";
+import {
+  AUTH_RECOVERY_ERROR_CODE,
+  AUTH_RECOVERY_GREEN_ADAPTER_TYPES,
+  AUTH_RECOVERY_WAKE_REASON,
+} from "../modules/auth-recovery/domain/policy.js";
+import { createAuthRecoveryService } from "../modules/auth-recovery/application/use-cases.js";
+import { createPostgresAuthRecoveryStore } from "../modules/auth-recovery/adapters/postgres.js";
 import { createHostDuplexObservabilityRecorder } from "./duplex-observability-recorder.js";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
@@ -9738,6 +9746,47 @@ export function heartbeatService(
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   });
   const runDispatch = createRunDispatch(db);
+
+  // NFM-5748: after a `claude_auth_required` episode, re-enqueue wakeups for
+  // the still-latched agents once a green authenticated `claude_local` run is
+  // observed, with hard bounds (≤3 attempts/agent, 10 min apart, 20/episode)
+  // and a recovery annotation on the latched `errorReason` surface (R4).
+  const authRecovery = createAuthRecoveryService(
+    createPostgresAuthRecoveryStore(db),
+    {
+      enqueueAuthRecoveryWake: async ({ agentId, episodeId, attempt, idempotencyKey }) =>
+        enqueueWakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: AUTH_RECOVERY_WAKE_REASON,
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          idempotencyKey,
+          contextSnapshot: {
+            wakeReason: AUTH_RECOVERY_WAKE_REASON,
+            authRecoveryEpisodeId: episodeId,
+            authRecoveryAttempt: attempt,
+          },
+        }),
+    },
+  );
+
+  async function sweepAuthRecoveryReenqueues() {
+    const rows = await db
+      .selectDistinct({ companyId: authRecoveryEpisodes.companyId })
+      .from(authRecoveryEpisodes)
+      .where(eq(authRecoveryEpisodes.state, "recovering"));
+    for (const { companyId } of rows) {
+      await authRecovery
+        .sweepRetries(companyId, { now: new Date().toISOString() })
+        .catch((error) => {
+          logger.warn(
+            { err: error, companyId },
+            "auth recovery re-enqueue sweep failed",
+          );
+        });
+    }
+  }
 
   // Applies the post-commit effects a run-dispatch operation returns, on a
   // best-effort basis, exactly as this service publishes them for every
@@ -26508,6 +26557,37 @@ export function heartbeatService(
               agent,
             );
           }
+          // NFM-5748: auth failures open/pause the recovery episode; a green
+          // authenticated run on the affected adapter family is the only
+          // trigger that re-enqueues the still-latched agents (AC3).
+          if (outcome === "failed" && runErrorCode === AUTH_RECOVERY_ERROR_CODE) {
+            await authRecovery
+              .observeAuthFailure(agent.companyId, {
+                at: (livenessRun.finishedAt ?? new Date()).toISOString(),
+              })
+              .catch((error) => {
+                logger.warn(
+                  { err: error, runId: livenessRun.id },
+                  "auth failure episode tracking failed",
+                );
+              });
+          }
+          if (
+            outcome === "succeeded" &&
+            AUTH_RECOVERY_GREEN_ADAPTER_TYPES.has(agent.adapterType)
+          ) {
+            await authRecovery
+              .observeGreen(agent.companyId, {
+                at: (livenessRun.finishedAt ?? new Date()).toISOString(),
+                runId: livenessRun.id,
+              })
+              .catch((error) => {
+                logger.warn(
+                  { err: error, runId: livenessRun.id },
+                  "auth recovery green observation failed",
+                );
+              });
+          }
           const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
             livenessRun,
             agent,
@@ -30943,6 +31023,8 @@ export function heartbeatService(
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
+
+    sweepAuthRecoveryReenqueues,
 
     resumeQueuedRuns,
 
