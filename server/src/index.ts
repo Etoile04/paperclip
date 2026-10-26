@@ -1557,6 +1557,12 @@ async function startServerWithDatabaseTeardown(
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
+        // NFM-5748: resume any auth-episode re-enqueue retries after restart.
+        await heartbeat
+          .sweepAuthRecoveryReenqueues()
+          .catch((err) => {
+            logger.warn({ err }, "startup auth recovery sweep failed");
+          });
         const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
         if (
           recoveredGoalActions.enqueued > 0 ||
@@ -1924,6 +1930,10 @@ async function startServerWithDatabaseTeardown(
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
               }
+            })
+            .then(async () => {
+              // NFM-5748: fire due auth-recovery re-enqueue retries.
+              await heartbeat.sweepAuthRecoveryReenqueues();
             })
             .catch((err) => {
               logger.error({ err }, "periodic heartbeat recovery failed");
