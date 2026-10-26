@@ -16,6 +16,12 @@ import { agents } from "./agents.js";
  * re-enqueue of the still-latched agents (≤3 attempts, 10 min apart,
  * 20 wakes per episode). `red` records latch evidence only; `recovering`
  * means a green observation triggered the re-enqueue; `closed` is terminal.
+ *
+ * NFM-5774 — the same table also holds degradation-class episodes
+ * (`kind = 'degradation'`, the turn-failure-rate passive signal). The auth
+ * lane reads only `kind = 'auth'` rows; the degradation lane reads only
+ * `kind = 'degradation'` rows. `lastRestatedAt` bounds degradation
+ * restatements to the R1 restate-≤1/h discipline while an episode stays red.
  */
 export const authRecoveryEpisodes = pgTable(
   "auth_recovery_episodes",
@@ -25,6 +31,7 @@ export const authRecoveryEpisodes = pgTable(
       .notNull()
       .references(() => companies.id),
     state: text("state").notNull().default("red"),
+    kind: text("kind").notNull().default("auth"),
     startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
     firstGreenAt: timestamp("first_green_at", { withTimezone: true }),
     firstGreenRunId: uuid("first_green_run_id"),
@@ -32,6 +39,7 @@ export const authRecoveryEpisodes = pgTable(
     wakesUsed: integer("wakes_used").notNull().default(0),
     reenqueuedCount: integer("reenqueued_count").notNull().default(0),
     manualCount: integer("manual_count").notNull().default(0),
+    lastRestatedAt: timestamp("last_restate_at", { withTimezone: true }),
     closedAt: timestamp("closed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

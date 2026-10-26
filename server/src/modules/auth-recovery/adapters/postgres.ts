@@ -57,6 +57,9 @@ export function createPostgresAuthRecoveryStore(db: Db): AuthRecoveryStore {
         .where(
           and(
             eq(authRecoveryEpisodes.companyId, companyId),
+            // NFM-5774: the auth lane never sees degradation-class episodes
+            // sharing this table.
+            eq(authRecoveryEpisodes.kind, "auth"),
             sql`${authRecoveryEpisodes.state} <> 'closed'`,
           ),
         )
@@ -68,7 +71,7 @@ export function createPostgresAuthRecoveryStore(db: Db): AuthRecoveryStore {
     async insertEpisode(companyId, input) {
       const [row] = await db
         .insert(authRecoveryEpisodes)
-        .values({ companyId, state: "red", startedAt: new Date(input.startedAt) })
+        .values({ companyId, state: "red", kind: "auth", startedAt: new Date(input.startedAt) })
         .returning();
       return episodeRowFrom(row!);
     },
