@@ -37,8 +37,15 @@ episode flips to `recovering` and the control plane re-enqueues wakeups:
   retries hold until the next green observation resumes them. Attempt
   counts and spacing are preserved across pauses.
 - **Closure**: once every enrolled agent is recovered, exhausted, or manual,
-  the episode closes. A later failure starts a fresh episode with a fresh
-  20-wake budget.
+  the episode closes. A green observation that enrolls nobody (no agent
+  latched) closes the episode immediately. A later failure starts a fresh
+  episode with a fresh 20-wake budget.
+- **Wake accounting**: retry sweeps add their fires to the episode's
+  `wakes_used` counter, so the 20-wake cap holds across sweeps, not just at
+  the green observation. If a crash ever lands between the `recovering`
+  flip and the enrollment writes, the sweep drops the episode back to
+  `red` instead of closing it, so the next green re-plans the latched
+  agents.
 
 ## What operators see (R4)
 

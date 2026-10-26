@@ -419,4 +419,107 @@ describe("createAuthRecoveryService", () => {
     await service.observeGreen("company-1", { at: "2026-10-26T09:10:05.000Z" });
     expect(calls).toHaveLength(1);
   });
+
+  it("enforces the 20-wake episode cap across repeated retry sweeps (NFM-5755 F1)", async () => {
+    const fake = createFakeStore("company-1");
+    const { enqueuer, calls } = createFakeEnqueuer();
+    const service = createAuthRecoveryService(fake.store, enqueuer);
+    const agentIds = Array.from({ length: 10 }, (_, index) => `agent-${String(index).padStart(2, "0")}`);
+    fake.seedAgents(agentIds.map((id) => ({ id, status: "error" })));
+    fake.seedRuns(agentIds.map((id, index) => latchedRun(id, new Date(Date.parse(T0) + index * 1000).toISOString())));
+
+    await service.observeAuthFailure("company-1", { at: T0 });
+    await service.observeGreen("company-1", { at: "2026-10-26T09:10:00.000Z" });
+    expect(calls).toHaveLength(10); // initial budget: 10 of 20
+
+    // Retries fire from sweeps alone (no re-green), and every re-enqueued
+    // run keeps failing, so the agents stay latched.
+    const first = await service.sweepRetries("company-1", { now: "2026-10-26T09:21:00.000Z" });
+    expect(first.fired).toBe(10);
+
+    // The sweep's fires must reach the episode budget: a stale count would
+    // let all ten agents fire attempt 3 too (30 wakes against a cap of 20).
+    const second = await service.sweepRetries("company-1", { now: "2026-10-26T09:32:00.000Z" });
+    expect(second.fired).toBe(0);
+
+    expect(calls).toHaveLength(AUTH_RECOVERY_MAX_WAKES_PER_EPISODE);
+    expect(calls.every((call) => call.attempt <= 2)).toBe(true);
+    const episode = fake.episodes[0];
+    expect(episode?.wakesUsed).toBe(AUTH_RECOVERY_MAX_WAKES_PER_EPISODE);
+    expect(episode?.reenqueuedCount).toBe(AUTH_RECOVERY_MAX_WAKES_PER_EPISODE);
+    // The budget was spent, not the per-agent attempt bound.
+    const enrollments = await fake.store.listEnrollments(episode!.id);
+    expect(enrollments).toHaveLength(10);
+    expect(enrollments.every((enrollment) => enrollment.attempts === 2)).toBe(true);
+    expect(enrollments.every((enrollment) => enrollment.state === "exhausted")).toBe(true);
+    expect(fake.episodes[0]?.state).toBe("closed");
+    // The last-fired agent's annotation shows the final cumulative count.
+    expect(fake.errorReasons.get("agent-09")).toContain(
+      "20 agents re-enqueued / 0 manual",
+    );
+  });
+
+  it("does not close over missing enrollments after a mid-recovery crash; the next green re-plans (NFM-5755 F2)", async () => {
+    const fake = createFakeStore("company-1");
+    const { enqueuer, calls } = createFakeEnqueuer();
+    const service = createAuthRecoveryService(fake.store, enqueuer);
+    fake.seedAgents([{ id: "agent-a", status: "error" }]);
+    fake.seedRuns([latchedRun("agent-a", T0)]);
+
+    // Crash window: `markEpisodeRecovering` committed, `upsertEnrollments`
+    // never ran — the episode is `recovering` with zero enrollments while
+    // agent-a is still latched.
+    await fake.store.insertEpisode("company-1", { startedAt: T0 });
+    await fake.store.markEpisodeRecovering(fake.episodes[0]!.id, {
+      greenAt: "2026-10-26T09:10:00.000Z",
+      greenRunId: "run-green-1",
+      greenSource: "run",
+    });
+
+    const swept = await service.sweepRetries("company-1", { now: "2026-10-26T09:21:00.000Z" });
+    expect(swept).toEqual({ fired: 0, succeeded: 0, exhausted: 0 });
+    expect(fake.episodes[0]?.state).toBe("red");
+    expect(calls).toHaveLength(0);
+
+    // The next green observation re-plans the still-latched agent.
+    await service.observeGreen("company-1", { at: "2026-10-26T09:30:00.000Z" });
+    expect(calls.map((call) => call.agentId)).toEqual(["agent-a"]);
+    expect(fake.episodes[0]?.state).toBe("recovering");
+  });
+
+  it("closes the episode at green when nobody latched, freeing the budget for the next incident", async () => {
+    const fake = createFakeStore("company-1");
+    const { enqueuer, calls } = createFakeEnqueuer();
+    const service = createAuthRecoveryService(fake.store, enqueuer);
+    fake.seedAgents([{ id: "agent-a", status: "error" }]);
+    fake.seedRuns([latchedRun("agent-a", T0)]);
+    await service.observeAuthFailure("company-1", { at: T0 });
+
+    // The agent is fixed out-of-band before the green: no longer latched,
+    // so nothing enrolls and the episode has nothing left to watch.
+    fake.seedAgents([{ id: "agent-a", status: "idle" }]);
+    fake.seedRuns([
+      latchedRun("agent-a", T0),
+      successRun("agent-a", "2026-10-26T09:08:00.000Z"),
+    ]);
+    const green = await service.observeGreen("company-1", { at: "2026-10-26T09:10:00.000Z" });
+    expect(green).toEqual({ woken: 0, manual: 0, recovered: 1 });
+    expect(fake.episodes[0]?.state).toBe("closed");
+    expect(calls).toHaveLength(0);
+
+    // A later incident opens a FRESH episode with the full wake budget.
+    fake.seedAgents([{ id: "agent-a", status: "error" }]);
+    fake.seedRuns([
+      latchedRun("agent-a", T0),
+      successRun("agent-a", "2026-10-26T09:08:00.000Z"),
+      latchedRun("agent-a", "2026-10-26T09:40:00.000Z"),
+    ]);
+    await service.observeAuthFailure("company-1", { at: "2026-10-26T09:40:00.000Z" });
+    expect(fake.episodes).toHaveLength(2);
+    expect(fake.episodes[1]?.wakesUsed).toBe(0);
+
+    await service.observeGreen("company-1", { at: "2026-10-26T09:50:00.000Z" });
+    expect(calls).toHaveLength(1);
+    expect(fake.episodes[1]?.state).toBe("recovering");
+  });
 });

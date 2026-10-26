@@ -125,6 +125,20 @@ export function createAuthRecoveryService(
       now: input.at,
     });
 
+    // Nobody latched during this episode — nothing to enroll, nothing to
+    // watch. Close it here so the episode cannot linger (a sweep would
+    // otherwise read the empty enrollment set as a crash orphan) and the
+    // next incident starts with a fresh wake budget.
+    if (
+      plan.reenqueued.length === 0 &&
+      plan.manual.length === 0 &&
+      plan.exhausted.length === 0 &&
+      enrollments.length === 0
+    ) {
+      await store.markEpisodeClosed(active.id, input.at);
+      return { woken: 0, manual: 0, recovered: plan.recovered.length };
+    }
+
     // Upsert rows first so the claim below is a CAS against a persisted
     // attempt counter — two near-simultaneous greens cannot both fire.
     await store.upsertEnrollments(active.id, active.companyId, [
@@ -274,7 +288,7 @@ export function createAuthRecoveryService(
           enrollment.agentId,
           buildRecoveryAnnotation({
             recoveredAt: active.firstGreenAt ?? input.now,
-            reenqueuedCount: active.reenqueuedCount,
+            reenqueuedCount: active.reenqueuedCount + fired,
             manualCount: active.manualCount,
             maxWakes,
             agent: { disposition: "exhausted", attempt: enrollment.attempts, maxAttempts },
@@ -304,7 +318,7 @@ export function createAuthRecoveryService(
           enrollment.agentId,
           buildRecoveryAnnotation({
             recoveredAt: active.firstGreenAt ?? input.now,
-            reenqueuedCount: active.reenqueuedCount,
+            reenqueuedCount: active.reenqueuedCount + fired,
             manualCount: active.manualCount,
             maxWakes,
             agent: {
@@ -317,8 +331,24 @@ export function createAuthRecoveryService(
         );
       }
     }
+    // Persist this sweep's fires: the episode wake cap must see retries, or
+    // every sweep re-reads a stale budget and retries run past the cap
+    // (NFM-5755 F1).
+    if (fired > 0) {
+      await store.addEpisodeWakes(active.id, fired);
+      await store.setEpisodeCounts(active.id, {
+        reenqueuedCount: active.reenqueuedCount + fired,
+        manualCount: active.manualCount,
+      });
+    }
     const fresh = await store.listEnrollments(active.id);
-    if (shouldCloseEpisode(fresh)) {
+    if (fresh.length === 0) {
+      // Crash-window orphan: `markEpisodeRecovering` committed before
+      // `upsertEnrollments` did. Drop back to red so the next green
+      // re-plans the latched agents instead of closing over them
+      // (NFM-5755 F2).
+      await store.markEpisodeRed(active.id);
+    } else if (shouldCloseEpisode(fresh)) {
       await store.markEpisodeClosed(active.id, input.now);
     }
     return { fired, succeeded, exhausted };
