@@ -185,13 +185,16 @@ export function shouldCloseEpisode(enrollments: Array<{ state: EnrollmentState }
 /**
  * The R4 surface: the annotation operators read on the latched agent's
  * `errorReason`, with the fleet counts and (optionally) this agent's
- * disposition appended.
+ * disposition appended. When the green observation names the credential
+ * slot it recovered (ADR-026 §6), the slot ID — never a credential value —
+ * rides along so forensics can attribute the episode to a key.
  */
 export function buildRecoveryAnnotation(input: {
   recoveredAt: string;
   reenqueuedCount: number;
   manualCount: number;
   maxWakes?: number;
+  credentialSlotId?: string | null;
   agent?: {
     disposition: "reenqueued" | "manual" | "exhausted";
     attempt?: number;
@@ -204,6 +207,10 @@ export function buildRecoveryAnnotation(input: {
     `auth recovered at ${input.recoveredAt}` +
     ` — ${input.reenqueuedCount} agents re-enqueued / ${input.manualCount} manual` +
     ` (wake cap ${maxWakes}/episode)`;
+  const slotId = input.credentialSlotId?.trim();
+  if (slotId) {
+    text += `; credential slot ${slotId}`;
+  }
   const agent = input.agent;
   if (agent?.disposition === "reenqueued") {
     const attempt = agent.attempt ?? 1;

@@ -298,4 +298,34 @@ describe("recovery annotation (AC4)", () => {
       "auth recovered at 2026-10-26T09:40:00.000Z — 16 agents re-enqueued / 4 manual (wake cap 20/episode); this agent: 3/3 wakes did not produce a successful run — manual wake required",
     );
   });
+
+  it("omits the slot suffix when no credential slot is known (single-slot no-regression)", () => {
+    expect(buildRecoveryAnnotation({
+      recoveredAt: GREEN,
+      reenqueuedCount: 1,
+      manualCount: 0,
+      credentialSlotId: null,
+      agent: { disposition: "reenqueued", attempt: 1, maxAttempts: 3 },
+    })).toBe(
+      "auth recovered at 2026-10-26T09:40:00.000Z — 1 agents re-enqueued / 0 manual (wake cap 20/episode); this agent: wake 1/3 enqueued",
+    );
+  });
+
+  it("appends the credential slot id (id only, never a value) for episode attribution (ADR-026 §6)", () => {
+    const base = {
+      recoveredAt: GREEN,
+      reenqueuedCount: 3,
+      manualCount: 1,
+      credentialSlotId: "B",
+    };
+    expect(buildRecoveryAnnotation(base)).toBe(
+      "auth recovered at 2026-10-26T09:40:00.000Z — 3 agents re-enqueued / 1 manual (wake cap 20/episode); credential slot B",
+    );
+    expect(buildRecoveryAnnotation({
+      ...base,
+      agent: { disposition: "reenqueued", attempt: 1, maxAttempts: 3, nextAttemptAt: "2026-10-26T09:50:00.000Z" },
+    })).toBe(
+      "auth recovered at 2026-10-26T09:40:00.000Z — 3 agents re-enqueued / 1 manual (wake cap 20/episode); credential slot B; this agent: wake 1/3 enqueued, next retry after 2026-10-26T09:50:00.000Z",
+    );
+  });
 });
