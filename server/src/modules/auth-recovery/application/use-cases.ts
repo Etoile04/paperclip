@@ -84,20 +84,26 @@ export function createAuthRecoveryService(
    * A green observation (successful authenticated `claude_local` run, or the
    * sibling canary signal). Only a red episode reacts: it snaps to
    * `recovering`, re-enqueues the still-latched within bounds, and
-   * annotates the latched `errorReason` surface (R4).
+   * annotates the latched `errorReason` surface (R4). When the caller names
+   * the credential slot the green came from (ADR-026 §6), the slot id —
+   * never a credential value — is persisted on the episode and rides the
+   * R4 annotations; omitting it leaves every annotation byte-identical to
+   * the single-slot behavior.
    */
   async function observeGreen(
     companyId: string,
-    input: { at: string; runId?: string | null; source?: "run" | "canary" },
+    input: { at: string; runId?: string | null; source?: "run" | "canary"; credentialSlotId?: string | null },
   ): Promise<AuthRecoveryGreenResult> {
     const active = await store.getActiveEpisode(companyId);
     if (decideEpisodeOnGreen(active).action === "noop" || !active) {
       return { woken: 0, manual: 0, recovered: 0 };
     }
+    const credentialSlotId = input.credentialSlotId?.trim() || null;
     await store.markEpisodeRecovering(active.id, {
       greenAt: input.at,
       greenRunId: input.runId ?? null,
       greenSource: input.source ?? "run",
+      greenSlotId: credentialSlotId,
     });
 
     const [latches, succeededAgentIds, enrollments] = await Promise.all([
@@ -208,6 +214,7 @@ export function createAuthRecoveryService(
           reenqueuedCount,
           manualCount,
           maxWakes,
+          credentialSlotId,
           agent: {
             disposition: "reenqueued",
             attempt: item.attempt,
@@ -225,6 +232,7 @@ export function createAuthRecoveryService(
           reenqueuedCount,
           manualCount,
           maxWakes,
+          credentialSlotId,
           agent: { disposition: "manual" },
         }),
       );
@@ -237,6 +245,7 @@ export function createAuthRecoveryService(
           reenqueuedCount,
           manualCount,
           maxWakes,
+          credentialSlotId,
           agent: {
             disposition: "exhausted",
             attempt: attemptsByAgent.get(agentId) ?? maxAttempts,
@@ -298,6 +307,7 @@ export function createAuthRecoveryService(
             reenqueuedCount: active.reenqueuedCount + fired,
             manualCount: active.manualCount,
             maxWakes,
+            credentialSlotId: active.greenSlotId,
             agent: { disposition: "exhausted", attempt: enrollment.attempts, maxAttempts },
           }),
         );
@@ -328,6 +338,7 @@ export function createAuthRecoveryService(
             reenqueuedCount: active.reenqueuedCount + fired,
             manualCount: active.manualCount,
             maxWakes,
+            credentialSlotId: active.greenSlotId,
             agent: {
               disposition: "reenqueued",
               attempt: decision.attempt,

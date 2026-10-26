@@ -9,6 +9,8 @@ export type AuthRecoveryEpisodeRow = {
   firstGreenAt: string | null;
   firstGreenRunId: string | null;
   greenSource: string | null;
+  /** Credential slot id (never a value) that produced the green, when known (NFM-5775). */
+  greenSlotId: string | null;
   /** Total wakes this episode has fired (initial re-enqueues + retries). */
   wakesUsed: number;
   reenqueuedCount: number;
@@ -37,7 +39,7 @@ export type AuthRecoveryStore = {
   insertEpisode(companyId: string, input: { startedAt: string }): Promise<AuthRecoveryEpisodeRow>;
   markEpisodeRecovering(
     episodeId: string,
-    input: { greenAt: string; greenRunId: string | null; greenSource: string },
+    input: { greenAt: string; greenRunId: string | null; greenSource: string; greenSlotId: string | null },
   ): Promise<void>;
   markEpisodeRed(episodeId: string): Promise<void>;
   markEpisodeClosed(episodeId: string, closedAt: string): Promise<void>;

@@ -58,6 +58,7 @@ function createFakeStore(companyId: string) {
         firstGreenAt: null,
         firstGreenRunId: null,
         greenSource: null,
+        greenSlotId: null,
         wakesUsed: 0,
         reenqueuedCount: 0,
         manualCount: 0,
@@ -74,6 +75,7 @@ function createFakeStore(companyId: string) {
         firstGreenAt: input.greenAt,
         firstGreenRunId: input.greenRunId,
         greenSource: input.greenSource,
+        greenSlotId: input.greenSlotId,
       });
     },
     async markEpisodeRed(episodeId) {
@@ -420,6 +422,70 @@ describe("createAuthRecoveryService", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("annotates the recovery with the credential slot id when the green names one (WP1.3)", async () => {
+    const fake = createFakeStore("company-1");
+    const { enqueuer } = createFakeEnqueuer();
+    const service = createAuthRecoveryService(fake.store, enqueuer);
+    fake.seedAgents([{ id: "agent-a", status: "error" }]);
+    fake.seedRuns([latchedRun("agent-a", T0)]);
+
+    await service.observeAuthFailure("company-1", { at: T0 });
+    await service.observeGreen("company-1", {
+      at: "2026-10-26T09:40:00.000Z",
+      source: "canary",
+      credentialSlotId: "B",
+    });
+
+    expect(fake.errorReasons.get("agent-a")).toBe(
+      "auth recovered at 2026-10-26T09:40:00.000Z — 1 agents re-enqueued / 0 manual (wake cap 20/episode)" +
+      "; credential slot B" +
+      "; this agent: wake 1/3 enqueued, next retry after 2026-10-26T09:50:00.000Z",
+    );
+    expect(fake.episodes[0]?.greenSlotId).toBe("B");
+  });
+
+  it("keeps retry-sweep annotations attributed to the episode's green slot (WP1.3)", async () => {
+    const fake = createFakeStore("company-1");
+    const { enqueuer, calls } = createFakeEnqueuer();
+    const service = createAuthRecoveryService(fake.store, enqueuer);
+    fake.seedAgents([{ id: "agent-a", status: "error" }]);
+    fake.seedRuns([latchedRun("agent-a", T0)]);
+
+    await service.observeAuthFailure("company-1", { at: T0 });
+    await service.observeGreen("company-1", {
+      at: "2026-10-26T09:10:00.000Z",
+      credentialSlotId: "B",
+    });
+    expect(calls).toHaveLength(1);
+
+    // The retry sweep rewrites the annotation for attempt 2 — the slot id
+    // must survive because it lives on the episode, not the wake.
+    const first = await service.sweepRetries("company-1", { now: "2026-10-26T09:21:00.000Z" });
+    expect(first.fired).toBe(1);
+    expect(fake.errorReasons.get("agent-a")).toBe(
+      "auth recovered at 2026-10-26T09:10:00.000Z — 2 agents re-enqueued / 0 manual (wake cap 20/episode)" +
+      "; credential slot B" +
+      "; this agent: wake 2/3 enqueued, next retry after 2026-10-26T09:31:00.000Z",
+    );
+  });
+
+  it("leaves slot-free annotations untouched when no credential slot is named (single-slot no-regression)", async () => {
+    const fake = createFakeStore("company-1");
+    const { enqueuer } = createFakeEnqueuer();
+    const service = createAuthRecoveryService(fake.store, enqueuer);
+    fake.seedAgents([{ id: "agent-a", status: "error" }]);
+    fake.seedRuns([latchedRun("agent-a", T0)]);
+
+    await service.observeAuthFailure("company-1", { at: T0 });
+    await service.observeGreen("company-1", { at: "2026-10-26T09:40:00.000Z" });
+
+    expect(fake.errorReasons.get("agent-a")).toBe(
+      "auth recovered at 2026-10-26T09:40:00.000Z — 1 agents re-enqueued / 0 manual (wake cap 20/episode)" +
+      "; this agent: wake 1/3 enqueued, next retry after 2026-10-26T09:50:00.000Z",
+    );
+    expect(fake.episodes[0]?.greenSlotId).toBeNull();
+  });
+
   it("enforces the 20-wake episode cap across repeated retry sweeps (NFM-5755 F1)", async () => {
     const fake = createFakeStore("company-1");
     const { enqueuer, calls } = createFakeEnqueuer();
@@ -512,6 +578,7 @@ describe("createAuthRecoveryService", () => {
       greenAt: "2026-10-26T09:10:00.000Z",
       greenRunId: "run-green-1",
       greenSource: "run",
+      greenSlotId: null,
     });
 
     const swept = await service.sweepRetries("company-1", { now: "2026-10-26T09:21:00.000Z" });

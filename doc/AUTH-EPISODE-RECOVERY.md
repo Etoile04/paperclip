@@ -55,6 +55,19 @@ On recovery, each still-latched agent's `errorReason` is annotated, e.g.:
 auth recovered at 2026-10-26T09:40:00.000Z — 12 agents re-enqueued / 4 manual (wake cap 20/episode); this agent: wake 1/3 enqueued, next retry after 2026-10-26T09:50:00.000Z
 ```
 
+When the green observation names the credential slot it recovered
+(`credentialSlotId` on the green input — the canary lane supplies this once
+more than one slot is registered), the slot ID rides on the episode row
+(`auth_recovery_episodes.green_slot_id`) and the annotation, so retries keep
+their attribution:
+
+```
+auth recovered at 2026-10-26T09:40:00.000Z — 12 agents re-enqueued / 4 manual (wake cap 20/episode); credential slot B; this agent: wake 1/3 enqueued, next retry after 2026-10-26T09:50:00.000Z
+```
+
+Slot IDs are safe identifiers only — a credential value never appears in an
+annotation, in the episode row, or in canary state (NFM-5743 hygiene).
+
 Dispositions:
 
 | Suffix | Meaning | Operator action |
@@ -83,3 +96,32 @@ adapter). Hooks: run settlement in `server/src/services/heartbeat.ts`
 `observeGreen`) and the periodic heartbeat recovery chain in
 `server/src/index.ts` (`sweepAuthRecoveryReenqueues`, also run once at
 startup after a restart).
+
+## Per-slot canary state (NFM-5775, ADR-026 §6)
+
+The provider canary (NFM-5747) is the credential-liveness authority. Once
+more than one credential slot is registered, its state file becomes
+per-slot: each slot carries its own consecutive-failure count and
+episode-open flag (plus the episode's first-red timestamp). The schema and
+the pure state machine live in
+`server/src/modules/auth-recovery/domain/canarySlots.ts`:
+
+- `applyCanaryProbe` folds one probe outcome into the state — green closes
+  that slot's episode and resets its count; the `n`-th consecutive failure
+  opens the slot's episode at the red threshold (≥2, the NFM-5747 paging
+  rule).
+- Episodes are per-credential: slots fail and recover independently, and a
+  slot's green recovery is what flips the fleet back to healthy.
+- `classifyCanaryFleet` separates the alarm classes: `slot_red` is the
+  ordinary `[SRE-CRITICAL]` class (with a single registered slot this is
+  exactly today's alarm — behavior is unchanged); `fleet_emergency` fires
+  only when N≥2 and every registered slot is red — the rarer, louder
+  all-slots-red signal.
+- `parseCanaryFleetState` / `serializeCanaryFleetState` round-trip the JSON
+  state file behind a versioned, closed-key schema; `migrateLegacyCanaryState`
+  maps the single-slot R1 state file onto the incumbent slot (`A`), stamping
+  an untimestamped open episode with the migration time (an upper bound on
+  the true first-red) so migrated state always parses.
+
+Slot IDs are safe identifiers (`"A"`, `"B"`, …) and the only key-like
+material in this state — never a credential value.
