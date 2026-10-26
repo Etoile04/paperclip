@@ -153,12 +153,19 @@ describe("fleet classification (fleet-wide emergency = ALL registered slots red)
 });
 
 describe("legacy R1 state migration (NFM-5747 state file → per-slot)", () => {
+  // Migration stamp: stamped onto open episodes whose legacy file carried no
+  // first-red time. The true first-red is at or before it (upper bound).
+  const AT = "2026-10-26T10:00:00.000Z";
+
   it("maps the single-slot R1 counters onto the default slot", () => {
-    const state = migrateLegacyCanaryState({
-      consecutiveFailures: CANARY_RED_THRESHOLD,
-      episodeOpen: true,
-      firstRedAt: T1,
-    });
+    const state = migrateLegacyCanaryState(
+      {
+        consecutiveFailures: CANARY_RED_THRESHOLD,
+        episodeOpen: true,
+        firstRedAt: T1,
+      },
+      { at: AT },
+    );
     expect(state.schemaVersion).toBe(1);
     expect(state.slots[CANARY_DEFAULT_SLOT_ID]).toEqual({
       slotId: CANARY_DEFAULT_SLOT_ID,
@@ -168,21 +175,83 @@ describe("legacy R1 state migration (NFM-5747 state file → per-slot)", () => {
     });
   });
 
-  it("derives a missing episodeOpen flag from the failure count", () => {
-    const open = migrateLegacyCanaryState({ consecutiveFailures: 3 });
+  it("migrates onto a named slot when the incumbent id differs", () => {
+    const state = migrateLegacyCanaryState({ consecutiveFailures: 2 }, { at: AT, slotId: "B" });
+    expect(Object.keys(state.slots)).toEqual(["B"]);
+    expect(state.slots.B).toEqual({
+      slotId: "B",
+      consecutiveFailures: 2,
+      episodeOpen: true,
+      firstRedAt: AT,
+    });
+  });
+
+  it("derives a missing episodeOpen flag from the failure count, stamping an untimestamped open episode", () => {
+    const open = migrateLegacyCanaryState({ consecutiveFailures: 3 }, { at: AT });
     expect(open.slots.A?.episodeOpen).toBe(true);
-    expect(open.slots.A?.firstRedAt).toBeNull();
-    const warn = migrateLegacyCanaryState({ consecutiveFailures: 1 });
+    expect(open.slots.A?.firstRedAt).toBe(AT);
+    const warn = migrateLegacyCanaryState({ consecutiveFailures: 1 }, { at: AT });
     expect(warn.slots.A?.episodeOpen).toBe(false);
+    expect(warn.slots.A?.firstRedAt).toBeNull();
+  });
+
+  it("stamps an explicitly open untimestamped episode with the migration time", () => {
+    const state = migrateLegacyCanaryState(
+      { consecutiveFailures: CANARY_RED_THRESHOLD, episodeOpen: true },
+      { at: AT },
+    );
+    expect(state.slots.A?.episodeOpen).toBe(true);
+    expect(state.slots.A?.firstRedAt).toBe(AT);
   });
 
   it("honors an explicit closed episode regardless of the count", () => {
-    const state = migrateLegacyCanaryState({
-      consecutiveFailures: 5,
-      episodeOpen: false,
-      firstRedAt: null,
-    });
+    const state = migrateLegacyCanaryState(
+      {
+        consecutiveFailures: 5,
+        episodeOpen: false,
+        firstRedAt: null,
+      },
+      { at: AT },
+    );
     expect(state.slots.A?.episodeOpen).toBe(false);
+    expect(state.slots.A?.firstRedAt).toBeNull();
+  });
+
+  it("drops a stale first-red timestamp when the legacy episode is closed", () => {
+    const state = migrateLegacyCanaryState(
+      { consecutiveFailures: 0, episodeOpen: false, firstRedAt: T1 },
+      { at: AT },
+    );
+    expect(state.slots.A?.episodeOpen).toBe(false);
+    expect(state.slots.A?.firstRedAt).toBeNull();
+  });
+
+  it("rejects a non-timestamp migration stamp", () => {
+    expect(() => migrateLegacyCanaryState({ consecutiveFailures: 3 }, { at: "nope" })).toThrow();
+  });
+
+  it("rejects an internally contradictory legacy file at the state-file boundary", () => {
+    // Explicit open below the red threshold cannot come from a legitimate R1
+    // writer; migration stays silent but the state file rejects it loudly.
+    const migrated = migrateLegacyCanaryState({ consecutiveFailures: 1, episodeOpen: true }, { at: AT });
+    expect(() => parseCanaryFleetState(serializeCanaryFleetState(migrated))).toThrow();
+  });
+
+  it("round-trips every legacy variant through the state file (migrate → serialize → parse)", () => {
+    const variants = [
+      { name: "timestamped-open", legacy: { consecutiveFailures: 3, episodeOpen: true, firstRedAt: T1 } },
+      { name: "untimestamped-open (explicit)", legacy: { consecutiveFailures: 2, episodeOpen: true } },
+      { name: "untimestamped-open (explicit null)", legacy: { consecutiveFailures: 2, episodeOpen: true, firstRedAt: null } },
+      { name: "derived-open", legacy: { consecutiveFailures: 4 } },
+      { name: "explicit-closed", legacy: { consecutiveFailures: 5, episodeOpen: false, firstRedAt: null } },
+      { name: "stale-closed-timestamp", legacy: { consecutiveFailures: 0, episodeOpen: false, firstRedAt: T1 } },
+      { name: "warn-zone", legacy: { consecutiveFailures: 1 } },
+      { name: "healthy", legacy: { consecutiveFailures: 0 } },
+    ];
+    for (const { name, legacy } of variants) {
+      const migrated = migrateLegacyCanaryState(legacy, { at: AT });
+      expect(parseCanaryFleetState(serializeCanaryFleetState(migrated)), name).toEqual(migrated);
+    }
   });
 });
 

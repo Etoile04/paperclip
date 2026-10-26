@@ -143,16 +143,29 @@ export type LegacyCanaryState = {
   firstRedAt?: string | null;
 };
 
+export type MigrateLegacyCanaryStateOptions = {
+  /**
+   * Migration timestamp, stamped onto an open episode whose legacy file
+   * carried no first-red time — the true first-red is at or before it.
+   */
+  at: string;
+  slotId?: CanarySlotId;
+};
+
 /**
  * Maps the R1 (NFM-5747) single-slot state file onto the per-slot schema,
  * under the incumbent slot id. Derives a missing episode-open flag from the
- * counter so either R1 file variant migrates cleanly.
+ * counter so either R1 file variant migrates cleanly. The result always
+ * satisfies the state-file parser's invariants: an open episode without a
+ * first-red timestamp is stamped with `options.at` (legacy R1 files never
+ * stamped one), and a stale timestamp on a closed episode is dropped.
  */
 export function migrateLegacyCanaryState(
   legacy: LegacyCanaryState,
-  slotId: CanarySlotId = CANARY_DEFAULT_SLOT_ID,
+  options: MigrateLegacyCanaryStateOptions,
 ): CanaryFleetState {
-  const id = requireSlotId(slotId);
+  const id = requireSlotId(options.slotId ?? CANARY_DEFAULT_SLOT_ID);
+  const stamp = parseIsoTimestamp(options.at, "migration at");
   const failures = Math.max(0, Math.floor(legacy.consecutiveFailures));
   const episodeOpen = legacy.episodeOpen ?? failures >= CANARY_RED_THRESHOLD;
   return {
@@ -162,7 +175,7 @@ export function migrateLegacyCanaryState(
         slotId: id,
         consecutiveFailures: failures,
         episodeOpen,
-        firstRedAt: legacy.firstRedAt ?? null,
+        firstRedAt: episodeOpen ? legacy.firstRedAt ?? stamp : null,
       },
     },
   };

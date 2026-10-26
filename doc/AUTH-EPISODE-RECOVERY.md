@@ -119,7 +119,9 @@ the pure state machine live in
   all-slots-red signal.
 - `parseCanaryFleetState` / `serializeCanaryFleetState` round-trip the JSON
   state file behind a versioned, closed-key schema; `migrateLegacyCanaryState`
-  maps the single-slot R1 state file onto the incumbent slot (`A`).
+  maps the single-slot R1 state file onto the incumbent slot (`A`), stamping
+  an untimestamped open episode with the migration time (an upper bound on
+  the true first-red) so migrated state always parses.
 
 Slot IDs are safe identifiers (`"A"`, `"B"`, …) and the only key-like
 material in this state — never a credential value.
