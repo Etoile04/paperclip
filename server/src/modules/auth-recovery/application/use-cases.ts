@@ -109,12 +109,19 @@ export function createAuthRecoveryService(
     const attemptsByAgent = new Map(
       enrollments.map((enrollment) => [enrollment.agentId, enrollment.attempts]),
     );
+    // The 10-minute spacing gate keys on each agent's last wake this
+    // episode — without it, an early re-green after a provider flap fires
+    // the next attempt immediately (NFM-5755 F3).
+    const lastWakeAtByAgent = new Map(
+      enrollments.map((enrollment) => [enrollment.agentId, enrollment.lastWakeAt]),
+    );
     const evidence: LatchEvidence[] = latches.map((latch) => ({
       agentId: latch.agentId,
       firstLatchedAt: latch.firstLatchedAt,
       isStillLatched: latch.isStillLatched,
       hasSuccessfulRunSinceEpisodeStart: succeeded.has(latch.agentId),
       alreadyEnrolledAttempts: attemptsByAgent.get(latch.agentId) ?? 0,
+      lastWakeAt: lastWakeAtByAgent.get(latch.agentId) ?? null,
     }));
 
     const plan = planEpisodeReenrollments({

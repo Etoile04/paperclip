@@ -459,6 +459,44 @@ describe("createAuthRecoveryService", () => {
     );
   });
 
+  it("holds an early re-green inside the 10-minute spacing on the flap path (NFM-5755 F3)", async () => {
+    const fake = createFakeStore("company-1");
+    const { enqueuer, calls } = createFakeEnqueuer();
+    const service = createAuthRecoveryService(fake.store, enqueuer);
+    fake.seedAgents([{ id: "agent-a", status: "error" }]);
+    fake.seedRuns([latchedRun("agent-a", T0)]);
+
+    await service.observeAuthFailure("company-1", { at: T0 });
+    // Attempt 1 via the first green.
+    await service.observeGreen("company-1", { at: "2026-10-26T09:10:00.000Z" });
+    expect(calls).toHaveLength(1);
+
+    // Attempt 2 via sweep once the spacing elapses.
+    const sweep1 = await service.sweepRetries("company-1", { now: "2026-10-26T09:21:00.000Z" });
+    expect(sweep1.fired).toBe(1);
+    expect(calls).toHaveLength(2);
+
+    // Provider flap: the retry run fails auth again — episode pauses to red.
+    fake.seedRuns([
+      latchedRun("agent-a", T0),
+      latchedRun("agent-a", "2026-10-26T09:21:30.000Z"),
+    ]);
+    await service.observeAuthFailure("company-1", { at: "2026-10-26T09:21:30.000Z" });
+
+    // Re-green 60 seconds after attempt 2: the green re-plan must honor
+    // the 10-minute spacing — no attempt 3 until 09:31.
+    const early = await service.observeGreen("company-1", { at: "2026-10-26T09:22:30.000Z" });
+    expect(early.woken).toBe(0);
+    expect(calls).toHaveLength(2);
+    expect(fake.episodes[0]?.state).toBe("recovering");
+
+    // After the spacing elapses, the sweep fires attempt 3 as usual.
+    const sweep2 = await service.sweepRetries("company-1", { now: "2026-10-26T09:32:00.000Z" });
+    expect(sweep2.fired).toBe(1);
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.attempt).toBe(3);
+  });
+
   it("does not close over missing enrollments after a mid-recovery crash; the next green re-plans (NFM-5755 F2)", async () => {
     const fake = createFakeStore("company-1");
     const { enqueuer, calls } = createFakeEnqueuer();
