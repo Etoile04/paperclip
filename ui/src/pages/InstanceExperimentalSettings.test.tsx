@@ -117,6 +117,11 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
+    enableIssueGraphLivenessAutoRecovery: false,
+    issueGraphLivenessAutoRecoveryLookbackHours: 24,
+    adr009ReconciliationHookEnabled: false,
+    precompletionMergeHookEnabled: false,
+    phantomBackfillHookEnabled: false,
   };
 }
 

@@ -201,9 +201,15 @@ import {
   AUTH_RECOVERY_ERROR_CODE,
   AUTH_RECOVERY_GREEN_ADAPTER_TYPES,
   AUTH_RECOVERY_WAKE_REASON,
-} from "../modules/auth-recovery/domain/policy.js";
-import { createAuthRecoveryService } from "../modules/auth-recovery/application/use-cases.js";
-import { createPostgresAuthRecoveryStore } from "../modules/auth-recovery/adapters/postgres.js";
+  createAuthRecoveryService,
+  createPostgresAuthRecoveryStore,
+} from "../modules/auth-recovery/index.js";
+import {
+  createPostgresTurnFailureSignalStore,
+  createTurnFailureSignalService,
+  readCanaryState,
+  resolveTurnFailureSignalConfig,
+} from "../modules/turn-failure-signal/index.js";
 import { createHostDuplexObservabilityRecorder } from "./duplex-observability-recorder.js";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
@@ -9771,11 +9777,60 @@ export function heartbeatService(
     },
   );
 
+  // NFM-5774: the turn-failure-rate passive signal (WP1.2, ADR-026 §5) —
+  // a degradation-class alarm over live `claude_local` outcomes. Additive to
+  // the auth machinery above: it never wakes anyone, never pages, and only
+  // opens while the R1 canary (the credential-liveness authority) reads
+  // green. Disabled until TURN_FAILURE_SIGNAL_CANARY_STATE_PATH is set.
+  const turnFailureSignalConfig = resolveTurnFailureSignalConfig(runtimeEnv);
+  const turnFailureSignal = createTurnFailureSignalService(
+    createPostgresTurnFailureSignalStore(db),
+    {
+      readCanary: (now) =>
+        turnFailureSignalConfig.enabled && turnFailureSignalConfig.canaryStatePath
+          ? readCanaryState(turnFailureSignalConfig.canaryStatePath, {
+              now,
+              maxAgeMs: turnFailureSignalConfig.canaryMaxAgeMs,
+            })
+          : { state: "unknown", observedAt: null },
+      logger: {
+        warn: (obj, msg) => logger.warn(obj as Record<string, unknown>, msg),
+      },
+    },
+    { config: turnFailureSignalConfig },
+  );
+
+  async function evaluateTurnFailureSignal(): Promise<{ evaluated: number }> {
+    if (!turnFailureSignalConfig.enabled) return { evaluated: 0 };
+    const rows = await db
+      .selectDistinct({ companyId: agents.companyId })
+      .from(agents)
+      .where(eq(agents.adapterType, "claude_local"));
+    for (const { companyId } of rows) {
+      await turnFailureSignal
+        .evaluate(companyId, { now: new Date().toISOString() })
+        .catch((error) => {
+          logger.warn(
+            { err: error, companyId },
+            "turn-failure signal evaluation failed",
+          );
+        });
+    }
+    return { evaluated: rows.length };
+  }
+
   async function sweepAuthRecoveryReenqueues() {
     const rows = await db
       .selectDistinct({ companyId: authRecoveryEpisodes.companyId })
       .from(authRecoveryEpisodes)
-      .where(eq(authRecoveryEpisodes.state, "recovering"));
+      .where(
+        and(
+          // NFM-5774: only auth-kind episodes re-enqueue; degradation
+          // episodes share the table but never wake anyone.
+          eq(authRecoveryEpisodes.kind, "auth"),
+          eq(authRecoveryEpisodes.state, "recovering"),
+        ),
+      );
     for (const { companyId } of rows) {
       await authRecovery
         .sweepRetries(companyId, { now: new Date().toISOString() })
@@ -31025,6 +31080,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     sweepAuthRecoveryReenqueues,
+
+    evaluateTurnFailureSignal,
 
     resumeQueuedRuns,
 

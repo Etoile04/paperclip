@@ -28,12 +28,21 @@ describe("auth recovery episode schema", () => {
       "started_at",
       "first_green_at",
       "green_source",
+      "green_slot_id",
       "wakes_used",
       "reenqueued_count",
       "manual_count",
     ]) {
       expect(episodeColumns).toContain(column);
     }
+    const episodeColumnByName = new Map(
+      getTableConfig(authRecoveryEpisodes).columns.map((column) => [column.name, column]),
+    );
+    // NFM-5774: degradation-class episodes share the table behind a kind
+    // discriminator that defaults to the auth lane; restatements are bounded
+    // on their own timestamp.
+    expect(episodeColumnByName.get("kind")!.default).toBe("auth");
+    expect(episodeColumnByName.get("last_restate_at")).toBeDefined();
     const enrollmentColumns = getTableConfig(authRecoveryEpisodeAgents).columns.map(
       (column) => column.name,
     );

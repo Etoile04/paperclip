@@ -5,8 +5,10 @@
  * `status=done` transition when the issue's title or description match the
  * "merge-kind" heuristic but the named feature branch is NOT yet an ancestor
  * of `origin/main`. The agent-level gate at NFM-3166 only fires after the
- * agent runs `git push` — this API gate stops the "merge-kind issue → done"
- * transition at the source so a phantom pass cannot land in Paperclip.
+ * agent runs `git push` (paperclip:allow-git-push: doc-comment mention only —
+ * this module never invokes git push) — this API gate stops the
+ * "merge-kind issue → done" transition at the source so a phantom pass cannot
+ * land in Paperclip.
  *
  * Heuristics:
  * - `isMergeKind(issue)`: case-insensitive title matches `^merge\s`; returns
