@@ -26,6 +26,7 @@ function episodeRowFrom(raw: typeof authRecoveryEpisodes.$inferSelect): AuthReco
     firstGreenAt: raw.firstGreenAt ? raw.firstGreenAt.toISOString() : null,
     firstGreenRunId: raw.firstGreenRunId,
     greenSource: raw.greenSource,
+    greenSlotId: raw.greenSlotId,
     wakesUsed: raw.wakesUsed,
     reenqueuedCount: raw.reenqueuedCount,
     manualCount: raw.manualCount,
@@ -81,6 +82,7 @@ export function createPostgresAuthRecoveryStore(db: Db): AuthRecoveryStore {
           firstGreenAt: new Date(input.greenAt),
           firstGreenRunId: input.greenRunId,
           greenSource: input.greenSource,
+          greenSlotId: input.greenSlotId,
           updatedAt: new Date(),
         })
         .where(eq(authRecoveryEpisodes.id, episodeId));

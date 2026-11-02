@@ -29,6 +29,10 @@ export const authRecoveryEpisodes = pgTable(
     firstGreenAt: timestamp("first_green_at", { withTimezone: true }),
     firstGreenRunId: uuid("first_green_run_id"),
     greenSource: text("green_source"),
+    // NFM-5775 (ADR-026 §6): credential slot id (never a value) that
+    // produced the green, when the observer knows it. Keeps the R4 slot
+    // attribution stable across retry sweeps.
+    greenSlotId: text("green_slot_id"),
     wakesUsed: integer("wakes_used").notNull().default(0),
     reenqueuedCount: integer("reenqueued_count").notNull().default(0),
     manualCount: integer("manual_count").notNull().default(0),

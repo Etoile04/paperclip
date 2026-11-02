@@ -28,6 +28,7 @@ describe("auth recovery episode schema", () => {
       "started_at",
       "first_green_at",
       "green_source",
+      "green_slot_id",
       "wakes_used",
       "reenqueued_count",
       "manual_count",
