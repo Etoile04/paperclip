@@ -201,13 +201,15 @@ import {
   AUTH_RECOVERY_ERROR_CODE,
   AUTH_RECOVERY_GREEN_ADAPTER_TYPES,
   AUTH_RECOVERY_WAKE_REASON,
-} from "../modules/auth-recovery/domain/policy.js";
-import { createAuthRecoveryService } from "../modules/auth-recovery/application/use-cases.js";
-import { createPostgresAuthRecoveryStore } from "../modules/auth-recovery/adapters/postgres.js";
-import { createTurnFailureSignalService } from "../modules/turn-failure-signal/application/use-cases.js";
-import { createPostgresTurnFailureSignalStore } from "../modules/turn-failure-signal/adapters/postgres.js";
-import { readCanaryState } from "../modules/turn-failure-signal/canary-state.js";
-import { resolveTurnFailureSignalConfig } from "../modules/turn-failure-signal/config.js";
+  createAuthRecoveryService,
+  createPostgresAuthRecoveryStore,
+} from "../modules/auth-recovery/index.js";
+import {
+  createPostgresTurnFailureSignalStore,
+  createTurnFailureSignalService,
+  readCanaryState,
+  resolveTurnFailureSignalConfig,
+} from "../modules/turn-failure-signal/index.js";
 import { createHostDuplexObservabilityRecorder } from "./duplex-observability-recorder.js";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
