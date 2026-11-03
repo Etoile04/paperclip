@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { companies, createDb, issues } from "@paperclipai/db";
+import { agents, companies, createDb, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -10,6 +10,8 @@ import {
   getIssueListFreshnessMetrics,
 } from "../metrics/issue-list-freshness.js";
 import {
+  ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_A_ID,
+  ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_B_ID,
   ISSUE_LIST_FRESHNESS_CANARY_COMPANY_ID,
   ISSUE_LIST_FRESHNESS_LAG_THRESHOLD_MS,
   createIssueListFreshnessCanaryCore,
@@ -42,10 +44,37 @@ describe("issue list freshness canary core", () => {
     return { state, readBack };
   }
 
+  // Healthy field legs for the widened tick: the sentinel is visible only
+  // under the assignee the last write set, with the projected value equal to
+  // it — mirroring what a real healthy PG serves through
+  // `issues_company_assignee_status_idx`.
+  function makeHealthyFieldModel() {
+    const state = { currentAssignee: null as string | null };
+    const writeSentinel = async (
+      _title: string,
+      _at: Date,
+      assigneeAgentId: string,
+    ) => {
+      state.currentAssignee = assigneeAgentId;
+    };
+    const readBackByAssignee = async (
+      nonce: string,
+      assigneeAgentId: string,
+    ) =>
+      assigneeAgentId === state.currentAssignee
+        ? {
+            title: `issue-list-freshness-canary nonce=${nonce}`,
+            assigneeAgentId: state.currentAssignee,
+          }
+        : null;
+    return { state, writeSentinel, readBackByAssignee };
+  }
+
   it("reports a fresh tick when the read-back sees the sentinel write in the same tick", async () => {
     const logger = makeLogger();
     const { state, readBack } = makeReadBack();
     state.visible = true;
+    const fieldModel = makeHealthyFieldModel();
     const metrics = createIssueListFreshnessMetrics();
     let nowMs = 1_000;
     const core = createIssueListFreshnessCanaryCore({
@@ -55,7 +84,8 @@ describe("issue list freshness canary core", () => {
       metrics,
       now: () => nowMs,
       readBack,
-      writeSentinel: async () => {},
+      readBackByAssignee: fieldModel.readBackByAssignee,
+      writeSentinel: fieldModel.writeSentinel,
     });
 
     const result = await core.tick();
@@ -111,6 +141,7 @@ describe("issue list freshness canary core", () => {
   it("clears the anchor and logs recovery once the sentinel becomes visible again", async () => {
     const logger = makeLogger();
     const { state, readBack } = makeReadBack();
+    const fieldModel = makeHealthyFieldModel();
     const metrics = createIssueListFreshnessMetrics();
     let nowMs = 1_000;
     const core = createIssueListFreshnessCanaryCore({
@@ -120,7 +151,8 @@ describe("issue list freshness canary core", () => {
       metrics,
       now: () => nowMs,
       readBack,
-      writeSentinel: async () => {},
+      readBackByAssignee: fieldModel.readBackByAssignee,
+      writeSentinel: fieldModel.writeSentinel,
     });
 
     await core.tick();
@@ -141,6 +173,178 @@ describe("issue list freshness canary core", () => {
     nowMs += ISSUE_LIST_FRESHNESS_LAG_THRESHOLD_MS + 1_000;
     await core.tick(); // overdue observation → second breach
     expect((await metrics.snapshot()).breaches).toBe(2);
+  });
+
+  it("flips the sentinel assignee every tick and checks membership, projected value, and old-assignee absence", async () => {
+    const logger = makeLogger();
+    const metrics = createIssueListFreshnessMetrics();
+    let nowMs = 1_000;
+    // Healthy model: the row is visible only under the just-written assignee,
+    // and the projected value equals it (field_old short-circuits to null).
+    const writes: { nonce: string; assignee: string }[] = [];
+    const state = { currentAssignee: null as string | null };
+    const fieldReadCalls: string[] = [];
+    const core = createIssueListFreshnessCanaryCore({
+      db: {} as any,
+      ensureSentinel: async () => {},
+      logger,
+      metrics,
+      now: () => nowMs,
+      readBack: async () => ({ nonce: "seen" }),
+      readBackByAssignee: async (nonce, assigneeAgentId) => {
+        fieldReadCalls.push(assigneeAgentId);
+        if (assigneeAgentId !== state.currentAssignee) return null;
+        return {
+          title: `issue-list-freshness-canary nonce=${nonce}`,
+          assigneeAgentId: state.currentAssignee,
+        };
+      },
+      writeSentinel: async (title, _at, assignee) => {
+        const marker = "nonce=";
+        writes.push({
+          nonce: title.slice(title.indexOf(marker) + marker.length),
+          assignee,
+        });
+        state.currentAssignee = assignee;
+      },
+    });
+
+    const first = await core.tick();
+    expect(first.outcome).toBe("fresh");
+    const second = await core.tick();
+    expect(second.outcome).toBe("fresh");
+    const third = await core.tick();
+    expect(third.outcome).toBe("fresh");
+
+    // The assignee alternates between the two fixed canary agents.
+    const assignees = writes.map((w) => w.assignee);
+    expect(new Set(assignees).size).toBe(2);
+    expect(assignees[1]).not.toBe(assignees[0]);
+    expect(assignees[2]).toBe(assignees[0]);
+    // Fresh nonces every tick — each write re-anchors existence.
+    expect(new Set(writes.map((w) => w.nonce)).size).toBe(3);
+    // First tick has no previous assignee: no field_old read happened.
+    expect(fieldReadCalls.slice(0, 1)).toEqual([assignees[0]]);
+    expect(logger.calls.filter((c) => c.level === "warn")).toHaveLength(0);
+    expect((await metrics.snapshot()).breaches).toBe(0);
+  });
+
+  it("flags field_new (with WARN + breach once) when the projected assignee value stays stale, then recovers", async () => {
+    const logger = makeLogger();
+    const metrics = createIssueListFreshnessMetrics();
+    let nowMs = 1_000;
+    // The row is visible under the just-written assignee, but the projected
+    // value lags behind the write — the 21:05Z stale-btree-content class.
+    const state = {
+      currentAssignee: null as string | null,
+      projectedAssignee: null as string | null,
+    };
+    const core = createIssueListFreshnessCanaryCore({
+      db: {} as any,
+      ensureSentinel: async () => {},
+      logger,
+      metrics,
+      now: () => nowMs,
+      readBack: async () => ({ nonce: "seen" }),
+      readBackByAssignee: async (nonce, assigneeAgentId) => {
+        if (assigneeAgentId !== state.currentAssignee) return null;
+        return {
+          title: `issue-list-freshness-canary nonce=${nonce}`,
+          assigneeAgentId: state.projectedAssignee ?? state.currentAssignee,
+        };
+      },
+      writeSentinel: async (_title, _at, assignee) => {
+        state.currentAssignee = assignee;
+        // Deliberately does NOT advance projectedAssignee: stale projection.
+      },
+    });
+
+    // Tick 1 lands healthy (first write, no stale projection to trip over).
+    const first = await core.tick();
+    expect(first.outcome).toBe("fresh");
+    state.projectedAssignee = state.currentAssignee; // value A is durable
+
+    // Tick 2 flips to B but the projected value stays A → field_new fails.
+    nowMs += 1_000;
+    const second = await core.tick();
+    expect(second.outcome).toBe("lagging");
+    expect(second.leg).toBe("field_new");
+    expect(logger.calls.filter((c) => c.level === "warn")).toHaveLength(0);
+
+    // Past the threshold: WARN names the leg, breach counter increments once.
+    nowMs += ISSUE_LIST_FRESHNESS_LAG_THRESHOLD_MS + 1_000;
+    const third = await core.tick();
+    expect(third.outcome).toBe("lagging");
+    expect(third.leg).toBe("field_new");
+    const warns = logger.calls.filter((c) => c.level === "warn");
+    expect(warns).toHaveLength(1);
+    expect((warns[0].payload as any).leg).toBe("field_new");
+    expect((await metrics.snapshot()).breaches).toBe(1);
+
+    // Projection catches up: all legs pass, recovery is logged, anchor clears.
+    state.projectedAssignee = state.currentAssignee;
+    nowMs += 1_000;
+    const recovered = await core.tick();
+    expect(recovered.outcome).toBe("fresh");
+    expect(
+      logger.calls
+        .filter((c) => c.level === "info")
+        .some((c) => c.message.includes("recovered")),
+    ).toBe(true);
+  });
+
+  it("flags field_old when the sentinel still appears under the previous assignee", async () => {
+    const logger = makeLogger();
+    const metrics = createIssueListFreshnessMetrics();
+    let nowMs = 1_000;
+    // Stale index range: after the flip the row is visible under BOTH the
+    // new and the previous assignee.
+    const state = {
+      currentAssignee: null as string | null,
+      alsoVisibleUnder: null as string | null,
+    };
+    const core = createIssueListFreshnessCanaryCore({
+      db: {} as any,
+      ensureSentinel: async () => {},
+      logger,
+      metrics,
+      now: () => nowMs,
+      readBack: async () => ({ nonce: "seen" }),
+      readBackByAssignee: async (nonce, assigneeAgentId) => {
+        if (
+          assigneeAgentId !== state.currentAssignee &&
+          assigneeAgentId !== state.alsoVisibleUnder
+        ) {
+          return null;
+        }
+        return {
+          title: `issue-list-freshness-canary nonce=${nonce}`,
+          assigneeAgentId: state.currentAssignee,
+        };
+      },
+      writeSentinel: async (_title, _at, assignee) => {
+        state.alsoVisibleUnder = state.currentAssignee; // old range lingers
+        state.currentAssignee = assignee;
+      },
+    });
+
+    const first = await core.tick();
+    expect(first.outcome).toBe("fresh"); // no previous assignee yet
+    state.alsoVisibleUnder = null;
+
+    // Tick 2 flips; the old assignee's index range still returns the row.
+    nowMs += 1_000;
+    const second = await core.tick();
+    expect(second.outcome).toBe("lagging");
+    expect(second.leg).toBe("field_old");
+    expect(logger.calls.filter((c) => c.level === "warn")).toHaveLength(0);
+
+    // Recovery once the old range drains.
+    state.alsoVisibleUnder = null;
+    nowMs += 1_000;
+    const recovered = await core.tick();
+    expect(recovered.outcome).toBe("fresh");
+    expect(logger.calls.filter((c) => c.level === "warn")).toHaveLength(0);
   });
 
   it("resolves the canary interval from env, defaulting to 15s and clamping to the ≤30s charter bound", () => {
@@ -223,6 +427,7 @@ describeEmbeddedPostgres("issue list freshness canary integration", () => {
 
   afterEach(async () => {
     await db.delete(issues);
+    await db.delete(agents);
     await db.delete(companies);
   });
 
@@ -230,7 +435,7 @@ describeEmbeddedPostgres("issue list freshness canary integration", () => {
     await tempDb?.cleanup();
   });
 
-  it("writes + reads back the sentinel through the real list query shape and never leaks into other companies", async () => {
+  it("writes + reads back the sentinel through the real list query shapes, reflects the assignee flip, and never leaks into other companies", async () => {
     const realCompanyId = randomUUID();
     await db.insert(companies).values({
       id: realCompanyId,
@@ -260,12 +465,37 @@ describeEmbeddedPostgres("issue list freshness canary integration", () => {
     expect(sentinelRows).toHaveLength(1);
     expect(sentinelRows[0].title).toContain("issue-list-freshness-canary");
 
-    // Isolation: the sentinel never appears in another company's lists.
+    // Field-update reflection: tick 1 assigned A, tick 2 flipped to B. The
+    // assignee-filtered shape must show the row under B (projected value ==
+    // B) and nowhere under A — the 21:05Z recurrence class.
+    const underA = await svc.list(ISSUE_LIST_FRESHNESS_CANARY_COMPANY_ID, {
+      assigneeAgentId: ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_A_ID,
+    });
+    const underB = await svc.list(ISSUE_LIST_FRESHNESS_CANARY_COMPANY_ID, {
+      assigneeAgentId: ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_B_ID,
+    });
+    expect(underA).toHaveLength(0);
+    expect(underB).toHaveLength(1);
+    expect(underB[0].assigneeAgentId).toBe(
+      ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_B_ID,
+    );
+    expect(underB[0].title).toContain("issue-list-freshness-canary");
+
+    // Isolation: the sentinel (and its assignee agents) never appear in
+    // another company's lists — including assignee-filtered reads.
     const realRows = await svc.list(realCompanyId, {});
     expect(realRows).toHaveLength(0);
     const realStatusRows = await svc.list(realCompanyId, {
       status: "in_progress",
     });
     expect(realStatusRows).toHaveLength(0);
+    const realUnderCanaryA = await svc.list(realCompanyId, {
+      assigneeAgentId: ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_A_ID,
+    });
+    const realUnderCanaryB = await svc.list(realCompanyId, {
+      assigneeAgentId: ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_B_ID,
+    });
+    expect(realUnderCanaryA).toHaveLength(0);
+    expect(realUnderCanaryB).toHaveLength(0);
   });
 });

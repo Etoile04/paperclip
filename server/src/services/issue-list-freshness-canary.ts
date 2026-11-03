@@ -3,29 +3,47 @@
  *
  * Every tick (default 15s, charter bound ≤30s) the canary writes the sentinel
  * issue in a dedicated scratch company and reads it back through the SAME
- * list query shape the production list route uses
- * (`issueService(db).list(company, { status: "in_progress" })` — the
- * company/status-filtered shape served by `issues_company_status_idx`).
+ * list query shapes the production list route uses:
  *
- * Each sentinel write updates `updated_at` — an indexed column — so every
+ * - `issueService(db).list(company, { status: "in_progress" })` — the
+ *   company/status-filtered shape served by `issues_company_status_idx`
+ *   (existence + monotonicity).
+ * - `issueService(db).list(company, { assigneeAgentId })` — the shape served
+ *   by `issues_company_assignee_status_idx` (field-update reflection).
+ *
+ * Each sentinel write updates `updated_at` and flips `assignee_agent_id`
+ * between two fixed canary-owned agents — both indexed columns — so every
  * tick mints fresh btree entries in all `issues` secondary indexes, the exact
  * access paths that froze during the NFM-5838 incident.
  *
- * A sentinel write that stays invisible through the list query past
+ * Three observations are checked per write:
+ *
+ * 1. `existence` — the status-filtered list sees the just-written sentinel.
+ * 2. `field_new` — the assignee-filtered list sees it under the NEW assignee
+ *    with the projected `assigneeAgentId` equal to the new value. The
+ *    2026-11-03 21:05Z recurrence served fresh existence alongside
+ *    ≥26-min-stale assignee VALUES (stale btree content, index-only-scan
+ *    class); an existence-only probe would have missed it.
+ * 3. `field_old` — the assignee-filtered list no longer returns the sentinel
+ *    under the PREVIOUS assignee (membership must leave the old index range).
+ *
+ * A write whose any leg stays broken past
  * {@link ISSUE_LIST_FRESHNESS_LAG_THRESHOLD_MS} emits a WARN log and
  * increments `paperclip_issue_list_freshness_visibility_lag_breaches_total`
- * exactly once per stuck write, then logs recovery once it becomes visible.
- * While a write is stuck, subsequent ticks re-affirm the SAME sentinel nonce
- * (fresh `updated_at`, fresh index entries) so the anchor stays observable.
+ * exactly once per stuck write (naming the failed leg), then logs recovery
+ * once all legs observe. While a write is stuck, subsequent ticks re-affirm
+ * the SAME sentinel nonce and assignee (fresh `updated_at`, fresh index
+ * entries) so the anchor stays observable.
  *
- * The sentinel lives in its own scratch company, so it can never appear in a
- * real company's list, search, or patrol reads (every list query is scoped by
- * `company_id`) — the canary writes no user-visible data.
+ * The sentinel and its two assignee agents live in their own scratch company,
+ * so they can never appear in a real company's list, search, or patrol reads
+ * (every list query is scoped by `company_id`) — the canary writes no
+ * user-visible data.
  */
 
 import { eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import { companies, issues, type Db } from "@paperclipai/db";
+import { agents, companies, issues, type Db } from "@paperclipai/db";
 import { issueService } from "./issues.js";
 import {
   getIssueListFreshnessMetrics,
@@ -47,6 +65,16 @@ export const ISSUE_LIST_FRESHNESS_CANARY_COMPANY_ID =
   "00000000-0000-4000-8000-000000005843";
 export const ISSUE_LIST_FRESHNESS_CANARY_ISSUE_ID =
   "00000000-0000-4000-8000-000000005844";
+/**
+ * Fixed canary-owned assignee agents the sentinel flips between each tick.
+ * `issues.assignee_agent_id` carries a real foreign key to `agents`, so the
+ * assignee flip needs these rows to exist; they live in the scratch company
+ * and are invisible to every company-scoped read path.
+ */
+export const ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_A_ID =
+  "00000000-0000-4000-8000-000000005845";
+export const ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_B_ID =
+  "00000000-0000-4000-8000-000000005846";
 
 export type IssueListFreshnessCanaryLogger = {
   info(payload: unknown, message: string): void;
@@ -54,9 +82,22 @@ export type IssueListFreshnessCanaryLogger = {
   error(payload: unknown, message: string): void;
 };
 
+/** Which same-tick observation failed for a sentinel write. */
+export type IssueListFreshnessCanaryLeg =
+  | "existence"
+  | "field_new"
+  | "field_old";
+
 export type IssueListFreshnessCanaryTickResult = {
   outcome: "fresh" | "lagging";
   lagMs: number;
+  /** Set on `lagging`: the first observation that failed for this write. */
+  leg?: IssueListFreshnessCanaryLeg;
+};
+
+export type IssueListFreshnessCanaryFieldRow = {
+  title: string | null;
+  assigneeAgentId: string | null;
 };
 
 export type IssueListFreshnessCanaryDeps = {
@@ -65,8 +106,16 @@ export type IssueListFreshnessCanaryDeps = {
   metrics?: IssueListFreshnessMetrics;
   now?: () => number;
   readBack?: (nonce: string) => Promise<{ nonce: string } | null>;
-  writeSentinel?: (title: string, at: Date) => Promise<void>;
-  /** Overridable for unit tests that inject readBack/writeSentinel. */
+  readBackByAssignee?: (
+    nonce: string,
+    assigneeAgentId: string,
+  ) => Promise<IssueListFreshnessCanaryFieldRow | null>;
+  writeSentinel?: (
+    title: string,
+    at: Date,
+    assigneeAgentId: string,
+  ) => Promise<void>;
+  /** Overridable for unit tests that inject the read/write surfaces. */
   ensureSentinel?: () => Promise<void>;
 };
 
@@ -74,6 +123,10 @@ type StuckWrite = {
   nonce: string;
   committedAt: number;
   warned: boolean;
+  assignee: string;
+  prevAssignee: string | null;
+  /** The most recent observation that failed for this write. */
+  lastFailedLeg: IssueListFreshnessCanaryLeg;
 };
 
 function sentinelTitle(nonce: string) {
@@ -115,9 +168,9 @@ export function resolveIssueListFreshnessCanaryIntervalMs(
 }
 
 export type IssueListFreshnessCanary = {
-  /** Ensure the scratch company + sentinel row exist (idempotent). */
+  /** Ensure the scratch company, assignee agents, and sentinel row exist. */
   ensureSentinel(): Promise<void>;
-  /** One canary beat: sentinel write, then read-back through the list shape. */
+  /** One canary beat: sentinel write, then read-backs through the list shapes. */
   tick(): Promise<IssueListFreshnessCanaryTickResult>;
 };
 
@@ -140,17 +193,38 @@ export function createIssueListFreshnessCanaryCore(
       );
       return row ? { nonce } : null;
     });
+  const readBackByAssignee =
+    deps.readBackByAssignee ??
+    (async (nonce: string, assigneeAgentId: string) => {
+      const rows = await issueService(db).list(
+        ISSUE_LIST_FRESHNESS_CANARY_COMPANY_ID,
+        { assigneeAgentId },
+      );
+      const row = rows.find(
+        (candidate) => nonceFromTitle(candidate.title) === nonce,
+      );
+      return row
+        ? { title: row.title, assigneeAgentId: row.assigneeAgentId }
+        : null;
+    });
   const writeSentinel =
     deps.writeSentinel ??
-    (async (title: string, at: Date) => {
+    (async (title: string, at: Date, assigneeAgentId: string) => {
       await db
         .update(issues)
-        .set({ title, updatedAt: at, status: "in_progress", hiddenAt: null })
+        .set({
+          title,
+          updatedAt: at,
+          status: "in_progress",
+          hiddenAt: null,
+          assigneeAgentId,
+        })
         .where(eq(issues.id, ISSUE_LIST_FRESHNESS_CANARY_ISSUE_ID));
     });
 
   let sentinelEnsured = false;
   let stuckWrite: StuckWrite | null = null;
+  let lastAssignee: string | null = null;
 
   const ensureSentinelFn =
     deps.ensureSentinel ??
@@ -165,6 +239,21 @@ export function createIssueListFreshnessCanaryCore(
         })
         .onConflictDoNothing();
       await db
+        .insert(agents)
+        .values([
+          {
+            id: ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_A_ID,
+            companyId: ISSUE_LIST_FRESHNESS_CANARY_COMPANY_ID,
+            name: "issue-list-freshness-canary assignee A",
+          },
+          {
+            id: ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_B_ID,
+            companyId: ISSUE_LIST_FRESHNESS_CANARY_COMPANY_ID,
+            name: "issue-list-freshness-canary assignee B",
+          },
+        ])
+        .onConflictDoNothing();
+      await db
         .insert(issues)
         .values({
           id: ISSUE_LIST_FRESHNESS_CANARY_ISSUE_ID,
@@ -177,7 +266,34 @@ export function createIssueListFreshnessCanaryCore(
         .onConflictDoNothing();
     });
 
-  const warnOncePerStuckWrite = (anchor: StuckWrite, lagMs: number) => {
+  const evaluateLegs = async (
+    anchor: {
+      nonce: string;
+      assignee: string;
+      prevAssignee: string | null;
+    },
+  ): Promise<IssueListFreshnessCanaryLeg | null> => {
+    const seen = await readBack(anchor.nonce);
+    if (!seen) return "existence";
+    const fieldRow = await readBackByAssignee(anchor.nonce, anchor.assignee);
+    if (!fieldRow || fieldRow.assigneeAgentId !== anchor.assignee) {
+      return "field_new";
+    }
+    if (anchor.prevAssignee) {
+      const staleRow = await readBackByAssignee(
+        anchor.nonce,
+        anchor.prevAssignee,
+      );
+      if (staleRow) return "field_old";
+    }
+    return null;
+  };
+
+  const warnOncePerStuckWrite = (
+    anchor: StuckWrite,
+    lagMs: number,
+    leg: IssueListFreshnessCanaryLeg,
+  ) => {
     if (anchor.warned || lagMs <= ISSUE_LIST_FRESHNESS_LAG_THRESHOLD_MS) return;
     anchor.warned = true;
     metrics.breach();
@@ -187,6 +303,7 @@ export function createIssueListFreshnessCanaryCore(
         lagMs,
         thresholdMs: ISSUE_LIST_FRESHNESS_LAG_THRESHOLD_MS,
         nonce: anchor.nonce,
+        leg,
       },
       "issues list freshness canary: list query lagged sentinel write",
     );
@@ -203,29 +320,47 @@ export function createIssueListFreshnessCanaryCore(
       if (!sentinelEnsured) await this.ensureSentinel();
 
       if (!stuckWrite) {
-        // Fresh sentinel write, then same-tick read-back through the
-        // production list query shape.
+        // Fresh sentinel write (assignee flips each tick), then same-tick
+        // read-backs through the production list query shapes.
         const nonce = `${Date.now()}-${randomUUID()}`;
-        await writeSentinel(sentinelTitle(nonce), new Date(now()));
+        const assignee =
+          lastAssignee === ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_A_ID
+            ? ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_B_ID
+            : ISSUE_LIST_FRESHNESS_CANARY_ASSIGNEE_A_ID;
+        const prevAssignee = lastAssignee;
+        await writeSentinel(sentinelTitle(nonce), new Date(now()), assignee);
         const committedAt = now();
-        const seen = await readBack(nonce);
-        if (seen) {
+        const failedLeg = await evaluateLegs({ nonce, assignee, prevAssignee });
+        if (!failedLeg) {
+          lastAssignee = assignee;
           metrics.tick("fresh");
           return { outcome: "fresh", lagMs: now() - committedAt };
         }
-        stuckWrite = { nonce, committedAt, warned: false };
+        stuckWrite = {
+          nonce,
+          committedAt,
+          warned: false,
+          assignee,
+          prevAssignee,
+          lastFailedLeg: failedLeg,
+        };
         metrics.tick("lagging");
-        return { outcome: "lagging", lagMs: now() - committedAt };
+        return { outcome: "lagging", leg: failedLeg, lagMs: now() - committedAt };
       }
 
-      // A write is stuck: re-affirm the SAME nonce (fresh updated_at → fresh
-      // index entries) and re-read until the list query sees it.
+      // A write is stuck: re-affirm the SAME nonce and assignee (fresh
+      // updated_at → fresh index entries) and re-observe until every leg
+      // passes.
       const anchor = stuckWrite;
-      await writeSentinel(sentinelTitle(anchor.nonce), new Date(now()));
-      const seen = await readBack(anchor.nonce);
+      await writeSentinel(
+        sentinelTitle(anchor.nonce),
+        new Date(now()),
+        anchor.assignee,
+      );
+      const failedLeg = await evaluateLegs(anchor);
       const lagMs = now() - anchor.committedAt;
-      if (seen) {
-        warnOncePerStuckWrite(anchor, lagMs);
+      if (!failedLeg) {
+        warnOncePerStuckWrite(anchor, lagMs, anchor.lastFailedLeg);
         if (lagMs > ISSUE_LIST_FRESHNESS_LAG_THRESHOLD_MS) {
           logger?.info(
             {
@@ -236,13 +371,15 @@ export function createIssueListFreshnessCanaryCore(
             "issues list freshness canary recovered",
           );
         }
+        lastAssignee = anchor.assignee;
         stuckWrite = null;
         metrics.tick("fresh");
         return { outcome: "fresh", lagMs };
       }
-      warnOncePerStuckWrite(anchor, lagMs);
+      warnOncePerStuckWrite(anchor, lagMs, failedLeg);
+      anchor.lastFailedLeg = failedLeg;
       metrics.tick("lagging");
-      return { outcome: "lagging", lagMs };
+      return { outcome: "lagging", leg: failedLeg, lagMs };
     },
   };
 }
@@ -256,7 +393,10 @@ export type IssueListFreshnessCanaryHandle = {
  * is unref'd so the canary never keeps the process alive on its own.
  */
 export function startIssueListFreshnessCanary(
-  deps: Omit<IssueListFreshnessCanaryDeps, "now" | "readBack" | "writeSentinel"> & {
+  deps: Omit<
+    IssueListFreshnessCanaryDeps,
+    "now" | "readBack" | "readBackByAssignee" | "writeSentinel"
+  > & {
     intervalMs?: number | null;
     env?: NodeJS.ProcessEnv;
     /** Optional gate evaluated before bootstrap and every tick (e.g. warm-standby skip). */

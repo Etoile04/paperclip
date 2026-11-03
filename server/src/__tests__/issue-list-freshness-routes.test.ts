@@ -242,6 +242,53 @@ describeEmbeddedPostgres("issue list freshness routes", () => {
     expect(todoAfter.ids).not.toContain(movedIssueId);
   });
 
+  it("AC4-iv: reflects an assignee change in assignee-filtered compact lists immediately — membership both directions and projected value", async () => {
+    // CTO-ARCH amendment 2026-11-03: the 21:05Z recurrence mixed fresh
+    // existence with ≥26-min-stale assignee VALUES, so the regression pin
+    // must cover the projected field, not just membership.
+    const companyId = await seedCompany();
+    const agentA = await seedAgent(companyId);
+    const agentB = await seedAgent(companyId);
+    const movedIssueId = await seedIssue(companyId, {
+      status: "todo",
+      assigneeAgentId: agentA,
+    });
+    await seedIssue(companyId, { status: "todo" });
+    const app = createApp(companyId);
+
+    // Warm every assignee-filtered cache key the same-tick reads will reuse.
+    const warmedA = await listCompact(app, companyId, {
+      assigneeAgentId: agentA,
+    });
+    const warmedB = await listCompact(app, companyId, {
+      assigneeAgentId: agentB,
+    });
+    const warmedUnfiltered = await listCompact(app, companyId, {});
+    expect(warmedA.ids).toEqual([movedIssueId]);
+    expect(warmedB.ids).toEqual([]);
+    expect(warmedUnfiltered.ids).toContain(movedIssueId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${movedIssueId}`)
+      .send({ assigneeAgentId: agentB });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    // Same tick: membership flips both directions…
+    const listB = await listCompact(app, companyId, { assigneeAgentId: agentB });
+    const listA = await listCompact(app, companyId, { assigneeAgentId: agentA });
+    expect(listB.ids).toContain(movedIssueId);
+    expect(listA.ids).not.toContain(movedIssueId);
+    // …and the projected assignee value is the NEW assignee everywhere the
+    // row appears (a stale index-only projection would still serve agentA).
+    const rowB = (listB.body ?? []).find((r: any) => r.id === movedIssueId);
+    expect(rowB?.assigneeAgentId).toBe(agentB);
+    const unfilteredAfter = await listCompact(app, companyId, {});
+    const rowUnfiltered = (unfilteredAfter.body ?? []).find(
+      (r: any) => r.id === movedIssueId,
+    );
+    expect(rowUnfiltered?.assigneeAgentId).toBe(agentB);
+  });
+
   it("AC4-iii: walks offset pages content-monotonically — no duplicates, full coverage, strictly decreasing id order", async () => {
     const companyId = await seedCompany();
     const baseUpdatedAt = new Date("2026-11-01T00:00:00.000Z").getTime();
