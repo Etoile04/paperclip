@@ -189,6 +189,10 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import {
+  noteIssueListMutation,
+  withIssueListFreshness,
+} from "../lib/issue-list-freshness.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -9427,6 +9431,7 @@ export function issueService(db: Db) {
         );
       }
 
+      noteIssueListMutation(parent.companyId);
       return {
         issue: child,
         parentBlockerAdded: Boolean(blockParentUntilDone),
@@ -10293,8 +10298,14 @@ export function issueService(db: Db) {
         );
         return withRelations;
       };
-      if (dbOrTx === db) return db.transaction(persist);
-      return persist(dbOrTx as DbTransaction);
+      if (dbOrTx === db) {
+        return withIssueListFreshness(companyId, () =>
+          db.transaction(persist),
+        );
+      }
+      const createdExternally = await persist(dbOrTx as DbTransaction);
+      noteIssueListMutation(companyId);
+      return createdExternally;
     },
 
     /**
@@ -10529,7 +10540,7 @@ export function issueService(db: Db) {
 
         await insertRowsInChunks(tx, issues, issueRows);
         await insertRowsInChunks(tx, issueLabels, labelRows);
-      });
+      }).then(() => noteIssueListMutation(companyId));
     },
 
     /**
@@ -11330,8 +11341,16 @@ export function issueService(db: Db) {
       };
 
       const result = await (dbOrTx === db
-        ? db.transaction(runUpdate)
-        : runUpdate(dbOrTx));
+        ? withIssueListFreshness(existing.companyId, () =>
+            db.transaction(runUpdate),
+          )
+        : runUpdate(dbOrTx).then((updated) => {
+            // The caller owns this transaction and commits it later; stamping
+            // the watermark now still invalidates every cache entry computed
+            // before these writes were issued (NFM-5843).
+            noteIssueListMutation(existing.companyId);
+            return updated;
+          }));
       if (dbOrTx === db && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications)
           publishActivity(publication);
@@ -11430,6 +11449,9 @@ export function issueService(db: Db) {
         if (!removedIssue) return null;
         const [enriched] = await withIssueLabels(tx, [removedIssue]);
         return enriched;
+      }).then((removed) => {
+        if (removed) noteIssueListMutation(removed.companyId);
+        return removed;
       }),
 
     checkout: async (

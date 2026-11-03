@@ -17,6 +17,7 @@ import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./se
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
+import { startIssueListFreshnessCanary } from "./services/issue-list-freshness-canary.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type RequestListener } from "node:http";
@@ -1207,6 +1208,17 @@ async function startServerWithDatabaseTeardown(
   const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
   sweepExecutionControl();
+  // Issues-list freshness canary (NFM-5843 AC2): sentinel write + read-back
+  // through the production list query shape every ≤30s; WARN log + Prometheus
+  // breach counter when visibility lag exceeds 10s. The canary writes only to
+  // its own scratch company, so no user-visible data is touched. Disabled via
+  // PAPERCLIP_LIST_FRESHNESS_CANARY_INTERVAL_MS=off.
+  const issueListFreshnessCanary = startIssueListFreshnessCanary({
+    db,
+    logger,
+    env: process.env,
+    shouldTick: () => !isWarmStandby(),
+  });
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(() => {
       if (!isWarmStandby()) callback();
@@ -2084,6 +2096,7 @@ async function startServerWithDatabaseTeardown(
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;
     }
+    issueListFreshnessCanary?.stop();
 
     const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
       signal,

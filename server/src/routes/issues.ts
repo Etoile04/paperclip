@@ -231,6 +231,11 @@ import {
   unprocessable,
 } from "../errors.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
+import {
+  __resetIssueListFreshnessForTests,
+  getIssueListFreshnessGate,
+  withIssueListFreshness,
+} from "../lib/issue-list-freshness.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
   assertBoard,
@@ -3127,6 +3132,10 @@ type IssueListCacheEntry = {
   response: IssueListPreparedResponse;
   expiresAt: number;
   staleUntil: number;
+  // Coordinate-entry time of the compute that produced this entry, compared
+  // against the company's list-freshness watermark so entries computed before
+  // the latest mutation are served as misses (NFM-5843).
+  recordedAt: number;
 };
 
 type IssueListInflightEntry = {
@@ -3146,6 +3155,7 @@ export function __getIssueListResponseCacheSizeForTests() {
 
 export function __clearIssueListResponseCacheForTests() {
   issueListResponseCache.clear();
+  __resetIssueListFreshnessForTests();
 }
 
 function shortHash(value: string): string {
@@ -3326,9 +3336,20 @@ async function coordinateIssueListGet(input: {
   const now = Date.now();
   pruneIssueListResponseCache(now);
 
-  const cached = input.allowTtlCache
+  // Freshness gate (NFM-5843): while a mutation is in flight for this company
+  // nothing cached may be served (a mid-transaction compute observes
+  // pre-commit state), and any entry computed before the company's latest
+  // durable mutation is a miss.
+  const gate = getIssueListFreshnessGate(input.companyId);
+  const cachedCandidate = input.allowTtlCache
     ? issueListResponseCache.get(input.requestKey.key)
     : undefined;
+  const cached =
+    cachedCandidate &&
+    !gate.mutating &&
+    cachedCandidate.recordedAt >= gate.watermarkAt
+      ? cachedCandidate
+      : undefined;
   if (cached && cached.expiresAt > now) {
     touchIssueListResponseCacheEntry(input.requestKey.key, cached);
     return {
@@ -3412,6 +3433,9 @@ async function coordinateIssueListGet(input: {
         response,
         expiresAt: Date.now() + ISSUE_LIST_SERVER_CACHE_TTL_MS,
         staleUntil: Date.now() + ISSUE_LIST_SERVER_CACHE_STALE_MS,
+        // Conservative compute-start stamp: a compute that began before the
+        // next mutation committed must not outlive it.
+        recordedAt: now,
       });
     }
     return { response, cacheStatus: "miss", identicalInFlightCount: 1 };
@@ -13826,7 +13850,13 @@ export function issueRoutes(
         reviewPolicySensitiveMutationRequested;
       try {
         if (shouldUseTransactionalIssueUpdate) {
-          issue = await db.transaction(async (tx) => {
+          // The whole transaction sits under the list-freshness gate so the
+          // compact-list cache can neither serve pre-commit entries nor cache
+          // a compute that observed pre-commit state (NFM-5843).
+          issue = await withIssueListFreshness(
+            existing.companyId,
+            () =>
+              db.transaction(async (tx) => {
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -13883,7 +13913,8 @@ export function issueRoutes(
             await persistReviewTransitionActivity(tx, updated);
 
             return updated;
-          });
+              }),
+          );
         } else {
           issue = await updateIssue();
         }

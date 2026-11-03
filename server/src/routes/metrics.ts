@@ -32,6 +32,10 @@ import {
   getPrecompletionMetrics,
   renderPrecompletionMetrics,
 } from "../metrics/precompletion.js";
+import {
+  getIssueListFreshnessMetrics,
+  renderIssueListFreshnessMetrics,
+} from "../metrics/issue-list-freshness.js";
 
 const PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -42,17 +46,21 @@ async function renderAllMetrics(): Promise<string> {
   // scrape issued before any event would return an empty body.
   getPrecompletionMetrics();
   getInteractionResultFallbackMetrics();
+  getIssueListFreshnessMetrics();
 
-  const [precompletion, fallback] = await Promise.all([
+  const [precompletion, fallback, listFreshness] = await Promise.all([
     renderPrecompletionMetrics(),
     renderInteractionResultFallbackMetrics(),
+    renderIssueListFreshnessMetrics(),
   ]);
 
   // Each Registry.metrics() call already emits the full Prometheus text
   // envelope (HELP + TYPE + samples). Joining with a blank line keeps
   // prom-client's per-registry preamble intact while still producing a body
   // that scrapers parse as one document.
-  return [precompletion, fallback].filter((chunk) => chunk.length > 0).join("\n");
+  return [precompletion, fallback, listFreshness]
+    .filter((chunk) => chunk.length > 0)
+    .join("\n");
 }
 
 export function metricsRoutes(): Router {
