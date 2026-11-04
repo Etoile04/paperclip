@@ -2984,7 +2984,7 @@ export function recoveryService(
             eq(issues.executionRunId, input.run.id),
           ),
         );
-      noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
+      noteIssueListMutation(input.run.companyId); // NFM-5850 list-gating patch
 
       return updatedRun;
     });

@@ -775,7 +775,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .update(issues)
       .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
       .where(eq(issues.id, review.id));
-    noteIssueListMutation(sourceIssue.companyId); // NFM-5850 list-gating patch
+    noteIssueListMutation(evidence.sourceIssue.companyId); // NFM-5850 list-gating patch
 
     await logActivity(db, {
       companyId: evidence.sourceIssue.companyId,

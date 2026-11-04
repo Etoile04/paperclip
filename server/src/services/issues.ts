@@ -7900,8 +7900,9 @@ export function issueService(db: Db) {
       .set({ updatedAt: new Date() })
       .where(eq(issues.id, parent.id));
 
-    return { comment, parent };
     noteIssueListMutation(parent.companyId); // NFM-5850 list-gating patch
+
+    return { comment, parent };
   }
 
   async function archiveInbox(
@@ -11433,7 +11434,7 @@ export function issueService(db: Db) {
           })
           .where(eq(issues.id, row.id));
         cleared += 1;
-          noteIssueListMutation(companyId); // NFM-5850 list-gating patch
+        noteIssueListMutation(companyId); // NFM-5850 list-gating patch
       }
 
       return cleared;

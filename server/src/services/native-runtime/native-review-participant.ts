@@ -250,7 +250,8 @@ export async function claimNativeReviewExecutionLock(db: Db, input: {
       eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
       or(isNull(issues.executionRunId), eq(issues.executionRunId, input.runId)),
     )).returning({ id: issues.id });
-    return claimed.length === 1;
-    if (claimed.length === 1) noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
+    const ok = claimed.length === 1;
+    if (ok) noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
+    return ok;
   });
 }

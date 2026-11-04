@@ -1,4 +1,4 @@
-import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
+import { noteIssueListMutation, withIssueListFreshness } from "../lib/issue-list-freshness.js";
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
@@ -1073,51 +1073,57 @@ export function agentService(db: Db) {
         });
       }
 
-      return db.transaction(async (tx) => {
-        await tx
-          .select({ id: agents.id })
-          .from(agents)
-          .where(eq(agents.id, id))
-          .for("update");
-        await issueThreadInteractionService(tx as unknown as Db)
-          .cancelPendingForDeletedAddressee(existing.companyId, id);
-        await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
-        // NFM-5850: agent deletion clears assignee/creator across companies —
-        // advance the watermark for every company that had a touched row.
-        const touchedIssues = await tx
-          .update(issues)
-          .set({ assigneeAgentId: null, createdByAgentId: null })
-          .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)))
-          .returning({ companyId: issues.companyId });
-        for (const touchedCompanyId of new Set(touchedIssues.map((r) => r.companyId))) {
-          noteIssueListMutation(touchedCompanyId);
-        }
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
-        await tx.delete(activityLog).where(
-          or(
-            eq(activityLog.agentId, id),
-            sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
-          ),
-        );
-        await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.actorAgentId, id));
-        await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
-        await tx.delete(principalPermissionGrants).where(and(
-          eq(principalPermissionGrants.companyId, existing.companyId),
-          eq(principalPermissionGrants.principalType, "agent"),
-          eq(principalPermissionGrants.principalId, id),
-        ));
-        const deleted = await tx
-          .delete(agents)
-          .where(eq(agents.id, id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
-        return deleted ? normalizeAgentRow(deleted) : null;
-      });
+      // NFM-5850: gate the read path for the agent's company for the whole
+      // transaction and stamp the watermark on resolution (post-commit).
+      // The per-company sweep notes inside still cover every other touched
+      // company (assignee/creator clears span companies).
+      return withIssueListFreshness(existing.companyId, () =>
+        db.transaction(async (tx) => {
+          await tx
+            .select({ id: agents.id })
+            .from(agents)
+            .where(eq(agents.id, id))
+            .for("update");
+          await issueThreadInteractionService(tx as unknown as Db)
+            .cancelPendingForDeletedAddressee(existing.companyId, id);
+          await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
+          // NFM-5850: agent deletion clears assignee/creator across companies —
+          // advance the watermark for every company that had a touched row.
+          const touchedIssues = await tx
+            .update(issues)
+            .set({ assigneeAgentId: null, createdByAgentId: null })
+            .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)))
+            .returning({ companyId: issues.companyId });
+          for (const touchedCompanyId of new Set(touchedIssues.map((r) => r.companyId))) {
+            noteIssueListMutation(touchedCompanyId);
+          }
+          await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
+          await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
+          await tx.delete(activityLog).where(
+            or(
+              eq(activityLog.agentId, id),
+              sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
+            ),
+          );
+          await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.actorAgentId, id));
+          await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
+          await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
+          await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
+          await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
+          await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
+          await tx.delete(principalPermissionGrants).where(and(
+            eq(principalPermissionGrants.companyId, existing.companyId),
+            eq(principalPermissionGrants.principalType, "agent"),
+            eq(principalPermissionGrants.principalId, id),
+          ));
+          const deleted = await tx
+            .delete(agents)
+            .where(eq(agents.id, id))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          return deleted ? normalizeAgentRow(deleted) : null;
+        }),
+      );
     },
 
     activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {
