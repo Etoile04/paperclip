@@ -258,6 +258,38 @@ describe("ConnectionIntentInteractionBody states and audience", () => {
       /authorizationUrl|bearer|credential/i,
     );
   });
+
+  it("names the addressee in the waiting state when the viewer is someone else", () => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    root = createRoot(host);
+    queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    void act(() => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <ConnectionIntentInteractionBody
+            interaction={pendingConnectionIntentInteraction}
+            currentUserId="other-user"
+            addresseeLabel="user-24"
+            addresseeName="Carol Chen"
+          />
+        </QueryClientProvider>,
+      );
+    });
+    expect(document.body.textContent).toContain("Waiting for Carol Chen");
+    expect(document.body.textContent).not.toContain("user-24");
+    expect(button("Connect / Use existing")).toBeUndefined();
+  });
+
+  it("never treats an unknown viewer as the addressee", () => {
+    renderBody(pendingConnectionIntentInteraction, null);
+    expect(document.body.textContent).toContain("Waiting for Carol");
+    expect(button("Connect / Use existing")).toBeUndefined();
+    expect(button("Not now")).toBeUndefined();
+    expect(setupOptionsMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("ConnectionIntentInteractionBody dialog behavior", () => {
