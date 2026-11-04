@@ -301,7 +301,7 @@ export function ConnectionIntentInteractionBody({
           <Clock className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
           <div>
             <p className="font-medium text-foreground">
-              Waiting for {addresseeLabel}
+              Waiting for {addresseeName?.trim() || addresseeLabel}
             </p>
             {!accessRequest ? <p className="mt-1 text-sm text-muted-foreground">
               Only the addressed person can choose an identity or authorize this
