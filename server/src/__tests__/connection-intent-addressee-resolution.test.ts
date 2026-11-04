@@ -45,6 +45,7 @@ async function seedHuman(
   companyId: string,
   userId: string,
   joinedAt: Date,
+  membershipRole: "member" | "viewer" = "member",
 ) {
   await db.insert(authUsers).values({
     id: userId,
@@ -60,7 +61,7 @@ async function seedHuman(
     principalType: "user",
     principalId: userId,
     status: "active",
-    membershipRole: "member",
+    membershipRole,
     createdAt: joinedAt,
     updatedAt: joinedAt,
   });
@@ -175,6 +176,7 @@ describeEmbeddedPostgres("connection intent addressee resolution", () => {
   let companyWithoutHumans!: string;
   let earlyHuman!: string;
   let lateHuman!: string;
+  let lateViewer!: string;
   let sentinelTask!: Awaited<ReturnType<typeof seedTask>>;
   let humanTask!: Awaited<ReturnType<typeof seedTask>>;
   let noHumansIssueId!: string;
@@ -198,6 +200,9 @@ describeEmbeddedPostgres("connection intent addressee resolution", () => {
     await seedSentinel(db, companyWithHumans, new Date("2025-01-01T00:00:00Z"));
     await seedHuman(db, companyWithHumans, earlyHuman, joinedEarly);
     await seedHuman(db, companyWithHumans, lateHuman, joinedLate);
+    // A read-only member who joined last: candidates must never pick them.
+    lateViewer = "human-late-viewer";
+    await seedHuman(db, companyWithHumans, lateViewer, new Date("2026-09-01T00:00:00Z"), "viewer");
     sentinelTask = await seedTask(db, companyWithHumans, SENTINEL);
     humanTask = await seedTask(db, companyWithHumans, earlyHuman);
 
@@ -227,6 +232,44 @@ describeEmbeddedPostgres("connection intent addressee resolution", () => {
 
   it("falls back to the original addressee when the company has no human members", async () => {
     await expect(resolveConnectionIntentAddressee(db, companyWithoutHumans, SENTINEL)).resolves.toBe(SENTINEL);
+  });
+
+  it("skips an earliest-joined viewer and picks the completable member instead", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Viewer joined first",
+      issuePrefix: "VWF",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedSentinel(db, companyId, new Date("2025-01-01T00:00:00Z"));
+    // The viewer joined earlier, so the pre-NFM-5852 ordering would pick them —
+    // but viewers fail the addressed-user completeness guard and are never
+    // delivered a wake, so selecting one recreates the black hole.
+    await seedHuman(db, companyId, "viewer-early", new Date("2026-01-01T00:00:00Z"), "viewer");
+    await seedHuman(db, companyId, "member-late", new Date("2026-06-01T00:00:00Z"), "member");
+    await expect(resolveConnectionIntentAddressee(db, companyId, SENTINEL)).resolves.toBe("member-late");
+  });
+
+  it("falls back to the original addressee when the only humans are viewers", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Viewers only",
+      issuePrefix: "VON",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedSentinel(db, companyId, new Date("2025-01-01T00:00:00Z"));
+    await seedHuman(db, companyId, "viewer-only", new Date("2026-01-01T00:00:00Z"), "viewer");
+    await expect(resolveConnectionIntentAddressee(db, companyId, SENTINEL)).resolves.toBe(SENTINEL);
+  });
+
+  it("reroutes a viewer responsible user instead of passing them through", async () => {
+    // The creation path rejects viewer responsible users before the resolver
+    // runs, so this pins the resolver's own contract: it never returns a
+    // member who cannot complete the card, even when that member is the
+    // responsible user itself.
+    await expect(resolveConnectionIntentAddressee(db, companyWithHumans, lateViewer)).resolves.toBe(earlyHuman);
   });
 
   it("is deterministic when two humans joined at the same instant", async () => {

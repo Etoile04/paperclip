@@ -7,7 +7,7 @@ import { logActivity } from "./activity-log.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { aiConnectionBindingSchema, aiConnectionRouterBindingSchema } from "@paperclipai/shared";
 import { aiBindingForAuthRecovery, isAiAuthenticationFailure } from "./ai-auth-failure.js";
-import { and, asc, eq, ne, desc, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, ne, desc, isNotNull, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -106,6 +106,12 @@ function connectionIntentAddresseeIsHumanCondition(companyId: string, principalI
     eq(companyMemberships.companyId, companyId),
     eq(companyMemberships.principalType, "user"),
     eq(companyMemberships.status, "active"),
+    // Viewers (and role-less memberships) can never act on a card addressed
+    // to them: the addressed-user completeness guard and the delivery gate
+    // both reject them, so selecting one deterministically recreates the
+    // black hole this resolver exists to prevent.
+    isNotNull(companyMemberships.membershipRole),
+    ne(companyMemberships.membershipRole, "viewer"),
     ...principalId ? [eq(companyMemberships.principalId, principalId)] : [],
     ...CONNECTION_INTENT_SENTINEL_ADDRESSEE_USER_IDS.map((sentinel) => ne(companyMemberships.principalId, sentinel)),
   );
@@ -125,6 +131,13 @@ function connectionIntentAddresseeIsHumanCondition(companyId: string, principalI
  * earliest-joined active human company member is chosen deterministically, and
  * a company with no human members at all falls back to the original value so
  * creation never fails (behavior there matches pre-NFM-5852 installs).
+ *
+ * "Human member" here means a member who could actually complete the card:
+ * memberships with a viewer (or unset) role never qualify, because the
+ * addressed-user completeness guard returns 403 for them and the delivery gate
+ * never wakes them. A company whose only human members are viewers therefore
+ * falls back to the original addressee, exactly like a company with no human
+ * members — an uncompletable card is never created on purpose.
  */
 export async function resolveConnectionIntentAddressee(
   db: Db,

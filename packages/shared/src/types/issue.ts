@@ -1379,6 +1379,13 @@ export interface ConnectionIntentPayload {
   requestingAgentId: string;
   requestingAgentName: string;
   phase: ConnectionIntentPhase;
+  /**
+   * Provenance for a rerouted addressee (NFM-5852): the non-human principal
+   * (e.g. the synthetic `local-board` account) the card was originally routed
+   * from before being addressed to a real human member. Deliberately not a
+   * guid — the sentinel principal ids it records are plain text.
+   */
+  routedFromUserId?: string;
 }
 
 export interface ConnectionIntentResult {

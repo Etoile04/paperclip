@@ -104,16 +104,18 @@ export async function migrateLocalBoardConnectionIntentAddressees(
       });
     }
 
-    const payload = row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
-      ? row.payload as Record<string, unknown>
-      : {};
+    // The WHERE clause pins kind to connection_intent; narrow the payload
+    // union through the discriminator instead of casting, so the provenance
+    // write stays type-checked against ConnectionIntentPayload. A corrupt or
+    // missing payload is left alone rather than replaced with a stub.
+    if (row.kind !== "connection_intent" || !row.payload || typeof row.payload !== "object" || Array.isArray(row.payload)) continue;
     await db
       .update(issueThreadInteractions)
       .set({
         addresseeUserId: to,
         payload: {
-          ...payload,
-          ...("routedFromUserId" in payload ? {} : { routedFromUserId: from }),
+          ...row.payload,
+          ...("routedFromUserId" in row.payload ? {} : { routedFromUserId: from }),
         },
         updatedAt: new Date(),
       })
