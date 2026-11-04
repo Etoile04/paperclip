@@ -32,6 +32,8 @@ export interface ConnectionIntentAddresseeMigrationResult {
   migrated: number;
   /** Pending cards left alone because the company has no human member. */
   skippedNoHuman: number;
+  /** Pending cards left alone because their payload is null or not a connection-intent object. */
+  skippedCorruptPayload: number;
   changes: ConnectionIntentAddresseeMigrationChange[];
 }
 
@@ -74,12 +76,24 @@ export async function migrateLocalBoardConnectionIntentAddressees(
     scanned: rows.length,
     migrated: 0,
     skippedNoHuman: 0,
+    skippedCorruptPayload: 0,
     changes: [],
   };
 
   for (const row of rows) {
     const from = row.addresseeUserId;
     if (!from) continue;
+    // The WHERE clause pins kind to connection_intent; narrow the payload
+    // union through the discriminator instead of casting, so the provenance
+    // write stays type-checked against ConnectionIntentPayload. A corrupt or
+    // missing payload is left alone rather than replaced with a stub. This
+    // narrowing happens BEFORE accounting and backup: a corrupt row must not
+    // be reported as a change nor written to the backup JSONL, or the report
+    // and backup drift from what was actually migrated (NFM-5853).
+    if (row.kind !== "connection_intent" || !row.payload || typeof row.payload !== "object" || Array.isArray(row.payload)) {
+      result.skippedCorruptPayload += 1;
+      continue;
+    }
     const to = await resolveConnectionIntentAddressee(db, row.companyId, from);
     if (to === from) {
       result.skippedNoHuman += 1;
@@ -104,11 +118,6 @@ export async function migrateLocalBoardConnectionIntentAddressees(
       });
     }
 
-    // The WHERE clause pins kind to connection_intent; narrow the payload
-    // union through the discriminator instead of casting, so the provenance
-    // write stays type-checked against ConnectionIntentPayload. A corrupt or
-    // missing payload is left alone rather than replaced with a stub.
-    if (row.kind !== "connection_intent" || !row.payload || typeof row.payload !== "object" || Array.isArray(row.payload)) continue;
     await db
       .update(issueThreadInteractions)
       .set({

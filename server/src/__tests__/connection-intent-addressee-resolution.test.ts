@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -22,6 +25,7 @@ import {
 import express from "express";
 import request from "supertest";
 import type { RuntimeToolsTokenClaims } from "../runtime-tools-token.js";
+import type { IssueThreadInteractionPayload } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
 import { connectionIntentBoardRoutes } from "../routes/connection-intents.js";
 import {
@@ -491,6 +495,120 @@ describeEmbeddedPostgres("connection intent addressee resolution", () => {
       const [after] = await db.select().from(issueThreadInteractions)
         .where(eq(issueThreadInteractions.id, resolved!.id));
       expect(after).toMatchObject({ addresseeUserId: SENTINEL, status: "accepted" });
+    });
+
+    /** Same shape as insertLegacyPendingRow but with an arbitrary payload value. */
+    async function insertLegacyPendingRowWithPayload(companyId: string, issueId: string, payload: unknown) {
+      const [row] = await db.insert(issueThreadInteractions).values({
+        companyId,
+        issueId,
+        kind: "connection_intent",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "governed_action",
+        idempotencyKey: `legacy-corrupt:${randomUUID()}`,
+        sourceRunId: sentinelTask.runId,
+        originCommentIds: [],
+        title: "Connect Notion",
+        summary: "Researcher needs this connection to continue.",
+        createdByAgentId: sentinelTask.agentId,
+        addresseeUserId: SENTINEL,
+        payload: payload as IssueThreadInteractionPayload,
+      }).returning();
+      return row!;
+    }
+
+    it("excludes corrupt and NULL payload rows from changes and backup, leaving them untouched", async () => {
+      const nullPayloadRow = await insertLegacyPendingRowWithPayload(companyWithHumans, sentinelTask.issueId, {});
+      // jsonb NOT NULL admits the JSON null VALUE (distinct from SQL NULL), and
+      // the schema's $type is compile-time only — scalar and array jsonb values
+      // are equally constructible in a live database (NFM-5853).
+      await db.execute(sql`UPDATE issue_thread_interactions SET payload = 'null'::jsonb WHERE id = ${nullPayloadRow.id}`);
+      const stringPayloadRow = await insertLegacyPendingRowWithPayload(companyWithHumans, sentinelTask.issueId, "corrupt-payload");
+      const arrayPayloadRow = await insertLegacyPendingRowWithPayload(companyWithHumans, sentinelTask.issueId, [1, 2, 3]);
+      const cleanRow = await insertLegacyPendingRow(companyWithHumans, sentinelTask.issueId);
+
+      const backupDir = mkdtempSync(path.join(tmpdir(), "nfm5853-backup-"));
+      const backupPath = path.join(backupDir, "backup.jsonl");
+      try {
+        const result = await migrateLocalBoardConnectionIntentAddressees(db, { backupPath });
+
+        const corruptIds = [nullPayloadRow.id, stringPayloadRow.id, arrayPayloadRow.id];
+        for (const id of corruptIds) {
+          expect(result.changes.some((change) => change.interactionId === id)).toBe(false);
+        }
+        expect(result.migrated).toBe(1);
+        expect(result.skippedCorruptPayload).toBe(3);
+
+        const backupLines = readFileSync(backupPath, "utf8").trim().split("\n")
+          .map((line) => JSON.parse(line) as { interactionId: string });
+        expect(backupLines.map((line) => line.interactionId)).toEqual([cleanRow.id]);
+
+        for (const id of corruptIds) {
+          const [after] = await db.select().from(issueThreadInteractions)
+            .where(eq(issueThreadInteractions.id, id));
+          expect(after).toMatchObject({ addresseeUserId: SENTINEL, status: "pending" });
+        }
+        const [afterNull] = await db.select().from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, nullPayloadRow.id));
+        expect(afterNull?.payload).toBeNull();
+        const [afterString] = await db.select().from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, stringPayloadRow.id));
+        expect(afterString?.payload).toBe("corrupt-payload");
+        const [afterArray] = await db.select().from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, arrayPayloadRow.id));
+        expect(afterArray?.payload).toEqual([1, 2, 3]);
+      } finally {
+        rmSync(backupDir, { recursive: true, force: true });
+      }
+
+      // Idempotent: a rerun still reports nothing to change.
+      const second = await migrateLocalBoardConnectionIntentAddressees(db, { backupPath: null });
+      expect(second.changes).toEqual([]);
+      expect(second.migrated).toBe(0);
+    });
+
+    it("dry-run reports would-be changes on well-formed data but writes no backup and touches nothing", async () => {
+      // Own company + company-scoped passes: corrupt rows left pending by the
+      // sibling test above must not leak into this company's pass.
+      const dryRunCompany = randomUUID();
+      await db.insert(companies).values({
+        id: dryRunCompany,
+        name: "Dry-run scope",
+        issuePrefix: "DRY",
+        requireBoardApprovalForNewAgents: false,
+      });
+      const dryHuman = "human-dry";
+      await seedHuman(db, dryRunCompany, dryHuman, new Date("2026-01-01T00:00:00Z"));
+      const dryIssueId = await seedIssue(db, dryRunCompany);
+      const pending = await insertLegacyPendingRow(dryRunCompany, dryIssueId);
+
+      const backupDir = mkdtempSync(path.join(tmpdir(), "nfm5853-backup-"));
+      const backupPath = path.join(backupDir, "backup.jsonl");
+      try {
+        const dry = await migrateLocalBoardConnectionIntentAddressees(db, { companyId: dryRunCompany, dryRun: true, backupPath });
+        expect(dry.changes).toContainEqual(expect.objectContaining({
+          interactionId: pending.id,
+          from: SENTINEL,
+          to: dryHuman,
+        }));
+        expect(dry.migrated).toBe(0);
+        expect(existsSync(backupPath)).toBe(false);
+        const [after] = await db.select().from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, pending.id));
+        expect(after).toMatchObject({ addresseeUserId: SENTINEL, status: "pending" });
+      } finally {
+        rmSync(backupDir, { recursive: true, force: true });
+      }
+
+      // After the real pass, dry-run against clean data reports nothing.
+      await migrateLocalBoardConnectionIntentAddressees(db, { companyId: dryRunCompany, backupPath: null });
+      const clean = await migrateLocalBoardConnectionIntentAddressees(db, { companyId: dryRunCompany, dryRun: true, backupPath: null });
+      expect(clean.changes).toEqual([]);
+      expect(clean.migrated).toBe(0);
     });
   });
 });

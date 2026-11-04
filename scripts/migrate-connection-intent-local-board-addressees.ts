@@ -49,6 +49,9 @@ async function main() {
   if (result.skippedNoHuman > 0) {
     console.log(`Left ${result.skippedNoHuman} card(s) untouched: their companies have no human member.`);
   }
+  if (result.skippedCorruptPayload > 0) {
+    console.log(`Left ${result.skippedCorruptPayload} card(s) untouched: their payload is null or not a connection-intent object.`);
+  }
   if (backupPath && !dryRun) {
     console.log(`Original values appended to ${backupPath}.`);
   }
