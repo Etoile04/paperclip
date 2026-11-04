@@ -4,6 +4,7 @@ import { grantConnectionAgentTools } from "./connection-agent-access.js";
 import { agentService } from "./agents.js";
 import { createHash } from "node:crypto";
 import { logActivity } from "./activity-log.js";
+import { resolveConnectionIntentAddressee } from "./connection-intent-addressee.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { aiConnectionBindingSchema, aiConnectionRouterBindingSchema } from "@paperclipai/shared";
 import { aiBindingForAuthRecovery, isAiAuthenticationFailure } from "./ai-auth-failure.js";
@@ -773,6 +774,16 @@ export function connectionIntentService(db: Db) {
         throw conflict("The user declined this connection. Pursue alternatives; do not request it again in this continuation.");
       }
     }
+    // A connection card asks one person to authorize a credential, so a
+    // synthetic responsible user (local-board …) is re-addressed to a human
+    // operator; otherwise every real user 403s on a card that can never become
+    // actionable (NFM-5851). The idempotency key keeps the responsible user so
+    // retries resolve to the same addressee and reuse the same live card.
+    const { addresseeUserId, routedFromUserId } = await resolveConnectionIntentAddressee(
+      db,
+      context.run.companyId,
+      context.run.responsibleUserId!,
+    );
     const interaction = await interactions.createConnectionIntent(
       context.issue,
       {
@@ -787,11 +798,12 @@ export function connectionIntentService(db: Db) {
           serviceDarkLogoUrl: app.branding.darkLogoUrl ?? null,
           requestingAgentId: context.agent.id,
           requestingAgentName: context.agent.name,
+          ...(routedFromUserId ? { routedFromUserId } : {}),
           phase: "requested",
         },
         sourceRunId: context.run.id,
         sourceIdentityContextId: context.run.activeIdentityContextId,
-        addresseeUserId: context.run.responsibleUserId!,
+        addresseeUserId,
         idempotencyKey: `connection-intent:${context.run.id}:${context.run.responsibleUserId}:${app.slug}${upstreamService ? `:${upstreamService.slug}` : ""}${options.purpose ? `:${options.purpose}` : ""}${accessRequest ? `:access:${createHash("sha256").update(JSON.stringify(accessRequest)).digest("hex")}` : ""}`,
       },
     );
@@ -800,7 +812,7 @@ export function connectionIntentService(db: Db) {
       companyId: context.run.companyId, actorType: "agent", actorId: context.agent.id,
       agentId: context.agent.id, runId: context.run.id,
       action: "issue.thread_interaction_created", entityType: "issue", entityId: context.issue.id,
-      details: { interactionId: interaction.id, interactionKind: "connection_intent", purpose: options.purpose },
+      details: { interactionId: interaction.id, interactionKind: "connection_intent", purpose: options.purpose, ...(routedFromUserId ? { routedFromUserId } : {}) },
     });
     return {
       version: 1,

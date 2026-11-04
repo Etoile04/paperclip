@@ -258,6 +258,16 @@ describe("ConnectionIntentInteractionBody states and audience", () => {
       /authorizationUrl|bearer|credential/i,
     );
   });
+
+  it("treats an unknown viewer as a non-addressee so no action can flash in", () => {
+    // currentUserId is still loading: strictness beats guessing (NFM-5851 —
+    // the addressee must be resolved before the card offers consent actions).
+    renderBody(pendingConnectionIntentInteraction, null);
+    expect(document.body.textContent).toContain("Waiting for Carol");
+    expect(button("Connect / Use existing")).toBeUndefined();
+    expect(button("Not now")).toBeUndefined();
+    expect(setupOptionsMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("ConnectionIntentInteractionBody dialog behavior", () => {

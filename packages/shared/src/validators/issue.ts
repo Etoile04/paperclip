@@ -1131,6 +1131,11 @@ export const connectionIntentPayloadSchema = z
     serviceDarkLogoUrl: connectionIntentBrandAssetSchema.nullable().optional(),
     requestingAgentId: z.string().guid(),
     requestingAgentName: z.string().trim().min(1).max(160),
+    // Set when the run's responsible user resolved to a synthetic principal
+    // (local-board …) and the card was re-addressed to a human operator —
+    // records where the addressee was routed from (NFM-5851). Not a guid on
+    // purpose: the routed-from value is exactly the synthetic id.
+    routedFromUserId: z.string().trim().min(1).max(160).optional(),
     phase: connectionIntentPhaseSchema,
   })
   .strict();
