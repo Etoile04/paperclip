@@ -7,11 +7,12 @@ import { logActivity } from "./activity-log.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { aiConnectionBindingSchema, aiConnectionRouterBindingSchema } from "@paperclipai/shared";
 import { aiBindingForAuthRecovery, isAiAuthenticationFailure } from "./ai-auth-failure.js";
-import { and, eq, desc, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, ne, desc, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
   aiConnectionTaskPins,
+  authUsers,
   companies,
   toolConnections,
   toolCatalogEntries,
@@ -90,6 +91,62 @@ function availableToolConnectionMethods(
   return getAvailableConnectionMethods(app).filter(
     (method) => (method.purpose ?? "tool") === "tool" && method.transport !== "runtime_auth",
   );
+}
+
+/**
+ * Synthetic principals a connection intent must never be addressed to. The
+ * board account carries an auth row and an active membership on local_trusted
+ * installs (`ensureLocalTrustedBoardPrincipal`), so table presence alone never
+ * proves a principal is a person — the sentinel is excluded by id instead.
+ */
+export const CONNECTION_INTENT_SENTINEL_ADDRESSEE_USER_IDS = ["local-board"] as const;
+
+function connectionIntentAddresseeIsHumanCondition(companyId: string, principalId?: string) {
+  return and(
+    eq(companyMemberships.companyId, companyId),
+    eq(companyMemberships.principalType, "user"),
+    eq(companyMemberships.status, "active"),
+    ...principalId ? [eq(companyMemberships.principalId, principalId)] : [],
+    ...CONNECTION_INTENT_SENTINEL_ADDRESSEE_USER_IDS.map((sentinel) => ne(companyMemberships.principalId, sentinel)),
+  );
+}
+
+/**
+ * Resolve who a connection intent should be addressed to (NFM-5852).
+ *
+ * The card is a consent request: every downstream consumer of
+ * `addresseeUserId` (setup options, credential lookups, the addressed-user
+ * completeness guard) assumes the addressee is a person, while
+ * `run.responsibleUserId` can be the synthetic board principal on
+ * local_trusted installs — which leaves the card invisible to every human and
+ * uncompletable by anyone.
+ *
+ * A real human responsible user passes through unchanged. Otherwise the
+ * earliest-joined active human company member is chosen deterministically, and
+ * a company with no human members at all falls back to the original value so
+ * creation never fails (behavior there matches pre-NFM-5852 installs).
+ */
+export async function resolveConnectionIntentAddressee(
+  db: Db,
+  companyId: string,
+  responsibleUserId: string,
+): Promise<string> {
+  const [responsibleIsHuman] = await db
+    .select({ userId: authUsers.id })
+    .from(companyMemberships)
+    .innerJoin(authUsers, eq(authUsers.id, companyMemberships.principalId))
+    .where(connectionIntentAddresseeIsHumanCondition(companyId, responsibleUserId))
+    .limit(1);
+  if (responsibleIsHuman) return responsibleUserId;
+
+  const [humanMember] = await db
+    .select({ userId: companyMemberships.principalId })
+    .from(companyMemberships)
+    .innerJoin(authUsers, eq(authUsers.id, companyMemberships.principalId))
+    .where(connectionIntentAddresseeIsHumanCondition(companyId))
+    .orderBy(asc(companyMemberships.createdAt), asc(companyMemberships.principalId))
+    .limit(1);
+  return humanMember?.userId ?? responsibleUserId;
 }
 
 export function connectionIntentService(db: Db) {
@@ -773,6 +830,13 @@ export function connectionIntentService(db: Db) {
         throw conflict("The user declined this connection. Pursue alternatives; do not request it again in this continuation.");
       }
     }
+    // A consent card must be addressed to a person. When the run's responsible
+    // user is a non-human principal, route the card to a real human member and
+    // record the original addressee as provenance (NFM-5852). The idempotency
+    // key keeps deriving from the run's responsible user so retries across the
+    // resolution boundary still dedupe onto the same card.
+    const addresseeUserId = await resolveConnectionIntentAddressee(db, context.run.companyId, context.run.responsibleUserId!);
+    const routedFromUserId = addresseeUserId === context.run.responsibleUserId ? null : context.run.responsibleUserId!;
     const interaction = await interactions.createConnectionIntent(
       context.issue,
       {
@@ -788,10 +852,11 @@ export function connectionIntentService(db: Db) {
           requestingAgentId: context.agent.id,
           requestingAgentName: context.agent.name,
           phase: "requested",
+          ...(routedFromUserId ? { routedFromUserId } : {}),
         },
         sourceRunId: context.run.id,
         sourceIdentityContextId: context.run.activeIdentityContextId,
-        addresseeUserId: context.run.responsibleUserId!,
+        addresseeUserId,
         idempotencyKey: `connection-intent:${context.run.id}:${context.run.responsibleUserId}:${app.slug}${upstreamService ? `:${upstreamService.slug}` : ""}${options.purpose ? `:${options.purpose}` : ""}${accessRequest ? `:access:${createHash("sha256").update(JSON.stringify(accessRequest)).digest("hex")}` : ""}`,
       },
     );
@@ -800,7 +865,10 @@ export function connectionIntentService(db: Db) {
       companyId: context.run.companyId, actorType: "agent", actorId: context.agent.id,
       agentId: context.agent.id, runId: context.run.id,
       action: "issue.thread_interaction_created", entityType: "issue", entityId: context.issue.id,
-      details: { interactionId: interaction.id, interactionKind: "connection_intent", purpose: options.purpose },
+      details: {
+        interactionId: interaction.id, interactionKind: "connection_intent", purpose: options.purpose,
+        ...(routedFromUserId ? { routedFromUserId, addresseeUserId } : {}),
+      },
     });
     return {
       version: 1,
