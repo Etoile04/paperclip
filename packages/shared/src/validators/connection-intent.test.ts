@@ -28,6 +28,22 @@ describe("connection intent contracts", () => {
     })).toMatchObject({ serviceSlug: "notion", phase: "requested" });
   });
 
+  it("accepts an optional routedFromUserId provenance for rerouted addressees", () => {
+    const base = {
+      version: 1,
+      serviceSlug: "notion",
+      serviceName: "Notion",
+      requestingAgentId: agentId,
+      requestingAgentName: "Researcher",
+      phase: "requested",
+    };
+    expect(connectionIntentPayloadSchema.parse({
+      ...base,
+      routedFromUserId: "local-board",
+    })).toMatchObject({ routedFromUserId: "local-board" });
+    expect(connectionIntentPayloadSchema.safeParse({ ...base, routedFromUserId: "" }).success).toBe(false);
+  });
+
   it("rejects credentials, authorization URLs, and unknown phases in thread payloads", () => {
     const base = {
       version: 1,

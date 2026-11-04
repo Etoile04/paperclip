@@ -1132,6 +1132,12 @@ export const connectionIntentPayloadSchema = z
     requestingAgentId: z.string().guid(),
     requestingAgentName: z.string().trim().min(1).max(160),
     phase: connectionIntentPhaseSchema,
+    // Provenance for a rerouted addressee (NFM-5852): when the run's responsible
+    // user resolves to a non-human principal (e.g. the synthetic `local-board`
+    // board account), the card is addressed to a real human instead and this
+    // field records who it was originally routed from. Deliberately not a guid:
+    // the sentinel principal ids it records are plain text.
+    routedFromUserId: z.string().trim().min(1).max(160).optional(),
   })
   .strict();
 
