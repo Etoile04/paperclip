@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import {
   persistActivity,
   publishActivity,
@@ -172,6 +173,7 @@ export async function prepareConversationTurn(
           updatedAt: new Date(),
         })
         .where(eq(issues.id, issue.id));
+      noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
       await tx
         .update(issueComments)
         .set({ conversationSessionGeneration: generation })
@@ -263,6 +265,7 @@ export async function prepareConversationTurn(
         updatedAt: new Date(),
       })
       .where(eq(issues.id, issue.id));
+    noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
     const next = {
       ...context,
       conversationSessionGeneration: generation,
@@ -383,6 +386,7 @@ export async function settleConversationTurn(
           sql`(${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id})`,
         ),
       );
+    noteIssueListMutation(issue.companyId); // NFM-5850 list-gating patch
     publication = (
       await persistActivity(tx as unknown as Db, {
         companyId: issue.companyId,

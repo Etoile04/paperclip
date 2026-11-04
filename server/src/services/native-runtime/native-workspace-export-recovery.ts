@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../../lib/issue-list-freshness.js";
 import { and, asc, desc, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
 import { completionContracts, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, workspaceOperations, type Db } from "@paperclipai/db";
 import { publishLiveEvent } from "../live-events.js";
@@ -93,6 +94,7 @@ export async function recoverLegacyUnsafeWorkspaceExports(db: Db, runIds?: strin
             resultJson: { ...run.resultJson, finalizationPhase: "result_accepted", failureCode: null, originalFailureCode: null, nextAttemptAt: null }, updatedAt: now,
           }).where(eq(heartbeatRuns.id, run.id)).returning();
           await tx.update(issues).set({ executionRunId: run.id, updatedAt: now }).where(eq(issues.id, issue.id));
+          noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
           await appendHeartbeatRunEvent(tx as unknown as Db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
             eventType: "workspace_export_omitted", stream: "system", level: "info",
             message: "Historical unsafe workspace export omitted; continuing with the accepted result.",

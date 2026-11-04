@@ -1,4 +1,5 @@
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
+import { noteIssueListMutation } from "../../../lib/issue-list-freshness.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
@@ -501,6 +502,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             isNull(issues.executionRunId),
           ),
         );
+      noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
 
       return toRunSummary(newRun);
     },
@@ -647,6 +649,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           updatedAt: now,
         })
         .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
+      noteIssueListMutation(companyId); // NFM-5850 list-gating patch
 
       return toRunSummary(queuedRun);
     },
@@ -711,6 +714,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           updatedAt: now,
         })
         .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
+      noteIssueListMutation(companyId); // NFM-5850 list-gating patch
 
       return toRunSummary(queuedRun);
     },
@@ -1074,10 +1078,12 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           .update(issues)
           .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: input.now })
           .where(and(eq(issues.companyId, input.companyId), eq(issues.executionRunId, run.id)));
+        noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
         await tx
           .update(issues)
           .set({ checkoutRunId: null, updatedAt: input.now })
           .where(and(eq(issues.companyId, input.companyId), eq(issues.checkoutRunId, run.id)));
+        noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
 
         const issueRow =
           (contextIssueId ? candidateIssues.find((candidate) => candidate.id === contextIssueId) : candidateIssues[0]) ?? null;
@@ -1210,6 +1216,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         }
         return { ...result, run: runSnapshot };
       });
+          noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
     },
   };
 }

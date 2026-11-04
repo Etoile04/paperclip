@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../../lib/issue-list-freshness.js";
 import { randomUUID } from "node:crypto";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
@@ -138,6 +139,7 @@ export async function retryNativeWorkspaceExport(input: {
           nativePhase: "result_accepted", nativePhaseUpdatedAt: now,
           resultJson: { ...current.run.resultJson, workspaceExportRetry: retry, finalizationPhase: "result_accepted", failureCode: null, originalFailureCode: null, nextAttemptAt: null }, updatedAt: now }).where(eq(heartbeatRuns.id, current.run.id));
         await tx.update(issues).set({ executionRunId: current.run.id, updatedAt: now }).where(eq(issues.id, current.issue.id));
+        noteIssueListMutation(current.run.companyId); // NFM-5850 list-gating patch
         // Reclaim the same lease only for control-plane copyback. The normal
         // finalization settlement will stop/retain it again on success or failure.
         await tx.update(environmentLeases).set({ status: "active", releasedAt: null, cleanupStatus: null, failureReason: null,

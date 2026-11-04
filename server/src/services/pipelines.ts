@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
@@ -1949,6 +1950,7 @@ async function postSystemCommentOnLinkedIssues(
       body: input.body,
     });
     await db.update(issues).set({ updatedAt: nowDate() }).where(eq(issues.id, row.issueId));
+    noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
   }
 }
 
@@ -2081,6 +2083,7 @@ async function notifyDependentWorkIssuesOfUpstreamContentChange(
         notifiedIssueIds: issueIds,
       },
     });
+      noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
   }
 }
 

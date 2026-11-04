@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../../lib/issue-list-freshness.js";
 import {
   agents,
   heartbeatRuns,
@@ -250,5 +251,6 @@ export async function claimNativeReviewExecutionLock(db: Db, input: {
       or(isNull(issues.executionRunId), eq(issues.executionRunId, input.runId)),
     )).returning({ id: issues.id });
     return claimed.length === 1;
+    if (claimed.length === 1) noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
   });
 }

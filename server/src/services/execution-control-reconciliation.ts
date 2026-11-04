@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { logger } from "../middleware/logger.js";
 import { and, eq, isNotNull, lte, sql } from "drizzle-orm";
 import {
@@ -228,6 +229,7 @@ export async function reconcileAbandonedExecutionControl(
             .update(issues)
             .set({ executionRunId: null, checkoutRunId: null, updatedAt: now })
             .where(eq(issues.id, task.id));
+          noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
           await issueRecoveryActionService(
             tx as unknown as Db,
           ).upsertSourceScoped({

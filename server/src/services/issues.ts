@@ -7901,6 +7901,7 @@ export function issueService(db: Db) {
       .where(eq(issues.id, parent.id));
 
     return { comment, parent };
+    noteIssueListMutation(parent.companyId); // NFM-5850 list-gating patch
   }
 
   async function archiveInbox(
@@ -11432,6 +11433,7 @@ export function issueService(db: Db) {
           })
           .where(eq(issues.id, row.id));
         cleared += 1;
+          noteIssueListMutation(companyId); // NFM-5850 list-gating patch
       }
 
       return cleared;
@@ -12229,6 +12231,7 @@ export function issueService(db: Db) {
           .update(issues)
           .set({ updatedAt: new Date() })
           .where(eq(issues.id, comment.issueId));
+          noteIssueListMutation(comment.companyId); // NFM-5850 list-gating patch
 
         return redactIssueComment(comment, currentUserRedactionOptions.enabled);
       });
@@ -12297,6 +12300,7 @@ export function issueService(db: Db) {
           .update(issues)
           .set({ updatedAt: now })
           .where(eq(issues.id, comment.issueId));
+          noteIssueListMutation(comment.companyId); // NFM-5850 list-gating patch
 
         const redacted = redactIssueComment(
           comment,
@@ -12839,6 +12843,7 @@ export function issueService(db: Db) {
         .update(issues)
         .set({ updatedAt: new Date() })
         .where(eq(issues.id, issueId));
+      noteIssueListMutation(issue.companyId); // NFM-5850 list-gating patch
 
       // Only an explicitly authored comment from the run causally woken by an
       // inbound chat message is automatically publishable. Presentation,

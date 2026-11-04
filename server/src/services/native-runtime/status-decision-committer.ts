@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { noteIssueListMutation } from "../../lib/issue-list-freshness.js";
 import type { Db } from "@paperclipai/db";
 import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
 import {
@@ -765,6 +766,7 @@ async function materializeDecisionEffect(input: {
         ),
       )
       .returning({ id: issues.id });
+    noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
     if (!bound) throw new Error("native_blocker_binding_not_persisted");
     let wakeId: string | null = null;
     if (effect.owner !== "board") {
@@ -1493,6 +1495,7 @@ async function materializeDecisionEffect(input: {
         ),
       )
       .returning({ id: issues.id });
+    noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
     if (!released) throw new Error("native_checkout_not_released");
     return {
       effectKind: effect.kind,

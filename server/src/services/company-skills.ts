@@ -1,4 +1,5 @@
 import { logger } from "../middleware/logger.js";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { removeRuntimeSkillCache, resolveRuntimeSkillCache, runtimeSkillCacheSpec } from "./runtime-skill-cache.js";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -7258,6 +7259,7 @@ export function companySkillService(db: Db) {
           .update(issues)
           .set({ hiddenAt: now, updatedAt: now })
           .where(and(eq(issues.companyId, companyId), eq(issues.id, row.issueId), eq(issues.harnessKind, "skill_test")));
+        noteIssueListMutation(companyId); // NFM-5850 list-gating patch
         await tx
           .update(companySkillTestRuns)
           .set({ harnessIssueDeletedAt: now, updatedAt: now })

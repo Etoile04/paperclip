@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
@@ -1081,10 +1082,16 @@ export function agentService(db: Db) {
         await issueThreadInteractionService(tx as unknown as Db)
           .cancelPendingForDeletedAddressee(existing.companyId, id);
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
-        await tx
+        // NFM-5850: agent deletion clears assignee/creator across companies —
+        // advance the watermark for every company that had a touched row.
+        const touchedIssues = await tx
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
-          .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+          .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)))
+          .returning({ companyId: issues.companyId });
+        for (const touchedCompanyId of new Set(touchedIssues.map((r) => r.companyId))) {
+          noteIssueListMutation(touchedCompanyId);
+        }
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
         await tx.delete(activityLog).where(

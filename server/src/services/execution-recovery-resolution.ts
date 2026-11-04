@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import { claimedAdapterType, conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
@@ -492,6 +493,7 @@ export async function settleUnrecoverableExecutions(
               updatedAt: now,
             })
             .where(eq(issues.id, task.id)).returning();
+          if (projected) noteIssueListMutation(projected.companyId); // NFM-5850 list-gating patch
           // Only a transition owned by this failure grants a recovery receipt.
           // An already-blocked task may have a separate human/dependency hold.
           if (task.status !== "blocked" && run.runtimeMode === "native") {

@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../../lib/issue-list-freshness.js";
 import { resolveAcpxQualification } from "./acpx-qualification.js";
 import { readLocalAiCredentialFile } from "../local-ai-credential-file.js";
 import { prepareGrokRunnerCredentials } from "./grok-runner-credentials.js";
@@ -8983,6 +8984,7 @@ async function executePaperclipNativeSessionWithinScope(
             .update(issues)
             .set({ executionRunId: null, checkoutRunId: null, updatedAt: now })
             .where(eq(issues.id, input.execution.binding.issueId));
+            noteIssueListMutation(input.execution.binding.companyId); // NFM-5850 list-gating patch
         }
         if (!stillOwnsTask) return;
         await issueRecoveryActionService(

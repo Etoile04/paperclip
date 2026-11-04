@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, gte, inArray, ne, notInArray, sql } from "drizzle-orm";
+import { noteIssueListMutation } from "../../../lib/issue-list-freshness.js";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -355,6 +356,7 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
           eq(issues.companyId, companyId),
           eq(issues.executionRunId, input.run.id),
         ));
+      noteIssueListMutation(companyId); // NFM-5850 list-gating patch
 
       if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
         const updatedEvaluation = await issuesSvc.update(

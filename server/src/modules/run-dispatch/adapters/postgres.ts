@@ -1,4 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
+import { noteIssueListMutation } from "../../../lib/issue-list-freshness.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -721,6 +722,7 @@ export function createPostgresRunDispatchAdapter(
             eq(issues.executionRunId, row.id),
           ),
         );
+      noteIssueListMutation(row.companyId); // NFM-5850 list-gating patch
     }
 
     await appendHeartbeatRunEvent(tx as unknown as Db, {
@@ -927,6 +929,7 @@ export function createPostgresRunDispatchAdapter(
             eq(issues.executionRunId, row.id),
           ),
         );
+      noteIssueListMutation(row.companyId); // NFM-5850 list-gating patch
 
       await appendHeartbeatRunEvent(tx as unknown as Db, {
         companyId: row.companyId,

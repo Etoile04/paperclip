@@ -1,4 +1,5 @@
 import { and, eq } from "drizzle-orm";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { setIssueTitleSchema, type SetIssueTitle } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
@@ -72,6 +73,7 @@ export async function setIssueTitle(
   }
   await tx.update(issues).set({ title, titleNeedsGeneration: false, updatedAt: new Date() }).where(predicate);
   await issueReferenceService(tx).syncIssue(issueId, tx);
+  noteIssueListMutation(companyId); // NFM-5850 list-gating patch
   const { publication } = await persistActivity(tx, {
     ...actor, companyId, action: "issue.updated", entityType: "issue", entityId: issueId,
     details: { title, previous: { title: issue.title }, titleNeedsGeneration: false },

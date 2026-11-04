@@ -1,4 +1,5 @@
 import { and, eq, inArray } from "drizzle-orm";
+import { noteIssueListMutation } from "../../../lib/issue-list-freshness.js";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import type { IssueComment, IssueQueuedCommentQueue } from "@paperclipai/shared";
@@ -68,6 +69,7 @@ function buildTransaction(tx: Db, companyId: string, deps: QueuedCommentQueuePos
         .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, companyId)))
         .returning()
         .then((rows) => rows[0]);
+      noteIssueListMutation(companyId); // NFM-5850 list-gating patch
       return toWakeRow(row);
     },
 
@@ -112,6 +114,7 @@ function buildTransaction(tx: Db, companyId: string, deps: QueuedCommentQueuePos
         .update(issues)
         .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt })
         .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId), eq(issues.executionRunId, executionRunId)));
+      noteIssueListMutation(companyId); // NFM-5850 list-gating patch
     },
 
     async buildQueueSnapshot({ issue, actor, wake, state, queueRun, activeRun }): Promise<IssueQueuedCommentQueue> {

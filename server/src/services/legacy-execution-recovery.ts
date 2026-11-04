@@ -1,4 +1,5 @@
 import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
@@ -113,11 +114,13 @@ export async function terminalizeLegacyExecution(input: {
           executionLockedAt: null,
         })
         .where(eq(issues.id, task.id));
+      noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
     if (task?.checkoutRunId === run.id)
       await tx
         .update(issues)
         .set({ checkoutRunId: null })
         .where(eq(issues.id, task.id));
+      noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
     const review = task?.status === "in_review" ? parseIssueExecutionState(task.executionState) : null;
     const isCurrentReviewer = review?.status === "pending" &&
       review.currentParticipant?.type === "agent" && review.currentParticipant.agentId === run.agentId;

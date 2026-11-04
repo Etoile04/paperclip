@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -1235,6 +1236,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               eq(issues.executionWorkspaceId, existing.id),
             ),
           );
+        noteIssueListMutation(existing.companyId); // NFM-5850 list-gating patch
       }
 
       try {

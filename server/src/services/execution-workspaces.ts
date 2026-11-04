@@ -1,4 +1,5 @@
 import { createWorkspaceGitInspectionCache } from "./workspace-git-inspection-cache.js";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -1766,6 +1767,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             eq(issues.companyId, workspace.companyId),
             eq(issues.executionWorkspaceId, workspace.id),
           ));
+        noteIssueListMutation(workspace.companyId); // NFM-5850 list-gating patch
       }
       const cleanupReason = [ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON, ...cleanup.warnings].join(" | ");
       if (!cleanup.cleaned || cleanup.warnings.length > 0) {

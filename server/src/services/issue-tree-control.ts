@@ -1,4 +1,5 @@
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -1014,6 +1015,7 @@ export function issueTreeControlService(db: Db) {
             status: issues.status,
             assigneeAgentId: issues.assigneeAgentId,
           });
+        noteIssueListMutation(companyId); // NFM-5850 list-gating patch
         restored.push(...rows.map((issue) => ({
           id: issue.id,
           status: coerceIssueStatus(issue.status),
