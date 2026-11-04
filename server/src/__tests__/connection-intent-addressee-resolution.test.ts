@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -398,7 +401,7 @@ describeEmbeddedPostgres("connection intent addressee resolution", () => {
   });
 
   describe("legacy local-board migration", () => {
-    async function insertLegacyPendingRow(companyId: string, issueId: string) {
+    async function insertLegacyPendingRow(companyId: string, issueId: string, payloadOverride?: unknown) {
       const [row] = await db.insert(issueThreadInteractions).values({
         companyId,
         issueId,
@@ -416,14 +419,19 @@ describeEmbeddedPostgres("connection intent addressee resolution", () => {
         summary: "Researcher needs this connection to continue.",
         createdByAgentId: sentinelTask.agentId,
         addresseeUserId: SENTINEL,
-        payload: {
+        // Tests seeding corrupt data pass payloads that violate the column's
+        // declared type on purpose: drifted deployed schemas contain exactly
+        // such rows, and the migration must classify them defensively. The
+        // override check must distinguish `undefined` from `null` — `null` is
+        // itself one of the corrupt shapes under test.
+        payload: (payloadOverride === undefined ? {
           version: 1,
           serviceSlug: "notion",
           serviceName: "Notion",
           requestingAgentId: sentinelTask.agentId,
           requestingAgentName: "Researcher",
           phase: "requested",
-        },
+        } : payloadOverride) as typeof issueThreadInteractions.$inferInsert["payload"],
       }).returning();
       return row!;
     }
@@ -491,6 +499,85 @@ describeEmbeddedPostgres("connection intent addressee resolution", () => {
       const [after] = await db.select().from(issueThreadInteractions)
         .where(eq(issueThreadInteractions.id, resolved!.id));
       expect(after).toMatchObject({ addresseeUserId: SENTINEL, status: "accepted" });
+    });
+
+    it("skips corrupt and NULL payload rows without counting or backing them up", async () => {
+      // Drifted deployed schemas predate the payload NOT NULL constraint, so
+      // real NULL payloads are the surface this guard exists for; relax it in
+      // this throwaway database before seeding one.
+      await db.execute(sql`ALTER TABLE issue_thread_interactions ALTER COLUMN payload DROP NOT NULL`);
+      const good = await insertLegacyPendingRow(companyWithHumans, sentinelTask.issueId);
+      const nullRow = await insertLegacyPendingRow(companyWithHumans, sentinelTask.issueId, null);
+      const arrayRow = await insertLegacyPendingRow(companyWithHumans, sentinelTask.issueId, [{ version: 1 }]);
+      const stringRow = await insertLegacyPendingRow(companyWithHumans, sentinelTask.issueId, "not-a-payload");
+      const backupPath = path.join(mkdtempSync(path.join(os.tmpdir(), "nfm-5853-backup-")), "backup.jsonl");
+      const corruptIds = [nullRow.id, arrayRow.id, stringRow.id];
+
+      const result = await migrateLocalBoardConnectionIntentAddressees(db, { backupPath });
+
+      expect(result.skippedCorruptPayload).toBe(3);
+      expect(result.migrated).toBe(1);
+      expect(result.changes).toEqual([
+        expect.objectContaining({ interactionId: good.id, from: SENTINEL, to: earlyHuman }),
+      ]);
+      for (const id of corruptIds) {
+        expect(result.changes).not.toContainEqual(expect.objectContaining({ interactionId: id }));
+      }
+      // The backup records only genuinely migrated rows: exactly one line,
+      // the good row, none of the corrupt ones.
+      expect(existsSync(backupPath)).toBe(true);
+      const backupText = readFileSync(backupPath, "utf8");
+      expect(backupText.split("\n").filter((line) => line.trim() !== "")).toHaveLength(1);
+      expect(backupText).toContain(good.id);
+      for (const id of corruptIds) {
+        expect(backupText).not.toContain(id);
+      }
+      const [afterGood] = await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, good.id));
+      expect(afterGood).toMatchObject({ addresseeUserId: earlyHuman, status: "pending" });
+      expect(afterGood?.payload).toMatchObject({ routedFromUserId: SENTINEL });
+      const [afterNull] = await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, nullRow.id));
+      expect(afterNull).toMatchObject({ addresseeUserId: SENTINEL, status: "pending", payload: null });
+
+      // Idempotent: the corrupt rows are skipped again, nothing new migrates.
+      const second = await migrateLocalBoardConnectionIntentAddressees(db, { backupPath: null });
+      expect(second.changes).toEqual([]);
+      expect(second.migrated).toBe(0);
+      expect(second.skippedCorruptPayload).toBe(3);
+    });
+
+    it("dry-run reports only migratable rows and writes nothing", async () => {
+      const nullRow = await insertLegacyPendingRow(companyWithHumans, sentinelTask.issueId, null);
+      const good = await insertLegacyPendingRow(companyWithHumans, sentinelTask.issueId);
+      const backupPath = path.join(mkdtempSync(path.join(os.tmpdir(), "nfm-5853-dryrun-")), "backup.jsonl");
+
+      const result = await migrateLocalBoardConnectionIntentAddressees(db, { dryRun: true, backupPath });
+
+      expect(result.changes).toEqual([
+        expect.objectContaining({ interactionId: good.id, from: SENTINEL, to: earlyHuman }),
+      ]);
+      expect(result.migrated).toBe(0);
+      // The three corrupt rows seeded by the test above are still pending.
+      expect(result.skippedCorruptPayload).toBeGreaterThanOrEqual(1);
+      // Dry-run never writes: no backup file, no database change.
+      expect(existsSync(backupPath)).toBe(false);
+      const [afterGood] = await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, good.id));
+      expect(afterGood).toMatchObject({ addresseeUserId: SENTINEL, status: "pending" });
+      expect(afterGood?.payload).not.toMatchObject({ routedFromUserId: SENTINEL });
+      const [afterNull] = await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, nullRow.id));
+      expect(afterNull).toMatchObject({ addresseeUserId: SENTINEL, payload: null });
+
+      // Clean scope (nothing migratable): 0 changes, exactly as before.
+      const cleanRun = await migrateLocalBoardConnectionIntentAddressees(db, {
+        companyId: companyWithoutHumans,
+        dryRun: true,
+        backupPath: null,
+      });
+      expect(cleanRun.changes).toEqual([]);
+      expect(cleanRun.migrated).toBe(0);
     });
   });
 });
