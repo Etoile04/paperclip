@@ -32,6 +32,12 @@ export interface ConnectionIntentAddresseeMigrationResult {
   migrated: number;
   /** Pending cards left alone because the company has no human member. */
   skippedNoHuman: number;
+  /**
+   * Pending cards left alone because their payload is missing or not a JSON
+   * object. They are neither migrated, counted as changes, nor backed up
+   * (NFM-5853); the counter keeps the report honest about what was scanned.
+   */
+  skippedCorruptPayload: number;
   changes: ConnectionIntentAddresseeMigrationChange[];
 }
 
@@ -74,12 +80,24 @@ export async function migrateLocalBoardConnectionIntentAddressees(
     scanned: rows.length,
     migrated: 0,
     skippedNoHuman: 0,
+    skippedCorruptPayload: 0,
     changes: [],
   };
 
   for (const row of rows) {
     const from = row.addresseeUserId;
     if (!from) continue;
+    // Narrow before accounting or backup (NFM-5853): a card whose payload is
+    // missing or not an object cannot be migrated safely, so it must not be
+    // reported as a change or written to the backup JSONL. The WHERE clause
+    // pins kind to connection_intent; the payload shape itself cannot be
+    // pinned by SQL, so it is discriminated here instead of after the write
+    // prep, keeping the report, the backup, and the writes in lockstep.
+    const payload = row.payload;
+    if (row.kind !== "connection_intent" || !payload || typeof payload !== "object" || Array.isArray(payload)) {
+      result.skippedCorruptPayload += 1;
+      continue;
+    }
     const to = await resolveConnectionIntentAddressee(db, row.companyId, from);
     if (to === from) {
       result.skippedNoHuman += 1;
@@ -100,22 +118,17 @@ export async function migrateLocalBoardConnectionIntentAddressees(
         companyId: row.companyId,
         issueId: row.issueId,
         previousAddresseeUserId: from,
-        payload: row.payload,
+        payload,
       });
     }
 
-    // The WHERE clause pins kind to connection_intent; narrow the payload
-    // union through the discriminator instead of casting, so the provenance
-    // write stays type-checked against ConnectionIntentPayload. A corrupt or
-    // missing payload is left alone rather than replaced with a stub.
-    if (row.kind !== "connection_intent" || !row.payload || typeof row.payload !== "object" || Array.isArray(row.payload)) continue;
     await db
       .update(issueThreadInteractions)
       .set({
         addresseeUserId: to,
         payload: {
-          ...row.payload,
-          ...("routedFromUserId" in row.payload ? {} : { routedFromUserId: from }),
+          ...payload,
+          ...("routedFromUserId" in payload ? {} : { routedFromUserId: from }),
         },
         updatedAt: new Date(),
       })
