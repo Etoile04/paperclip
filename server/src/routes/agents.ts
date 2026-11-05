@@ -2920,15 +2920,29 @@ export function agentRoutes(
     throw forbidden("Agent keys cannot configure host-executed process adapters.");
   }
 
-  const LOCAL_ADAPTER_HOST_COMMAND_KEYS = [
-    "command",
-    "hermesCommand",
-    "args",
-    "extraArgs",
-    "cwd",
-    "env",
-    "filesystemSandboxCommand",
-  ] as const;
+  // The adapterConfig keys an agent-scoped caller may write on a `*_local`
+  // adapter. This is an allow list on purpose: the server cannot enumerate
+  // every key a plugin adapter may grow, and an unknown key must never be
+  // writable by an agent, because a plugin key can name a host binary or a
+  // host path. The built-in local adapters alone already expose `agentCommand`
+  // (the ACP server command) and `stateDir` (an ACP state directory), and
+  // plugins add their own such as `zcodeCommand` / `envVars`.
+  //
+  // Every entry needs a reason why it is harmless for an agent to write it:
+  //   - `model`: an LLM model identifier. It selects which model the harness
+  //     talks to, never a host binary, a host path, or a permission level.
+  //   - `engine`: the execution engine enum (`auto` | `cli` | `acp`). Each
+  //     adapter normalizes it server-side to one of those three values, so it
+  //     cannot smuggle a command or a path. The override that *would* smuggle
+  //     one (`agentCommand`) is deliberately absent from this list.
+  //   - `env`: only through the credential-reference path in
+  //     `containsOnlyLocalAdapterCredentialRefs` — every entry must be a
+  //     `secret_ref` or an inheritable credential environment variable. A
+  //     secret reference names a server-side secret, not a host path.
+  //
+  // A new plugin adapter key stays unwritable by an agent until it is added
+  // here deliberately, with its own reason.
+  const AGENT_WRITABLE_LOCAL_ADAPTER_CONFIG_KEYS = ["model", "engine", "env"] as const;
 
   const LOCAL_ADAPTER_CREDENTIAL_ENV_KEYS: Record<string, readonly string[]> = {
     ...INHERITABLE_AGENT_CREDENTIAL_ENV_KEYS,
@@ -2968,13 +2982,25 @@ export function agentRoutes(
     allowPlainCredentials = false,
   ) {
     if (req.actor.type !== "agent" || !adapterType.endsWith("_local")) return;
-    const changedKeys = LOCAL_ADAPTER_HOST_COMMAND_KEYS.filter((key) =>
-      adapterConfig[key] !== undefined &&
-      (key !== "env" || !containsOnlyLocalAdapterCredentialRefs(adapterType, adapterConfig.env, allowPlainCredentials)),
-    );
-    if (changedKeys.length === 0) return;
+    const writableKeys: readonly string[] = AGENT_WRITABLE_LOCAL_ADAPTER_CONFIG_KEYS;
+    // Presence semantics: a key counts as written when it is an own property
+    // of the payload, even when its value is null or equal to the value the
+    // agent already has. Comparing values would let an agent re-assert a host
+    // setting it was never allowed to touch in the first place.
+    const rejectedKeys = Object.keys(adapterConfig).filter((key) => {
+      // The allow list is the single source of truth: a key that is not on it
+      // is refused outright, with no way for another rule to rescue it.
+      if (!writableKeys.includes(key)) return true;
+      // `env` is on the allow list, but only through the credential-reference
+      // path: an env record that carries anything else is refused as a whole.
+      if (key === "env") {
+        return !containsOnlyLocalAdapterCredentialRefs(adapterType, adapterConfig.env, allowPlainCredentials);
+      }
+      return false;
+    });
+    if (rejectedKeys.length === 0) return;
     throw forbidden(
-      `Agent keys cannot configure host-executed local adapter settings (${changedKeys.join(", ")}).`,
+      `Agent keys cannot configure host-executed local adapter settings (${[...rejectedKeys].sort().join(", ")}).`,
     );
   }
 
