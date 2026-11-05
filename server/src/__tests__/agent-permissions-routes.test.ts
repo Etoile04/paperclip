@@ -1088,6 +1088,189 @@ describe("agent permission routes", () => {
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
+  describe("agent-scoped local adapter config allow list", () => {
+    // The allow list is a server-owned, fail-closed set: an agent may write
+    // only the keys on that list, and every other key is refused. The keys
+    // below are the ones a `*_local` adapter can use to reach a host binary
+    // or a host path; each one must be refused even though the server does
+    // not model it.
+    const agentPatchApp = () => createApp({
+      type: "agent",
+      agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    it.each([
+      ["zcodeCommand", "/tmp/untrusted"],
+      ["envVars", { PATH: "/tmp" }],
+      ["mode", "bypass"],
+      ["disallowedTools", ["Bash"]],
+    ])("blocks agent-authenticated %s on a local adapter", async (key, value) => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+      const app = await agentPatchApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { [key]: value } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain(key);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["agentCommand", "/tmp/untrusted-acp-server"],
+      ["stateDir", "/tmp/untrusted-state"],
+      ["dangerouslyBypassApprovalsAndSandbox", true],
+      ["someFuturePluginKey", "value"],
+    ])("blocks agent-authenticated %s on a local adapter (fail closed)", async (key, value) => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+      const app = await agentPatchApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { [key]: value } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain(key);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["model", "claude-sonnet-4-5"],
+      ["engine", "cli"],
+    ])("allows agent-authenticated %s on a local adapter", async (key, value) => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+      const app = await agentPatchApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { [key]: value } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.update).toHaveBeenCalledOnce();
+    });
+
+    it("allows agent-authenticated env credential references on a local adapter", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+      const app = await agentPatchApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { env: { ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "33333333-3333-4333-8333-333333333333" } } } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.update).toHaveBeenCalledOnce();
+    });
+
+    it("blocks agent-authenticated env that carries a non-credential variable on a local adapter", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+      const app = await agentPatchApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { env: { PATH: "/tmp" } } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain("env");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("blocks an agent-authenticated local adapter write that repeats the current value", async () => {
+      mockAgentService.getById.mockResolvedValue({
+        ...baseAgent,
+        adapterType: "claude_local",
+        adapterConfig: { command: "/usr/local/bin/claude" },
+      });
+      const app = await agentPatchApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { command: "/usr/local/bin/claude" } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("blocks an agent-authenticated local adapter write that nulls a host key", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+      const app = await agentPatchApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { cwd: null } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain("cwd");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["create", `/api/companies/${companyId}/agents`],
+      ["hire", `/api/companies/${companyId}/agent-hires`],
+    ])("blocks agent-authenticated zcodeCommand on a local adapter through %s", async (_label, path) => {
+      const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(path)
+        .send({ name: "Local peer", role: "engineer", adapterType: "claude_local", adapterConfig: { zcodeCommand: "/tmp/untrusted" } }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain("zcodeCommand");
+      expect(mockAgentService.create).not.toHaveBeenCalled();
+    });
+
+    it("blocks agent-authenticated rollback into a local adapter zcodeCommand", async () => {
+      const revisionId = "33333333-3333-4333-8333-333333333333";
+      mockAgentService.getConfigRevision.mockResolvedValue({
+        id: revisionId,
+        afterConfig: { adapterType: "claude_local", adapterConfig: { zcodeCommand: "/tmp/untrusted" }, runtimeConfig: {} },
+      });
+      const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain("zcodeCommand");
+      expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+    });
+
+    it("blocks agent-authenticated local adapter settings carried over by an adapter type switch", async () => {
+      mockAgentService.getById.mockResolvedValue({
+        ...baseAgent,
+        adapterType: "paperclip_runner",
+        adapterConfig: { cwd: "/tmp/untrusted" },
+      });
+      const app = await agentPatchApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterType: "claude_local" }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("host-executed local adapter settings");
+      expect(res.body.error).toContain("cwd");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows a board-authenticated zcodeCommand on a local adapter", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
+      const app = await createApp({
+        type: "board",
+        userId: "instance-admin-user",
+        source: "session",
+        isInstanceAdmin: true,
+        companyIds: [companyId],
+      });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { zcodeCommand: "/usr/local/bin/zcode" } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.update).toHaveBeenCalledOnce();
+    });
+  });
+
   it.each(["provisionCommand", "runtimeProvisionCommand", "teardownCommand"])(
     "blocks agent-authenticated rollback of workspace %s",
     async (commandKey) => {
