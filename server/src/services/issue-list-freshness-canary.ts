@@ -40,6 +40,7 @@
  * (every list query is scoped by `company_id`) — the canary writes no
  * user-visible data.
  */
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 
 import { eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
@@ -220,6 +221,7 @@ export function createIssueListFreshnessCanaryCore(
           assigneeAgentId,
         })
         .where(eq(issues.id, ISSUE_LIST_FRESHNESS_CANARY_ISSUE_ID));
+      noteIssueListMutation(ISSUE_LIST_FRESHNESS_CANARY_COMPANY_ID); // NFM-5850 list-gating patch
     });
 
   let sentinelEnsured = false;

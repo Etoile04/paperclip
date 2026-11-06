@@ -1,4 +1,5 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 
@@ -90,6 +91,7 @@ export async function settleSlackConversation(db: Db, companyId: string, issueId
     if (!changed.length) return false;
     await tx.update(issues).set({ status: "in_review", updatedAt: new Date() })
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+    noteIssueListMutation(companyId); // NFM-5850 list-gating patch
     activity = (await persistActivity(tx as unknown as Db, {
       companyId, actorType: "system", actorId: "slack-conversation", action: "issue.updated",
       entityType: "issue", entityId: issueId, runId: run.id,

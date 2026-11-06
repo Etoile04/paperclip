@@ -1,4 +1,5 @@
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
+import { noteIssueListMutation } from "../../lib/issue-list-freshness.js";
 import { recordNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
@@ -852,6 +853,7 @@ export async function claimNativeRestartRecoveries(input: {
               eq(issues.executionRunId, row.run.id),
             ),
           );
+        noteIssueListMutation(row.run.companyId); // NFM-5850 list-gating patch
         await tx
           .update(issues)
           .set({ checkoutRunId: null, updatedAt: now })
@@ -862,6 +864,7 @@ export async function claimNativeRestartRecoveries(input: {
               eq(issues.checkoutRunId, row.run.id),
             ),
           );
+        noteIssueListMutation(row.run.companyId); // NFM-5850 list-gating patch
         if (
           row.issueAssigneeAgentId === row.run.agentId &&
           !["done", "cancelled"].includes(row.issueStatus)

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -1604,6 +1605,7 @@ async function writeDirtyQuarantineAuditComments(input: {
       .update(issues)
       .set({ updatedAt: now })
       .where(eq(issues.id, input.evidence.sourceIssueId));
+    noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
   }
 
   const claimantIssueId = input.evidence.contention?.claimedByIssueId ?? null;
@@ -1625,6 +1627,7 @@ async function writeDirtyQuarantineAuditComments(input: {
       .update(issues)
       .set({ updatedAt: now })
       .where(eq(issues.id, claimantIssueId));
+    noteIssueListMutation(input.companyId); // NFM-5850 list-gating patch
   }
 
   return { sourceAuditCommentId, claimantAuditCommentId };

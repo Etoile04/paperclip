@@ -1,4 +1,5 @@
 import { chatConversations, issues, type Db } from "@paperclipai/db";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { and, eq, sql } from "drizzle-orm";
 
 /** Read-only projection; Slack threads do not acquire Agent Chat identities. */
@@ -48,6 +49,7 @@ export async function resumeSlackConversation(tx: Db, companyId: string, issueId
   await tx.update(issues).set({ status: "todo", updatedAt: new Date() })
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId),
       sql`${externalConversationStateSql()} = 'waiting'`));
+  noteIssueListMutation(companyId); // NFM-5850 list-gating patch
   await tx.update(chatConversations).set({ state: "active", updatedAt: new Date() })
     .where(and(eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId),
       eq(chatConversations.state, "waiting"), sql`exists (select 1 from chat_endpoints e

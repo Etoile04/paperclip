@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -403,6 +404,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .update(issues)
       .set({ updatedAt: generatedAt })
       .where(eq(issues.id, reviewIssueId));
+    noteIssueListMutation(comment.companyId); // NFM-5850 list-gating patch
     return comment;
   }
 
@@ -773,6 +775,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .update(issues)
       .set({ createdAt: evidence.generatedAt, updatedAt: evidence.generatedAt })
       .where(eq(issues.id, review.id));
+    noteIssueListMutation(evidence.sourceIssue.companyId); // NFM-5850 list-gating patch
 
     await logActivity(db, {
       companyId: evidence.sourceIssue.companyId,

@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import {
   currentContinuationOrigins,
   deliveredContinuationCommentIds,
@@ -830,10 +831,14 @@ export function hydrateInteraction(
 }
 
 async function touchIssue(db: IssueTouchDb, issueId: string) {
-  await db
+  const touched = await db
     .update(issues)
     .set({ updatedAt: new Date() })
-    .where(eq(issues.id, issueId));
+    .where(eq(issues.id, issueId))
+    .returning({ companyId: issues.companyId });
+  // NFM-5850: recency bumps reorder/filter lists — advance the watermark for
+  // the touched row's company (borrowed-transaction fallback: note on return).
+  for (const row of touched) noteIssueListMutation(row.companyId);
 }
 
 function isTerminalIssueStatus(status: string) {

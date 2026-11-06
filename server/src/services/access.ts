@@ -1,4 +1,5 @@
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import type { Db } from "@paperclipai/db";
 import {
   companyMemberships,
@@ -704,11 +705,13 @@ export function accessService(db: Db) {
         })
         .where(and(assignedOpenIssueWhere, eq(issues.status, "in_progress")))
         .returning({ id: issues.id });
+      noteIssueListMutation(companyId); // NFM-5850 list-gating patch
       const reassigned = await tx
         .update(issues)
         .set(assignmentPatch)
         .where(and(assignedOpenIssueWhere, ne(issues.status, "in_progress")))
         .returning({ id: issues.id });
+      noteIssueListMutation(companyId); // NFM-5850 list-gating patch
 
       await tx
         .delete(principalPermissionGrants)

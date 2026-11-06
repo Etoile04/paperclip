@@ -1,3 +1,4 @@
+import { noteIssueListMutation } from "../../lib/issue-list-freshness.js";
 import { logger } from "../../middleware/logger.js";
 import { createHash, randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
@@ -486,6 +487,7 @@ export async function reconcileSafeNativeReplacements(
               eq(issues.assigneeAgentId, run.agentId),
             ),
           );
+          noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
         return true;
       });
       if (created) {

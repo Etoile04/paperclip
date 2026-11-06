@@ -7504,113 +7504,123 @@ export function issueService(db: Db) {
     actorRunId: string;
     expectedCheckoutRunId: string;
   }) {
-    return db.transaction(async (tx) => {
-      const lockedIssue = await tx
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
-        .from(issues)
-        .where(eq(issues.id, input.issueId))
-        .for("update")
-        .then((rows) => rows[0] ?? null);
-      if (!lockedIssue) {
-        return { adopted: null, latest: null };
-      }
+    const issueCompany = await db
+      .select({ companyId: issues.companyId })
+      .from(issues)
+      .where(eq(issues.id, input.issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issueCompany) return { adopted: null, latest: null };
+    // NFM-5850: this tx mutates list-gating fields (compact-list payload);
+    // gate list reads for the duration and stamp the watermark on resolution.
+    return withIssueListFreshness(issueCompany.companyId, () =>
+      db.transaction(async (tx) => {
+        const lockedIssue = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, input.issueId))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!lockedIssue) {
+          return { adopted: null, latest: null };
+        }
 
-      if (
-        lockedIssue.status !== "in_progress" ||
-        lockedIssue.assigneeAgentId !== input.actorAgentId ||
-        lockedIssue.checkoutRunId !== input.expectedCheckoutRunId
-      ) {
-        return { adopted: null, latest: lockedIssue };
-      }
-
-      await Promise.all([
-        tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.expectedCheckoutRunId} for update`,
-        ),
-        tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
-        ),
-      ]);
-      const [existingRun, actorRun] = await Promise.all([
-        tx
-          .select()
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
-          .then((rows) => rows[0] ?? null),
-        tx
-          .select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, input.actorRunId))
-          .then((rows) => rows[0] ?? null),
-      ]);
-      const stale =
-        !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
-      if (isExplicitContinuationRetryClaim(lockedIssue, existingRun)) {
-        return { adopted: null, latest: lockedIssue };
-      }
-      if (lockedIssue.executionRunId && lockedIssue.executionRunId !== input.expectedCheckoutRunId) {
-        const executionRun = await tx.select().from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, lockedIssue.executionRunId)).for("update")
-          .then(rows => rows[0] ?? null);
-        if (isExplicitContinuationRetryClaim(lockedIssue, executionRun)) {
+        if (
+          lockedIssue.status !== "in_progress" ||
+          lockedIssue.assigneeAgentId !== input.actorAgentId ||
+          lockedIssue.checkoutRunId !== input.expectedCheckoutRunId
+        ) {
           return { adopted: null, latest: lockedIssue };
         }
-      }
-      const actorLive =
-        actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
-      if (!stale || !actorLive) {
-        return { adopted: null, latest: lockedIssue };
-      }
 
-      const now = new Date();
-      const adopted = await tx
-        .update(issues)
-        .set({
-          checkoutRunId: input.actorRunId,
-          executionRunId: input.actorRunId,
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, input.issueId),
-            eq(issues.status, "in_progress"),
-            eq(issues.assigneeAgentId, input.actorAgentId),
-            eq(issues.checkoutRunId, input.expectedCheckoutRunId),
+        await Promise.all([
+          tx.execute(
+            sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.expectedCheckoutRunId} for update`,
           ),
-        )
-        .returning({
-          id: issues.id,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
-        .then((rows) => rows[0] ?? null);
-      if (adopted) {
-        return { adopted, latest: adopted };
-      }
+          tx.execute(
+            sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
+          ),
+        ]);
+        const [existingRun, actorRun] = await Promise.all([
+          tx
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
+            .then((rows) => rows[0] ?? null),
+          tx
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, input.actorRunId))
+            .then((rows) => rows[0] ?? null),
+        ]);
+        const stale =
+          !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
+        if (isExplicitContinuationRetryClaim(lockedIssue, existingRun)) {
+          return { adopted: null, latest: lockedIssue };
+        }
+        if (lockedIssue.executionRunId && lockedIssue.executionRunId !== input.expectedCheckoutRunId) {
+          const executionRun = await tx.select().from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, lockedIssue.executionRunId)).for("update")
+            .then(rows => rows[0] ?? null);
+          if (isExplicitContinuationRetryClaim(lockedIssue, executionRun)) {
+            return { adopted: null, latest: lockedIssue };
+          }
+        }
+        const actorLive =
+          actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
+        if (!stale || !actorLive) {
+          return { adopted: null, latest: lockedIssue };
+        }
 
-      const latest = await tx
-        .select({
-          id: issues.id,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
-        .from(issues)
-        .where(eq(issues.id, input.issueId))
-        .then((rows) => rows[0] ?? null);
-      return { adopted: null, latest };
-    });
+        const now = new Date();
+        const adopted = await tx
+          .update(issues)
+          .set({
+            checkoutRunId: input.actorRunId,
+            executionRunId: input.actorRunId,
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, input.issueId),
+              eq(issues.status, "in_progress"),
+              eq(issues.assigneeAgentId, input.actorAgentId),
+              eq(issues.checkoutRunId, input.expectedCheckoutRunId),
+            ),
+          )
+          .returning({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .then((rows) => rows[0] ?? null);
+        if (adopted) {
+          return { adopted, latest: adopted };
+        }
+
+        const latest = await tx
+          .select({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, input.issueId))
+          .then((rows) => rows[0] ?? null);
+        return { adopted: null, latest };
+      }),
+    );
   }
 
   async function adoptUnownedCheckoutRun(input: {
@@ -7618,96 +7628,116 @@ export function issueService(db: Db) {
     actorAgentId: string;
     actorRunId: string;
   }) {
-    return db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
-      );
-      const actorRun = await tx
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, input.actorRunId))
-        .then((rows) => rows[0] ?? null);
-      if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status))
-        return null;
+    const issueCompany = await db
+      .select({ companyId: issues.companyId })
+      .from(issues)
+      .where(eq(issues.id, input.issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issueCompany) return null;
+    // NFM-5850: this tx mutates list-gating fields (compact-list payload);
+    // gate list reads for the duration and stamp the watermark on resolution.
+    return withIssueListFreshness(issueCompany.companyId, () =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
+        );
+        const actorRun = await tx
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, input.actorRunId))
+          .then((rows) => rows[0] ?? null);
+        if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status))
+          return null;
 
-      const now = new Date();
-      const adopted = await tx
-        .update(issues)
-        .set({
-          checkoutRunId: input.actorRunId,
-          executionRunId: input.actorRunId,
-          executionLockedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, input.issueId),
-            eq(issues.status, "in_progress"),
-            eq(issues.assigneeAgentId, input.actorAgentId),
-            isNull(issues.checkoutRunId),
-            or(
-              isNull(issues.executionRunId),
-              eq(issues.executionRunId, input.actorRunId),
+        const now = new Date();
+        const adopted = await tx
+          .update(issues)
+          .set({
+            checkoutRunId: input.actorRunId,
+            executionRunId: input.actorRunId,
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, input.issueId),
+              eq(issues.status, "in_progress"),
+              eq(issues.assigneeAgentId, input.actorAgentId),
+              isNull(issues.checkoutRunId),
+              or(
+                isNull(issues.executionRunId),
+                eq(issues.executionRunId, input.actorRunId),
+              ),
             ),
-          ),
-        )
-        .returning({
-          id: issues.id,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
-        .then((rows) => rows[0] ?? null);
+          )
+          .returning({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .then((rows) => rows[0] ?? null);
 
-      return adopted;
-    });
+        return adopted;
+      }),
+    );
   }
 
   async function clearExecutionRunIfTerminal(
     issueId: string,
   ): Promise<boolean> {
-    return db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
-      );
-      const issue = await tx
-        .select({ id: issues.id, companyId: issues.companyId, executionRunId: issues.executionRunId })
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      if (!issue?.executionRunId) return false;
+    const issueCompany = await db
+      .select({ companyId: issues.companyId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issueCompany) return false;
+    // NFM-5850: this tx mutates list-gating fields (compact-list payload);
+    // gate list reads for the duration and stamp the watermark on resolution.
+    return withIssueListFreshness(issueCompany.companyId, () =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
+        );
+        const issue = await tx
+          .select({ id: issues.id, companyId: issues.companyId, executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0] ?? null);
+        if (!issue?.executionRunId) return false;
 
-      await tx.execute(
-        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
-      );
-      const run = await tx
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, issue.executionRunId))
-        .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
-      if (isExplicitContinuationRetryClaim(issue, run)) return false;
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
+        );
+        const run = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, issue.executionRunId))
+          .then((rows) => rows[0] ?? null);
+        if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+        if (isExplicitContinuationRetryClaim(issue, run)) return false;
 
-      const updated = await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issueId),
-            eq(issues.executionRunId, issue.executionRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
+        const updated = await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.executionRunId, issue.executionRunId),
+            ),
+          )
+          .returning({ id: issues.id })
+          .then((rows) => rows[0] ?? null);
 
-      return Boolean(updated);
-    });
+        return Boolean(updated);
+      }),
+    );
   }
 
   // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
@@ -7715,76 +7745,86 @@ export function issueService(db: Db) {
   // heartbeat run that is terminal or no longer exists. No assignee/status
   // precondition. Explicit retry claims remain owned by queue-first settlement.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
-    return db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
-      );
-      const issue = await tx
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      if (!issue?.checkoutRunId) return false;
-
-      await tx.execute(
-        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
-      );
-      const run = await tx
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, issue.checkoutRunId))
-        .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
-      if (isExplicitContinuationRetryClaim(issue, run)) return false;
-
-      if (
-        issue.executionRunId &&
-        issue.executionRunId !== issue.checkoutRunId
-      ) {
+    const issueCompany = await db
+      .select({ companyId: issues.companyId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issueCompany) return false;
+    // NFM-5850: this tx mutates list-gating fields (compact-list payload);
+    // gate list reads for the duration and stamp the watermark on resolution.
+    return withIssueListFreshness(issueCompany.companyId, () =>
+      db.transaction(async (tx) => {
         await tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
         );
-        const executionRun = await tx
+        const issue = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0] ?? null);
+        if (!issue?.checkoutRunId) return false;
+
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
+        );
+        const run = await tx
           .select()
           .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, issue.executionRunId))
+          .where(eq(heartbeatRuns.id, issue.checkoutRunId))
           .then((rows) => rows[0] ?? null);
+        if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+        if (isExplicitContinuationRetryClaim(issue, run)) return false;
+
         if (
-          executionRun &&
-          !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)
-        )
-          return false;
-        if (isExplicitContinuationRetryClaim(issue, executionRun)) return false;
-      }
+          issue.executionRunId &&
+          issue.executionRunId !== issue.checkoutRunId
+        ) {
+          await tx.execute(
+            sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
+          );
+          const executionRun = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, issue.executionRunId))
+            .then((rows) => rows[0] ?? null);
+          if (
+            executionRun &&
+            !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)
+          )
+            return false;
+          if (isExplicitContinuationRetryClaim(issue, executionRun)) return false;
+        }
 
-      const updated = await tx
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issues.id, issueId),
-            eq(issues.checkoutRunId, issue.checkoutRunId),
-            issue.executionRunId
-              ? eq(issues.executionRunId, issue.executionRunId)
-              : isNull(issues.executionRunId),
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
+        const updated = await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.checkoutRunId, issue.checkoutRunId),
+              issue.executionRunId
+                ? eq(issues.executionRunId, issue.executionRunId)
+                : isNull(issues.executionRunId),
+            ),
+          )
+          .returning({ id: issues.id })
+          .then((rows) => rows[0] ?? null);
 
-      return Boolean(updated);
-    });
+        return Boolean(updated);
+      }),
+    );
   }
 
   async function addStopRelayCommentIfNeeded(
@@ -7859,6 +7899,8 @@ export function issueService(db: Db) {
       .update(issues)
       .set({ updatedAt: new Date() })
       .where(eq(issues.id, parent.id));
+
+    noteIssueListMutation(parent.companyId); // NFM-5850 list-gating patch
 
     return { comment, parent };
   }
@@ -11392,6 +11434,7 @@ export function issueService(db: Db) {
           })
           .where(eq(issues.id, row.id));
         cleared += 1;
+        noteIssueListMutation(companyId); // NFM-5850 list-gating patch
       }
 
       return cleared;
@@ -11561,6 +11604,10 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       if (updated) {
+        // NFM-5850 (AC1-ii): checkout flips status + assignee (direct
+        // .update(issues) site). Single auto-commit statement — noting
+        // immediately after the write is equivalent to wrapping it.
+        noteIssueListMutation(issueCompany.companyId);
         const [enriched] = await withIssueLabels(db, [updated]);
         return enriched;
       }
@@ -11608,7 +11655,10 @@ export function issueService(db: Db) {
           )
           .returning()
           .then((rows) => rows[0] ?? null);
-        if (adopted) return adopted;
+        if (adopted) {
+          noteIssueListMutation(issueCompany.companyId);
+          return adopted;
+        }
       }
 
       if (
@@ -11679,6 +11729,7 @@ export function issueService(db: Db) {
             .returning()
             .then((rows) => rows[0] ?? null);
           if (adopted) {
+            noteIssueListMutation(issueCompany.companyId);
             const [enriched] = await withIssueLabels(db, [adopted]);
             return enriched;
           }
@@ -11867,117 +11918,142 @@ export function issueService(db: Db) {
       id: string,
       actorAgentId?: string,
       actorRunId?: string | null,
-    ) =>
-      db.transaction(async (tx) => {
-        await tx.execute(
-          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
-        );
-        const existing = await tx
-          .select()
-          .from(issues)
-          .where(eq(issues.id, id))
-          .then((rows) => rows[0] ?? null);
-
-        if (!existing) return null;
-        if (
-          actorAgentId &&
-          existing.assigneeAgentId &&
-          existing.assigneeAgentId !== actorAgentId
-        ) {
-          throw conflict("Only assignee can release issue");
-        }
-        if (
-          actorAgentId &&
-          existing.status === "in_progress" &&
-          existing.assigneeAgentId === actorAgentId &&
-          existing.checkoutRunId &&
-          !sameRunLock(existing.checkoutRunId, actorRunId ?? null)
-        ) {
-          const stale = await isTerminalOrMissingHeartbeatRun(
-            existing.checkoutRunId,
-            tx,
+    ) => {
+      const issueCompany = await db
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!issueCompany) return null;
+      // NFM-5850 (AC1-i): release flips status and clears the assignee —
+      // list-gating fields. Gate reads for the whole transaction and stamp
+      // the watermark on resolution so filtered compact lists never serve
+      // a pre-flip snapshot.
+      return withIssueListFreshness(issueCompany.companyId, () =>
+        db.transaction(async (tx) => {
+          await tx.execute(
+            sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
           );
-          if (!stale) {
-            throw conflict("Only checkout run can release issue", {
-              issueId: existing.id,
-              assigneeAgentId: existing.assigneeAgentId,
-              checkoutRunId: existing.checkoutRunId,
-              actorRunId: actorRunId ?? null,
-            });
-          }
-        }
+          const existing = await tx
+            .select()
+            .from(issues)
+            .where(eq(issues.id, id))
+            .then((rows) => rows[0] ?? null);
 
-        // Terminal assignment records who owned the work, not a live execution
-        // claim. Cleanup must preserve it; unfinished release still relinquishes it.
-        const isTerminal = existing.status === "done" || existing.status === "cancelled";
-        const releaseStatus =
-          existing.status === "in_progress" ? "todo" : existing.status;
-        const updated = await tx
-          .update(issues)
-          .set({
-            status: releaseStatus,
-            assigneeAgentId: isTerminal ? existing.assigneeAgentId : null,
+          if (!existing) return null;
+          if (
+            actorAgentId &&
+            existing.assigneeAgentId &&
+            existing.assigneeAgentId !== actorAgentId
+          ) {
+            throw conflict("Only assignee can release issue");
+          }
+          if (
+            actorAgentId &&
+            existing.status === "in_progress" &&
+            existing.assigneeAgentId === actorAgentId &&
+            existing.checkoutRunId &&
+            !sameRunLock(existing.checkoutRunId, actorRunId ?? null)
+          ) {
+            const stale = await isTerminalOrMissingHeartbeatRun(
+              existing.checkoutRunId,
+              tx,
+            );
+            if (!stale) {
+              throw conflict("Only checkout run can release issue", {
+                issueId: existing.id,
+                assigneeAgentId: existing.assigneeAgentId,
+                checkoutRunId: existing.checkoutRunId,
+                actorRunId: actorRunId ?? null,
+              });
+            }
+          }
+
+          // Terminal assignment records who owned the work, not a live execution
+          // claim. Cleanup must preserve it; unfinished release still relinquishes it.
+          const isTerminal = existing.status === "done" || existing.status === "cancelled";
+          const releaseStatus =
+            existing.status === "in_progress" ? "todo" : existing.status;
+          const updated = await tx
+            .update(issues)
+            .set({
+              status: releaseStatus,
+              assigneeAgentId: isTerminal ? existing.assigneeAgentId : null,
+              checkoutRunId: null,
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(issues.id, id))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (!updated) return null;
+          const [enriched] = await withIssueLabels(tx, [updated]);
+          return enriched;
+        }),
+      );
+    },
+
+    adminForceRelease: async (
+      id: string,
+      options: { clearAssignee?: boolean } = {},
+    ) => {
+      const issueCompany = await db
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!issueCompany) return null;
+      // NFM-5850 (AC1-iii): force-release clears execution leases and may
+      // clear the assignee — list-gating fields. Gate reads for the whole
+      // transaction and stamp the watermark on resolution.
+      return withIssueListFreshness(issueCompany.companyId, () =>
+        db.transaction(async (tx) => {
+          await tx.execute(
+            sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
+          );
+          const existing = await tx
+            .select({
+              id: issues.id,
+              checkoutRunId: issues.checkoutRunId,
+              executionRunId: issues.executionRunId,
+            })
+            .from(issues)
+            .where(eq(issues.id, id))
+            .then((rows) => rows[0] ?? null);
+          if (!existing) return null;
+
+          const patch: Partial<typeof issues.$inferInsert> = {
             checkoutRunId: null,
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
             updatedAt: new Date(),
-          })
-          .where(eq(issues.id, id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
-        if (!updated) return null;
-        const [enriched] = await withIssueLabels(tx, [updated]);
-        return enriched;
-      }),
+          };
+          if (options.clearAssignee) {
+            patch.assigneeAgentId = null;
+          }
 
-    adminForceRelease: async (
-      id: string,
-      options: { clearAssignee?: boolean } = {},
-    ) =>
-      db.transaction(async (tx) => {
-        await tx.execute(
-          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
-        );
-        const existing = await tx
-          .select({
-            id: issues.id,
-            checkoutRunId: issues.checkoutRunId,
-            executionRunId: issues.executionRunId,
-          })
-          .from(issues)
-          .where(eq(issues.id, id))
-          .then((rows) => rows[0] ?? null);
-        if (!existing) return null;
+          const updated = await tx
+            .update(issues)
+            .set(patch)
+            .where(eq(issues.id, id))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (!updated) return null;
 
-        const patch: Partial<typeof issues.$inferInsert> = {
-          checkoutRunId: null,
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: new Date(),
-        };
-        if (options.clearAssignee) {
-          patch.assigneeAgentId = null;
-        }
-
-        const updated = await tx
-          .update(issues)
-          .set(patch)
-          .where(eq(issues.id, id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
-        if (!updated) return null;
-
-        const [enriched] = await withIssueLabels(tx, [updated]);
-        return {
-          issue: enriched,
-          previous: {
-            checkoutRunId: existing.checkoutRunId,
-            executionRunId: existing.executionRunId,
-          },
-        };
-      }),
+          const [enriched] = await withIssueLabels(tx, [updated]);
+          return {
+            issue: enriched,
+            previous: {
+              checkoutRunId: existing.checkoutRunId,
+              executionRunId: existing.executionRunId,
+            },
+          };
+        }),
+      );
+    },
 
     listLabels: (companyId: string) =>
       db
@@ -12156,6 +12232,7 @@ export function issueService(db: Db) {
           .update(issues)
           .set({ updatedAt: new Date() })
           .where(eq(issues.id, comment.issueId));
+          noteIssueListMutation(comment.companyId); // NFM-5850 list-gating patch
 
         return redactIssueComment(comment, currentUserRedactionOptions.enabled);
       });
@@ -12224,6 +12301,7 @@ export function issueService(db: Db) {
           .update(issues)
           .set({ updatedAt: now })
           .where(eq(issues.id, comment.issueId));
+          noteIssueListMutation(comment.companyId); // NFM-5850 list-gating patch
 
         const redacted = redactIssueComment(
           comment,
@@ -12766,6 +12844,7 @@ export function issueService(db: Db) {
         .update(issues)
         .set({ updatedAt: new Date() })
         .where(eq(issues.id, issueId));
+      noteIssueListMutation(issue.companyId); // NFM-5850 list-gating patch
 
       // Only an explicitly authored comment from the run causally woken by an
       // inbound chat message is automatically publishable. Presentation,

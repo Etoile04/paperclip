@@ -1,4 +1,5 @@
 import { withAgentAppearance } from "@paperclipai/shared";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { and, count, desc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -249,6 +250,7 @@ export function createSecretProposalsService(db: Db) {
         serverOwnedPayload: "secretProposal",
       },
     });
+    noteIssueListMutation(proposal.companyId); // NFM-5850 list-gating patch
     return linked;
   }
 

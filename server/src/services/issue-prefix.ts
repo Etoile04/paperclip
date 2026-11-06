@@ -1,4 +1,5 @@
 import { and, eq, sql } from "drizzle-orm";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import type { PgColumn } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { cases, companies, issues } from "@paperclipai/db";
@@ -132,6 +133,7 @@ export async function rekeyCompanyIssueIdentifiers(
     .set({ identifier: sql`${toPrefix} || substring(${issues.identifier} from ${tailStart})` })
     .where(and(eq(issues.companyId, companyId), matchesLegacyHead(issues.identifier)))
     .returning({ id: issues.id });
+  noteIssueListMutation(companyId); // NFM-5850 list-gating patch
 
   const rekeyedCases = await tx
     .update(cases)

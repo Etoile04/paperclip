@@ -1,4 +1,5 @@
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
+import { noteIssueListMutation } from "../../lib/issue-list-freshness.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
@@ -2983,6 +2984,7 @@ export function recoveryService(
             eq(issues.executionRunId, input.run.id),
           ),
         );
+      noteIssueListMutation(input.run.companyId); // NFM-5850 list-gating patch
 
       return updatedRun;
     });
@@ -8941,6 +8943,7 @@ async function retireObsoleteLivenessRecoveryIssues(findings: IssueLivenessFindi
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+      noteIssueListMutation(issue.companyId); // NFM-5850 list-gating patch
 
       if (!updated) continue;
 
@@ -9252,6 +9255,7 @@ async function retireObsoleteLivenessRecoveryIssues(findings: IssueLivenessFindi
           .where(
             and(eq(issues.id, dep.id), eq(issues.companyId, dep.companyId)),
           );
+        noteIssueListMutation(dep.companyId); // NFM-5850 list-gating patch
 
         transitions.push({
           dependentId: dep.id,

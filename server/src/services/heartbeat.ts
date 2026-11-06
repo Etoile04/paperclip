@@ -1,4 +1,5 @@
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { noteIssueListMutation } from "../lib/issue-list-freshness.js";
 import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
 import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
 import { externalObjectService } from "./external-objects.js";
@@ -11820,6 +11821,7 @@ export function heartbeatService(
         updatedAt: input.now,
       })
       .where(eq(issues.id, input.claimed.id));
+    noteIssueListMutation(input.claimed.companyId); // NFM-5850 list-gating patch
 
     await logActivity(db, {
       companyId: input.claimed.companyId,
@@ -12046,6 +12048,7 @@ export function heartbeatService(
         })
         .where(eq(issues.id, claimed.id));
 
+      noteIssueListMutation(claimed.companyId); // NFM-5850 list-gating patch
       await logActivity(db, {
         companyId: claimed.companyId,
         actorType: input.actorType,
@@ -12083,6 +12086,7 @@ export function heartbeatService(
             })
             .where(eq(issues.id, claimed.id));
 
+            noteIssueListMutation(claimed.companyId); // NFM-5850 list-gating patch
           await logActivity(db, {
             companyId: claimed.companyId,
             actorType: input.actorType,
@@ -12112,6 +12116,8 @@ export function heartbeatService(
             updatedAt: new Date(),
           })
           .where(eq(issues.id, claimed.id));
+
+        noteIssueListMutation(claimed.companyId); // NFM-5850 list-gating patch
       } else {
         await db
           .update(issues)
@@ -12120,6 +12126,8 @@ export function heartbeatService(
             updatedAt: new Date(),
           })
           .where(eq(issues.id, claimed.id));
+
+        noteIssueListMutation(claimed.companyId); // NFM-5850 list-gating patch
       }
 
       throw err;
@@ -12195,6 +12203,7 @@ export function heartbeatService(
       throw conflict("Issue monitor check is already in progress");
     }
 
+    noteIssueListMutation(claimed.companyId); // NFM-5850 claim tx advances the watermark post-commit
     return dispatchClaimedIssueMonitor(claimed, {
       now,
       source: "on_demand",
@@ -12274,6 +12283,7 @@ export function heartbeatService(
       });
 
       if (!claimed) continue;
+      noteIssueListMutation(claimed.companyId); // NFM-5850 claim tx advances the watermark post-commit
 
       try {
         const result = await dispatchClaimedIssueMonitor(claimed, {
@@ -14602,6 +14612,7 @@ export function heartbeatService(
           updatedAt: now,
         })
         .where(eq(issues.id, issue.id));
+      noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
 
       await tx
         .update(heartbeatRuns)
@@ -16543,6 +16554,7 @@ export function heartbeatService(
                 eq(issues.executionRunId, run.id),
               ),
             );
+          noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
         }
 
         return {
@@ -17690,6 +17702,7 @@ export function heartbeatService(
               eq(issues.executionRunId, current.id),
             ),
           );
+        noteIssueListMutation(current.companyId); // NFM-5850 list-gating patch
         return null;
       });
       const result = stage === "dispatch"
@@ -17960,6 +17973,7 @@ export function heartbeatService(
         executionLockedAt: claimedAt,
         updatedAt: claimedAt,
       }).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+      noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
     }
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const queuedCommentIds = queuedCommentIdsFromRunContext(context);
@@ -18090,6 +18104,7 @@ export function heartbeatService(
                         eq(issues.executionRunId, run.id),
                       ),
                     );
+                  noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
                   return { kind: "cancelled" as const, run: cancelled };
                 }
                 await tx
@@ -18197,6 +18212,7 @@ export function heartbeatService(
                       eq(issues.executionRunId, run.id),
                     ),
                   );
+                noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
                 return {
                   kind: "cancelled" as const,
                   run: cancelled ?? lockedRun,
@@ -18376,6 +18392,7 @@ export function heartbeatService(
             ),
           ),
         );
+      noteIssueListMutation(claimed.companyId); // NFM-5850 list-gating patch
     }
 
     return claimed;
@@ -18442,6 +18459,7 @@ export function heartbeatService(
               eq(issues.executionRunId, released.id),
             ),
           );
+        noteIssueListMutation(released.companyId); // NFM-5850 list-gating patch
       }
     });
   }
@@ -18489,6 +18507,7 @@ export function heartbeatService(
           eq(issues.executionRunId, run.id),
         ),
       );
+    noteIssueListMutation(run.companyId); // NFM-5850 list-gating patch
 
     await appendRunEvent(cancelled, {
       eventType: "lifecycle",
@@ -21597,6 +21616,7 @@ export function heartbeatService(
               isNull(issues.responsibleUserId),
             ),
           );
+        noteIssueListMutation(agent.companyId); // NFM-5850 list-gating patch
         issueContext = { ...issueContext, responsibleUserId };
       }
       const parsedProjectExecutionWorkspacePolicy =
@@ -28756,6 +28776,7 @@ export function heartbeatService(
                     eq(issues.executionRunId, scheduledRun.id),
                   ),
                 );
+              noteIssueListMutation(issue.companyId); // NFM-5850 list-gating patch
             }
 
             const eventSeq = await allocateHeartbeatRunEventSeq(
@@ -28891,6 +28912,7 @@ export function heartbeatService(
                 updatedAt: new Date(),
               })
               .where(eq(issues.id, issue.id));
+            noteIssueListMutation(issue.companyId); // NFM-5850 list-gating patch
           }
 
           if (!activeExecutionRun) {
@@ -28934,6 +28956,7 @@ export function heartbeatService(
                     updatedAt: new Date(),
                   })
                   .where(eq(issues.id, issue.id));
+                noteIssueListMutation(issue.companyId); // NFM-5850 list-gating patch
               }
             }
           }
@@ -29088,6 +29111,7 @@ export function heartbeatService(
                   updatedAt: now,
                 })
                 .where(eq(issues.id, issue.id));
+              noteIssueListMutation(issue.companyId); // NFM-5850 list-gating patch
               await tx.insert(issueComments).values({
                 companyId: issue.companyId,
                 issueId: issue.id,
